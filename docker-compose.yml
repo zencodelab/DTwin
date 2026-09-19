@@ -1,0 +1,96 @@
+services:
+  db:
+    # The -ha variant is required: it bundles TimescaleDB, PostGIS and Timescale
+    # Toolkit in one image. The plain timescale/timescaledb image has no PostGIS,
+    # and this schema needs both extensions in the same database.
+    image: timescale/timescaledb-ha:pg17
+    container_name: dtwin-db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-dtwin}
+      - POSTGRES_USER=${POSTGRES_USER:-dtwin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-dtwin_dev_pwd}
+    volumes:
+      - dtwin-pgdata:/home/postgres/pgdata/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP on purpose. During first-boot init this image
+      # runs a temporary server on the unix socket only, so a socket-based
+      # pg_isready reports ready, the container is marked healthy, and the next
+      # command gets ECONNRESET when the real server restarts. TCP is only up
+      # once initialisation has finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-dtwin} -d ${POSTGRES_DB:-dtwin}"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  ingest:
+    build:
+      context: .
+      dockerfile: apps/ingest/Dockerfile
+    container_name: dtwin-ingest
+    ports:
+      - "8787:8787"
+    environment:
+      # The APP role, not the owner. The owner bypasses row-level security
+      # unconditionally (FORCE included), so pointing a service at it silently
+      # defeats tenant isolation with no error anywhere. See docs/decisions.md §41.
+      - DATABASE_URL=postgres://${POSTGRES_APP_USER:-dtwin_app}:${POSTGRES_APP_PASSWORD:-dtwin_app_dev_pwd}@db:5432/${POSTGRES_DB:-dtwin}
+      - INGEST_PORT=8787
+      # Must match the web service exactly: it verifies the tickets web signs.
+      - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET is required — see .env.example}
+      - ALERT_NOTIFY_ENABLED=${ALERT_NOTIFY_ENABLED:-false}
+      - ALERT_WEBHOOK_ALLOW_PRIVATE=${ALERT_WEBHOOK_ALLOW_PRIVATE:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles: ["app"]
+
+  sim:
+    build:
+      context: apps/sim
+      dockerfile: Dockerfile
+    container_name: dtwin-sim
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_APP_USER:-dtwin_app}:${POSTGRES_APP_PASSWORD:-dtwin_app_dev_pwd}@db:5432/${POSTGRES_DB:-dtwin}
+      # Run progress goes to ingest, which owns the WebSocket subscriptions.
+      - INGEST_BASE_URL=http://ingest:8787
+      # A tenant-scoped `service` key with the sim:notify scope, replacing the
+      # old shared token. Unset only costs live progress — the run still
+      # completes and its results are still durable.
+      - INGEST_API_KEY=${INGEST_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles: ["app"]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: dtwin-web
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_APP_USER:-dtwin_app}:${POSTGRES_APP_PASSWORD:-dtwin_app_dev_pwd}@db:5432/${POSTGRES_DB:-dtwin}
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8787/ws
+      - SIM_BASE_URL=http://sim:8000
+      # Signs the WebSocket tickets ingest verifies — the two must match.
+      - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET is required — see .env.example}
+      # No login screen yet; names the tenant to render for. Ignored when
+      # NODE_ENV=production (apps/web/lib/tenant.ts).
+      - DTWIN_DEMO_TENANT_ID=${DTWIN_DEMO_TENANT_ID:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles: ["app"]
+
+volumes:
+  dtwin-pgdata:

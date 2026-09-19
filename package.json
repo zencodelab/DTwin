@@ -1,0 +1,35 @@
+{
+  "name": "dtwin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Digital Twin platform for a single commercial building \u2014 spatial hierarchy, IoT telemetry, energy simulation, 3D dashboard",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "db:up": "docker compose up -d --wait db",
+    "db:down": "docker compose down",
+    "db:migrate": "npm run migrate -w @dtwin/db",
+    "db:psql": "docker compose exec db psql -U dtwin -d dtwin",
+    "typecheck": "npm run typecheck -w @dtwin/types && npm run typecheck -w @dtwin/db && npm run typecheck -w @dtwin/ingest && npm run typecheck -w @dtwin/web",
+    "dev:ingest": "npm run dev -w @dtwin/ingest",
+    "smoke": "npm run smoke -w @dtwin/db && npm run smoke -w @dtwin/ingest && npm run smoke:sim && npm run smoke -w @dtwin/web",
+    "sim:install": "cd apps/sim && uv venv --python 3.12 && uv pip install -r requirements.txt",
+    "dev:sim": "cd apps/sim && .venv/bin/uvicorn app.main:app --port ${SIM_PORT:-8000}",
+    "smoke:sim": "cd apps/sim && .venv/bin/python -m app.smoke_test",
+    "dev:web": "npm run dev -w @dtwin/web",
+    "build": "npm run build -w @dtwin/web"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2"
+  },
+  "overrides": {
+    "postcss": "^8.5.23"
+  }
+}

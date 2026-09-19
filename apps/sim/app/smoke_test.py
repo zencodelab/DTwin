@@ -1,0 +1,344 @@
+"""End-to-end smoke test for the simulation worker.
+
+Spawns the real uvicorn process and drives it over HTTP. Beyond the plumbing,
+this checks that the physics points the right way — a model that runs cleanly
+and gets the direction of a change wrong is worse than one that crashes.
+
+Requires a migrated, seeded database.  Run:  python -m app.smoke_test
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import httpx
+
+PORT = 8912
+BASE = f"http://127.0.0.1:{PORT}"
+TZ = timezone(timedelta(hours=4))  # Asia/Dubai, no DST
+
+failures = 0
+
+
+def ok(label: str, cond: bool, detail: str = "") -> None:
+    global failures
+    if not cond:
+        failures += 1
+    print(f"  {'PASS' if cond else 'FAIL'}  {label}{f' — {detail}' if detail else ''}")
+
+
+def wait_healthy(client: httpx.Client, timeout_s: float = 45.0) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if client.get(f"{BASE}/healthz", timeout=2.0).status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.3)
+    raise RuntimeError("worker did not become healthy")
+
+
+def run_until_done(client: httpx.Client, run_id: str, timeout_s: float = 120.0) -> dict[str, Any]:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        run = client.get(f"{BASE}/runs/{run_id}").json()
+        if run["status"] in ("completed", "failed", "cancelled"):
+            return run
+        time.sleep(0.3)
+    raise RuntimeError(f"run {run_id} did not finish")
+
+
+def simulate(client: httpx.Client, **overrides: Any) -> dict[str, Any]:
+    """Launch a run and return its summary, failing loudly if it did not finish."""
+    body: dict[str, Any] = {
+        "buildingId": BUILDING_ID,
+        "scenarioName": overrides.pop("scenarioName", "smoke"),
+        "periodStart": PERIOD_START,
+        "periodEnd": PERIOD_END,
+        "intervalS": 3600,
+        "weather": {
+            "mode": "synthetic",
+            "peakDryBulbC": 42.0,
+            "minDryBulbC": 30.0,
+            "peakGhiW_m2": 950.0,
+        },
+    }
+    body.update(overrides)
+
+    started = client.post(f"{BASE}/simulate", json=body)
+    assert started.status_code == 202, started.text
+    run_id = started.json()["runId"]
+    run = run_until_done(client, run_id)
+    assert run["status"] == "completed", run.get("error")
+    return client.get(f"{BASE}/runs/{run_id}/summary").json() | {"runId": run_id}
+
+
+# Three days around the summer solstice: deterministic sun, peak cooling season.
+PERIOD_START = datetime(2026, 6, 20, 0, 0, tzinfo=TZ).isoformat()
+PERIOD_END = datetime(2026, 6, 23, 0, 0, tzinfo=TZ).isoformat()
+BUILDING_ID = ""
+
+server: subprocess.Popen[bytes] | None = None
+try:
+    import psycopg
+
+    dsn = os.environ.get(
+        "DATABASE_URL", "postgres://dtwin:dtwin_dev_pwd@localhost:5432/dtwin"
+    )
+    # The worker is tenant-scoped now, so this suite must be too. An unscoped
+    # read here returns no rows under row-level security and the suite would
+    # report "no building" against a database that is seeded correctly.
+    TENANT_ID = os.environ.get("DTWIN_DEMO_TENANT_ID", "")
+    if not TENANT_ID:
+        raise SystemExit(
+            "DTWIN_DEMO_TENANT_ID must be set — it is the tenant this suite "
+            "simulates for. See .env.example."
+        )
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT_ID,))
+        row = conn.execute("SELECT id FROM buildings ORDER BY name LIMIT 1").fetchone()
+        if row is None:
+            raise SystemExit(f"no building visible for tenant {TENANT_ID}")
+        BUILDING_ID = str(row[0])
+
+    server = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(PORT), "--log-level", "warning"],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env={
+            **os.environ,
+            "DATABASE_URL": dsn,
+            # Deliberately a dead port. Broadcasting progress is best-effort:
+            # a run that produced correct results has succeeded whether or not
+            # anyone was listening, and the run row plus simulation_results are
+            # the durable record. If notification were on the critical path, an
+            # ingest outage would take the simulator down with it.
+            "INGEST_BASE_URL": "http://127.0.0.1:9",
+            "INGEST_NOTIFY_TIMEOUT_S": "0.3",
+        },
+    )
+
+    # Every request carries the tenant, exactly as the web service sets it.
+    with httpx.Client(timeout=30.0, headers={"x-tenant-id": TENANT_ID}) as client:
+        wait_healthy(client)
+
+        # ------------------------------------------------------------ plumbing
+        print("\n[1] Service and validation")
+        ok("healthz reports ok", client.get(f"{BASE}/healthz").json()["status"] == "ok")
+        ok(
+            "unknown building is a 404",
+            client.post(f"{BASE}/simulate", json={
+                "buildingId": "00000000-0000-0000-0000-000000000000",
+                "scenarioName": "x", "periodStart": PERIOD_START, "periodEnd": PERIOD_END,
+            }).status_code == 404,
+        )
+        ok(
+            "reversed period is rejected",
+            client.post(f"{BASE}/simulate", json={
+                "buildingId": BUILDING_ID, "scenarioName": "x",
+                "periodStart": PERIOD_END, "periodEnd": PERIOD_START,
+            }).status_code == 422,
+        )
+        ok(
+            "summary of an unknown run is a 404",
+            client.get(f"{BASE}/runs/00000000-0000-0000-0000-000000000000/summary")
+            .status_code == 404,
+        )
+
+        # ------------------------------------------------------------- baseline
+        print("\n[2] Baseline run")
+        base = simulate(client, scenarioName="baseline")
+        b = base["building"]
+        ok("run completed", base["run"]["status"] == "completed")
+        ok("progress reached 100", base["run"]["progressPct"] == 100)
+        ok("every zone produced results", len(base["byZone"]) == 24, str(len(base["byZone"])))
+
+        total = b["hvacKwh"] + b["lightingKwh"] + b["plugKwh"]
+        ok("end uses sum to the total", abs(total - b["totalKwh"]) < 1e-6,
+           f"{total:.2f} vs {b['totalKwh']:.2f}")
+        ok("carbon follows the grid factor",
+           abs(b["co2Kg"] - b["totalKwh"] * 0.42) < 1e-3,
+           f"{b['co2Kg']:.1f} kg for {b['totalKwh']:.1f} kWh")
+        # Whole-building plug load exceeds HVAC here because one 200 m2 server
+        # room at 450 W/m2 is ~90 kW continuous, which is most of the building's
+        # electricity. Checking a normal office zone is the meaningful test of
+        # "cooling dominates".
+        office_zone = next(z for z in base["byZone"] if z["zoneName"].startswith("OFF"))
+        ok("cooling dominates an office zone's energy",
+           office_zone["hvacKwh"] > office_zone["lightingKwh"]
+           and office_zone["hvacKwh"] > office_zone["plugKwh"],
+           f"hvac={office_zone['hvacKwh']:.0f} light={office_zone['lightingKwh']:.0f} "
+           f"plug={office_zone['plugKwh']:.0f}")
+        ok("the server room dominates whole-building plug load",
+           b["plugKwh"] > b["hvacKwh"],
+           f"plug={b['plugKwh']:.0f} > hvac={b['hvacKwh']:.0f} kWh, as a 90 kW data hall implies")
+
+        # 3 days of a Gulf office: a plausible annual EUI of 150-400 kWh/m2
+        # scales to roughly 1.2-3.3 kWh/m2 over this period.
+        eui = b["euiKwhPerM2"]
+        ok("energy intensity is in a plausible range", 0.8 < eui < 6.0,
+           f"{eui:.2f} kWh/m2 over 3 days -> ~{eui / 3 * 365:.0f}/yr")
+        ok("auto-sized plant leaves few unmet hours", b["unmetHours"] < 20,
+           f"{b['unmetHours']:.1f} h across 24 zones")
+
+        # ----------------------------------------------------------- physics
+        print("\n[3] Physics direction and shape")
+        results = client.get(
+            f"{BASE}/runs/{base['runId']}/results", params={"limit": 10000}
+        ).json()["results"]
+        ok("per-interval results are returned", len(results) > 0, f"{len(results)} rows")
+
+        by_hour: dict[int, float] = {}
+        solar_by_hour: dict[int, float] = {}
+        for r in results:
+            hour = datetime.fromisoformat(r["intervalStart"]).astimezone(TZ).hour
+            by_hour[hour] = by_hour.get(hour, 0.0) + r["hvacLoadKwh"]
+            solar_by_hour[hour] = solar_by_hour.get(hour, 0.0) + r["solarGainKwh"]
+
+        peak_hour = max(by_hour, key=lambda h: by_hour[h])
+        ok("cooling peaks in the afternoon, not at night", 11 <= peak_hour <= 18,
+           f"peak at {peak_hour}:00")
+        ok("no solar gain at midnight", solar_by_hour.get(0, 0.0) < 1e-6)
+        ok("solar gain at midday", solar_by_hour.get(12, 0.0) > 0)
+
+        # Vertical glazing at 24N behaves the opposite way to a roof: at summer
+        # solar noon the sun is nearly overhead and grazes the glass, while the
+        # beam strikes east and west facades near-perpendicular morning and
+        # evening. The profile therefore has twin peaks and a midday dip — which
+        # is why east/west glazing, not south, is the problem in the tropics.
+        # A model showing a noon peak here would have the geometry wrong.
+        peak_solar_hour = max(solar_by_hour, key=lambda h: solar_by_hour[h])
+        ok("vertical-facade solar peaks morning or afternoon, not at noon",
+           peak_solar_hour in range(5, 10) or peak_solar_hour in range(14, 19),
+           f"peak at {peak_solar_hour}:00")
+        ok("vertical-facade solar dips at solar noon",
+           solar_by_hour[12] < solar_by_hour[peak_solar_hour],
+           f"noon {solar_by_hour[12]:.1f} < peak {solar_by_hour[peak_solar_hour]:.1f} kWh")
+        ok("cooling peaks later than the morning solar peak, tracking outdoor temperature",
+           peak_hour > 10, f"cooling peaks {peak_hour}:00")
+
+        temps = [r["indoorTempC"] for r in results]
+        ok("indoor temperature stays in a habitable band",
+           all(15 < t < 35 for t in temps),
+           f"{min(temps):.1f}..{max(temps):.1f} C")
+
+        server_room = next((z for z in base["byZone"] if z["zoneName"].startswith("SER")), None)
+        office = next((z for z in base["byZone"] if z["zoneName"].startswith("OFF")), None)
+        ok("the server room is the most energy-intense zone",
+           server_room is not None and office is not None
+           and server_room["euiKwhPerM2"] > office["euiKwhPerM2"],
+           f"server {server_room['euiKwhPerM2']:.1f} vs office {office['euiKwhPerM2']:.1f}")
+
+        # -------------------------------------------------------- scenarios
+        print("\n[4] Scenario response")
+        warmer = simulate(client, scenarioName="setpoint +2K",
+                          params={"setpointDeltaK": 2.0})
+        ok("raising the setpoint reduces cooling energy",
+           warmer["building"]["hvacKwh"] < b["hvacKwh"],
+           f"{warmer['building']['hvacKwh']:.0f} < {b['hvacKwh']:.0f} kWh")
+
+        cooler = simulate(client, scenarioName="setpoint -2K",
+                          params={"setpointDeltaK": -2.0})
+        ok("lowering the setpoint increases cooling energy",
+           cooler["building"]["hvacKwh"] > b["hvacKwh"],
+           f"{cooler['building']['hvacKwh']:.0f} > {b['hvacKwh']:.0f} kWh")
+
+        led = simulate(client, scenarioName="LED retrofit",
+                       params={"lightingScale": 0.5})
+        ok("halving lighting power halves lighting energy",
+           abs(led["building"]["lightingKwh"] - b["lightingKwh"] / 2) < 1.0,
+           f"{led['building']['lightingKwh']:.1f} vs {b['lightingKwh'] / 2:.1f}")
+        ok("an LED retrofit also reduces cooling load",
+           led["building"]["hvacKwh"] < b["hvacKwh"],
+           "less waste heat to remove")
+
+        better_plant = simulate(client, scenarioName="chiller upgrade",
+                                params={"hvacCopScale": 1.25})
+        ok("a better COP reduces HVAC electricity without changing the load",
+           better_plant["building"]["hvacKwh"] < b["hvacKwh"]
+           and better_plant["building"]["plugKwh"] == b["plugKwh"],
+           f"{better_plant['building']['hvacKwh']:.0f} kWh")
+
+        ppa = simulate(client, scenarioName="green tariff",
+                       params={"gridCarbonKgPerKwh": 0.1})
+        ok("the emission factor changes carbon but not energy",
+           abs(ppa["building"]["totalKwh"] - b["totalKwh"]) < 1e-6
+           and ppa["building"]["co2Kg"] < b["co2Kg"],
+           f"{ppa['building']['co2Kg']:.0f} vs {b['co2Kg']:.0f} kg")
+
+        print("\n[5] Cross-language contract")
+        # The summary crosses into TypeScript, where "optional" and "nullable"
+        # are different things that Pydantic writes identically. This is the
+        # boundary the two-language split actually costs something at, so it is
+        # asserted rather than assumed.
+        from app.notify import summary_payload
+        from app.models import SimulationSummary as PySummary
+
+        # `base` is the summary JSON with runId bolted on by the helper; the
+        # Pydantic models forbid extra keys, so drop it before validating.
+        raw = {k: v for k, v in base.items() if k != "runId"}
+        wire = summary_payload(PySummary.model_validate(raw))
+        ok("scenario params carry no nulls (Zod declares them optional)",
+           all(v is not None for v in wire["run"]["params"].values()),
+           str(wire["run"]["params"]))
+        ok("nullable fields are still present as null, not dropped",
+           "peakDemandKw" in wire["building"] and "startedAt" in wire["run"],
+           "optional and nullable must not be conflated")
+
+        print("\n[6] Resilience")
+        ok("runs complete with the ingest service unreachable",
+           base["run"]["status"] == "completed",
+           "progress broadcast is best-effort, not on the critical path")
+        ok("an unreachable ingest leaves no error on the run",
+           base["run"]["error"] is None)
+
+        # ------------------------------------------------------ determinism
+        print("\n[7] Determinism and weather modes")
+        repeat = simulate(client, scenarioName="baseline repeat")
+        ok("the same request reproduces the same result",
+           abs(repeat["building"]["totalKwh"] - b["totalKwh"]) < 1e-6,
+           f"{repeat['building']['totalKwh']:.4f}")
+
+        missing = client.post(f"{BASE}/simulate", json={
+            "buildingId": BUILDING_ID, "scenarioName": "observed with no data",
+            "periodStart": datetime(2019, 1, 1, tzinfo=TZ).isoformat(),
+            "periodEnd": datetime(2019, 1, 2, tzinfo=TZ).isoformat(),
+            "weather": {"mode": "observed"},
+        })
+        failed_run = run_until_done(client, missing.json()["runId"])
+        ok("observed mode fails loudly when no weather exists, rather than inventing it",
+           failed_run["status"] == "failed" and "weather" in (failed_run["error"] or ""),
+           (failed_run["error"] or "")[:70])
+
+        written = client.post(f"{BASE}/weather/generate", json={
+            "buildingId": BUILDING_ID,
+            "periodStart": PERIOD_START, "periodEnd": PERIOD_END,
+        }).json()
+        ok("weather generation writes hourly rows", written["written"] > 70,
+           f"{written['written']} rows")
+
+        observed = simulate(client, scenarioName="observed replay",
+                            weather={"mode": "observed"})
+        ok("observed mode runs once weather exists",
+           observed["building"]["totalKwh"] > 0,
+           f"{observed['building']['totalKwh']:.0f} kWh")
+        ok("replayed weather gives a comparable answer to the synthetic day",
+           abs(observed["building"]["totalKwh"] - b["totalKwh"]) / b["totalKwh"] < 0.25,
+           f"{observed['building']['totalKwh']:.0f} vs {b['totalKwh']:.0f} kWh")
+
+finally:
+    if server is not None:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+print(f"\n{'all checks passed' if failures == 0 else f'{failures} check(s) FAILED'}\n")
+sys.exit(1 if failures else 0)

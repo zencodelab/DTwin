@@ -1,0 +1,348 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { WebSocketServer, type WebSocket } from 'ws';
+import { closePool, verifyWsTicket } from '@dtwin/db';
+import {
+  RawTelemetryBatch, SimEvent, parseClientMessage, topics, type ServerMessage,
+} from '@dtwin/types';
+import { listAlerts } from './rules/store.ts';
+import { authenticate } from './auth.ts';
+import { loadConfig } from './config.ts';
+import { Pipeline } from './pipeline.ts';
+import { DeviceSimulator, type FaultKind } from './simulator/index.ts';
+
+/**
+ * Ingest service.
+ *
+ * Devices push over HTTP POST /ingest; browsers subscribe over the WebSocket
+ * and only receive. Splitting the directions this way is why `ClientMessage`
+ * has no telemetry variant — a browser is never a data source, and keeping the
+ * inbound surface to one authenticated HTTP route is simpler than policing
+ * message kinds on a socket open to the dashboard.
+ *
+ * EVERY ROUTE HERE IS AUTHENTICATED except /healthz, and the tenant always
+ * comes from the credential, never from the request. `/healthz` is deliberately
+ * open and deliberately reports only process-level counters — no tenant names,
+ * no per-tenant figures — because it is the one thing a load balancer must be
+ * able to reach without a key.
+ */
+
+const config = loadConfig();
+const pipeline = new Pipeline(config);
+
+const simulator = new DeviceSimulator(config, pipeline.registry, (readings) => {
+  pipeline.ingestResolved(readings);
+});
+
+// ---------------------------------------------------------------------- HTTP
+
+async function readJson(req: IncomingMessage, limitBytes = 8 * 1024 * 1024): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    // Bound before buffering, not after: an unbounded body is a trivial way to
+    // exhaust memory on an endpoint that accepts batches by design.
+    if (size > limitBytes) throw new Error('payload too large');
+    chunks.push(chunk as Buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function send(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
+const httpServer = createServer((req, res) => {
+  void handle(req, res).catch((err: unknown) => {
+    send(res, 500, { error: (err as Error).message });
+  });
+});
+
+async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const route = `${req.method} ${url.pathname}`;
+
+  switch (route) {
+    case 'GET /healthz': {
+      const stats = pipeline.stats();
+      // Healthy means the write path is actually draining. A service that
+      // accepts readings and silently fails to persist them looks fine on a
+      // liveness check and is useless.
+      const healthy =
+        stats.sensors > 0 &&
+        stats.writer.buffered < config.INGEST_BUFFER_MAX_ROWS &&
+        stats.writer.lastError === null;
+      return send(res, healthy ? 200 : 503, {
+        status: healthy ? 'ok' : 'degraded',
+        ...stats,
+        simulator: config.SIM_ENABLED ? simulator.stats : { enabled: false as const },
+      });
+    }
+
+    case 'POST /ingest': {
+      const auth = await authenticate(req, 'ingest:write');
+      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+
+      // Authenticate BEFORE parsing. Parsing an 8 MB body for a caller with no
+      // valid key is work an unauthenticated stranger gets to make us do.
+      const parsed = RawTelemetryBatch.safeParse(await readJson(req));
+      if (!parsed.success) {
+        return send(res, 400, {
+          error: 'invalid batch',
+          issues: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
+        });
+      }
+      const result = pipeline.ingestRaw(auth.principal.tenantId, parsed.data);
+      // 202, not 200: the readings are buffered, not yet durable. Claiming
+      // otherwise would be a lie the writer cannot back up.
+      return send(res, 202, result);
+    }
+
+    case 'POST /internal/sim-event': {
+      const auth = await authenticate(req, 'sim:notify');
+      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+
+      const parsed = SimEvent.safeParse(await readJson(req));
+      if (!parsed.success) {
+        return send(res, 400, {
+          error: 'invalid sim event',
+          issues: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
+        });
+      }
+
+      const event = parsed.data;
+
+      // The worker names a building; the key names a tenant. If they disagree,
+      // refuse — a service key must not be usable to push a fabricated event
+      // into someone else's dashboard by naming their building id.
+      const owner = pipeline.registry.ownerOf(topics.building(event.buildingId));
+      if (owner !== auth.principal.tenantId) {
+        return send(res, 403, { error: 'building does not belong to this tenant' });
+      }
+
+      // Both topics: a panel watching one run subscribes to sim:<id>, while the
+      // dashboard is already on the building topic and should not have to
+      // subscribe and unsubscribe per run to follow one.
+      for (const topic of [topics.sim(event.runId), topics.building(event.buildingId)]) {
+        pipeline.fanout.send(topic, event as ServerMessage);
+      }
+      return send(res, 202, { forwarded: true });
+    }
+
+    case 'GET /alerts': {
+      const auth = await authenticate(req, 'ingest:write');
+      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+
+      const state = url.searchParams.get('state');
+      const filter = state === 'live' || state === 'resolved' ? state : undefined;
+      return send(res, 200, {
+        alerts: await listAlerts(auth.principal.tenantId, filter),
+      });
+    }
+
+    case 'POST /alerts/ack': {
+      const auth = await authenticate(req, 'ingest:write');
+      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+
+      // `by` is no longer accepted from the body. It used to be, which made the
+      // acknowledgement trail worth nothing: anyone could acknowledge an alert
+      // as anyone. The acting user now travels in a header the web service sets
+      // from its own session, and the column is a foreign key to `users`, so a
+      // fabricated id fails rather than being recorded.
+      const actingUser = req.headers['x-acting-user'];
+      const body = (await readJson(req)) as { alertId?: string };
+      if (!body.alertId || typeof actingUser !== 'string') {
+        return send(res, 400, { error: 'alertId and an acting user are required' });
+      }
+
+      const alert = await pipeline.alerts.acknowledge(
+        auth.principal.tenantId, body.alertId, actingUser);
+      // 409, not 404: the alert exists but is no longer open, which is a
+      // different thing for a caller to handle than a bad id. An alert in
+      // ANOTHER tenant also lands here rather than 404 — deliberately, since
+      // distinguishing the two would confirm the id exists.
+      return alert
+        ? send(res, 200, { alert })
+        : send(res, 409, { error: 'alert is not open' });
+    }
+
+    case 'POST /simulator/fault': {
+      const auth = await authenticate(req, 'ingest:write');
+      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+
+      const body = (await readJson(req)) as {
+        sensorId?: string; externalId?: string; kind?: FaultKind; magnitude?: number;
+      };
+      const found = body.sensorId
+        ? pipeline.registry.byId(body.sensorId)
+        : body.externalId
+          ? pipeline.registry.lookup(auth.principal.tenantId, body.externalId)
+          : undefined;
+      // A sensor id from another tenant reads as unknown, not forbidden: this
+      // route must not become a way to probe which ids exist elsewhere.
+      const sensor = found?.tenantId === auth.principal.tenantId ? found : undefined;
+      if (!sensor) return send(res, 404, { error: 'unknown sensor' });
+      if (!body.kind) return send(res, 400, { error: 'kind is required' });
+
+      simulator.injectFault(sensor.id, body.kind, body.magnitude ?? 1);
+      return send(res, 200, { sensorId: sensor.id, kind: body.kind });
+    }
+
+    case 'DELETE /simulator/fault': {
+      const auth = await authenticate(req, 'ingest:write');
+      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+
+      const sensorId = url.searchParams.get('sensorId');
+      if (!sensorId) {
+        simulator.clearFaultsForTenant(auth.principal.tenantId, pipeline.registry);
+        return send(res, 200, { cleared: 'all for tenant' });
+      }
+      const sensor = pipeline.registry.byId(sensorId);
+      if (sensor?.tenantId !== auth.principal.tenantId) {
+        return send(res, 404, { error: 'unknown sensor' });
+      }
+      return send(res, 200, { cleared: simulator.clearFault(sensorId) });
+    }
+
+    default:
+      return send(res, 404, { error: `no route for ${route}` });
+  }
+}
+
+// ----------------------------------------------------------------- WebSocket
+
+const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+
+/**
+ * A connection starts unauthenticated and can do nothing but authenticate.
+ *
+ * The first frame must be `auth` carrying a ticket the web service minted from
+ * the user's session. Until that succeeds the socket holds no subscriptions, so
+ * there is no window in which a frame could be delivered to an unidentified
+ * client.
+ *
+ * Unauthenticated sockets are closed after a short grace period. Without it,
+ * opening connections and never authenticating is a free way to hold server
+ * memory — the one thing a socket lets a stranger do before proving anything.
+ */
+const AUTH_GRACE_MS = 10_000;
+
+wss.on('connection', (socket: WebSocket) => {
+  const id = randomUUID();
+  pipeline.fanout.add({ id, socket, topics: new Set(), tenantId: null });
+
+  const reply = (message: ServerMessage) => socket.send(JSON.stringify(message));
+
+  let tenantId: string | null = null;
+  const authDeadline = setTimeout(() => {
+    if (!tenantId) {
+      reply({ type: 'error', code: 'auth_timeout', message: 'no auth frame received' });
+      socket.close();
+    }
+  }, AUTH_GRACE_MS);
+
+  socket.on('message', (data) => {
+    const parsed = parseClientMessage(data.toString());
+    if (!parsed.ok) {
+      // A malformed frame is an expected condition on a public socket, not a
+      // reason to drop a working connection.
+      reply({ type: 'error', code: 'bad_message', message: parsed.error });
+      return;
+    }
+
+    const message = parsed.message;
+
+    if (message.type === 'auth') {
+      const ticket = verifyWsTicket(message.ticket);
+      if (!ticket) {
+        // Expired and forged are reported identically. The client's remedy is
+        // the same either way — fetch a fresh ticket — and telling a forger
+        // that their signature was fine but stale is free information.
+        reply({ type: 'error', code: 'auth_failed', message: 'invalid or expired ticket' });
+        socket.close();
+        return;
+      }
+      tenantId = ticket.tenantId;
+      clearTimeout(authDeadline);
+      pipeline.fanout.authenticate(id, ticket.tenantId);
+      reply({ type: 'authenticated', tenantId: ticket.tenantId });
+      return;
+    }
+
+    // Ping is answered before the auth check so a client can keep an
+    // unauthenticated connection alive while it fetches a ticket.
+    if (message.type === 'ping') {
+      reply({ type: 'pong', ts: message.ts });
+      return;
+    }
+
+    if (!tenantId) {
+      reply({ type: 'error', code: 'unauthenticated', message: 'send an auth frame first' });
+      return;
+    }
+
+    switch (message.type) {
+      case 'subscribe': {
+        const { topics: accepted, denied } = pipeline.fanout.subscribe(id, message.topics);
+        reply({ type: 'subscribed', topics: accepted });
+        // Denials are reported, never swallowed: a silently ignored topic is
+        // indistinguishable from a topic with nothing happening on it, and an
+        // operator would wait indefinitely for data that is not coming.
+        if (denied.length > 0) {
+          reply({
+            type: 'subscribe.denied',
+            topics: denied,
+            reason: 'topic does not belong to this tenant, or is not known to this service',
+          });
+        }
+        break;
+      }
+      case 'unsubscribe':
+        reply({
+          type: 'subscribed',
+          topics: pipeline.fanout.unsubscribe(id, message.topics),
+        });
+        break;
+    }
+  });
+
+  const cleanup = () => {
+    clearTimeout(authDeadline);
+    pipeline.fanout.remove(id);
+  };
+  socket.on('close', cleanup);
+  socket.on('error', cleanup);
+});
+
+// ------------------------------------------------------------------ lifecycle
+
+async function shutdown(signal: string): Promise<void> {
+  console.log(`\n[ingest] ${signal} — draining`);
+  simulator.stop();
+  wss.close();
+  httpServer.close();
+  // Flush before the pool closes, or buffered readings are lost on every deploy.
+  await pipeline.stop();
+  await closePool();
+  process.exit(0);
+}
+
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => void shutdown(sig));
+}
+
+await pipeline.start();
+if (config.SIM_ENABLED) {
+  await simulator.start();
+  console.log(`[ingest] simulator on — ${pipeline.registry.size} sensors, speedup ${config.SIM_SPEEDUP}x`);
+}
+
+httpServer.listen(config.INGEST_PORT, () => {
+  console.log(`[ingest] http://localhost:${config.INGEST_PORT} · ws://localhost:${config.INGEST_PORT}/ws`);
+});

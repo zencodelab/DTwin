@@ -1,0 +1,22 @@
+node_modules/
+.next/
+dist/
+build/
+*.tsbuildinfo
+
+.env
+.env.local
+.env.*.local
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.DS_Store
+*.log
+
+# Large 3D assets — keep the tracked sample only
+models/*.glb
+models/*.gltf
+!models/sample-building.glb
