@@ -83,9 +83,8 @@ services:
       - SIM_BASE_URL=http://sim:8000
       # Signs the WebSocket tickets ingest verifies — the two must match.
       - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET is required — see .env.example}
-      # Development convenience only, and inert here: this container runs
-      # `next start`, so NODE_ENV=production and apps/web/lib/tenant.ts ignores
-      # it. Sign in at http://localhost:3000/login instead — run
+      # Inert unless DTWIN_ALLOW_DEMO_TENANT is also 'true', which is not set
+      # here and defaults to off. Sign in at http://localhost:3000/login — run
       # `npm run bootstrap` first if the database has no user yet.
       - DTWIN_DEMO_TENANT_ID=${DTWIN_DEMO_TENANT_ID:-}
     depends_on:

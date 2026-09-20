@@ -22,16 +22,24 @@ import type { TenantRole } from '@dtwin/types';
 export const SESSION_COOKIE = 'dtwin_session';
 
 /**
- * The seeded single-tenant demo has no login screen yet, so a tenant id may be
- * supplied by configuration instead.
+ * A tenant supplied by configuration instead of by a session.
  *
- * This **fails closed in production**: the fallback is ignored unless
- * `NODE_ENV` is not `production`, so a demo convenience cannot become the way
- * a deployment authenticates. A default that works everywhere is a default
- * that ships, which is the same reason `AUTH_SECRET` has no fallback value.
+ * It needs TWO variables, and the second is the point. This was gated on
+ * `NODE_ENV !== 'production'` alone, which worked — but it rests on
+ * `process.env.NODE_ENV`, which Next inlines at build time. What the running
+ * server evaluates is therefore the value the compiler saw, not the one the
+ * container's environment holds, and the two can differ: a build run without
+ * it set, a base image that sets it, a `next build` invoked by something that
+ * does not. That is a fragile thing for a security decision to rest on, and
+ * the failure is silent in the direction that matters.
+ *
+ * `DTWIN_ALLOW_DEMO_TENANT` is an ordinary variable, read at runtime, and it
+ * defaults to off. A convenience that has to be switched on deliberately
+ * cannot become the way a deployment authenticates by accident, which is the
+ * same reason `AUTH_SECRET` has no fallback value.
  */
 function demoTenant(): TenantContext | null {
-  if (process.env.NODE_ENV === 'production') return null;
+  if (process.env.DTWIN_ALLOW_DEMO_TENANT !== 'true') return null;
   const tenantId = process.env.DTWIN_DEMO_TENANT_ID;
   return tenantId ? { tenantId } : null;
 }

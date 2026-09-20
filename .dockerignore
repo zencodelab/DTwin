@@ -1,0 +1,36 @@
+# What must not reach a build context.
+#
+# There was no .dockerignore, so every build copied the host's node_modules
+# (572 MB) and apps/web/.next (237 MB) into the build context and then into the
+# builder image. Slow, and worse: `next build` finds a populated .next from the
+# host and may reuse parts of it, so an image can ship a mix of freshly
+# compiled code and stale output — a class of bug that is very hard to read
+# from the outside, because the source and the running code disagree.
+node_modules
+**/node_modules
+.next
+**/.next
+dist
+**/dist
+*.tsbuildinfo
+
+# Python
+.venv
+**/.venv
+__pycache__
+**/__pycache__
+
+# Secrets and local state. .env is gitignored; it must not be image-ignored
+# only by accident.
+.env
+.env.*
+!.env.example
+
+# Not needed to build or run a service.
+.git
+.github
+.claude
+docs
+models
+*.md
+!README.md
