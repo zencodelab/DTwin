@@ -887,7 +887,7 @@ try {
   const { rows: [after] } = await pool.query(`SELECT count(*) AS n FROM telemetry`);
   ok('buffered readings were flushed on SIGTERM, not lost',
      Number(after.n) >= Number(before.n), `${before.n} -> ${after.n}`);
-  ok('port released', await isPortFree(PORT));
+  ok('port released', await waitForPortFree(PORT));
 
 } finally {
   server?.kill('SIGKILL');
@@ -900,6 +900,26 @@ async function isPortFree(port: number): Promise<boolean> {
     return false;
   } catch {
     return true;
+  }
+}
+
+/**
+ * Poll rather than probe once.
+ *
+ * The process has already exited by the time this runs, so the listener is
+ * going away — but "has exited" and "the kernel has released the socket" are
+ * not the same instant, and how far apart they are depends on the machine. A
+ * single check after a fixed sleep passed consistently on a developer laptop
+ * and failed on a CI runner, which makes it a measure of the runner rather than
+ * of the shutdown path. What the check is actually for is that the port does
+ * not stay held, so it waits for that and fails only if it never happens.
+ */
+async function waitForPortFree(port: number, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await isPortFree(port)) return true;
+    if (Date.now() > deadline) return false;
+    await sleep(250);
   }
 }
 
