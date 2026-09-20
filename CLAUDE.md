@@ -135,7 +135,17 @@ service.
 - **`occupancy_heat_gain_w_person` is a TOTAL**, not a sensible gain. The engine
   splits it; do not use the column whole.
 - **Plant is auto-sized per zone** from its design load, so unmet hours mean the
-  plant is insufficient rather than the default being wrong.
+  plant is insufficient rather than the default being wrong. The chillers'
+  `rated_power_kw` is deliberately NOT used for it — that is a building-level
+  number and this is per zone; bridging them means modelling the
+  chiller→AHU→VAV tree (`docs/decisions.md` §50).
+- **`equipment.rated_power_kw` means different things by type** and nothing in
+  the schema says so: thermal capacity on a chiller, electrical input on an AHU
+  or VAV. Never sum it across types. The fan-power query restricts to `ahu`
+  rows for this reason (§50).
+- **Fan power and heating COP come from the register**, not from literature.
+  Fan energy and latent energy are both **subsets** of `hvacKwh`, never
+  additions to it.
 - **`observed` weather fails loudly** when no rows exist. Never silently fall back
   to a synthetic day.
 - **Optional and nullable are different, and Pydantic writes both as null.**

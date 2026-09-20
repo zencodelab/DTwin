@@ -31,6 +31,7 @@ ZONE_SQL = """
          tp.occupancy_heat_gain_w_person,
          tp.setpoint_temp_c, tp.deadband_k,
          tp.ventilation_l_s_person, tp.hvac_cop,
+         COALESCE(tp.heating_cop, tp.hvac_cop) AS heating_cop,
          -- Geometry for deriving which way this zone's walls face. GeoJSON
          -- rather than WKB because the consumer is Python doing vector maths,
          -- not PostGIS doing a spatial predicate. See facade.py and §49.
@@ -74,6 +75,46 @@ def load_zones(building_id: UUID, zone_ids: list[UUID] | None) -> list[dict[str,
 
     with connection() as conn:
         return conn.execute(query, params).fetchall()
+
+
+def specific_fan_power_w_per_l_s(building_id: UUID) -> float | None:
+    """Fan power per litre per second of supply air, from the asset register.
+
+    Derived rather than assumed, because §14 says the simulator must agree with
+    the register and the register has the numbers: the seeded AHUs are rated
+    15 kW at 18,000 m3/h, which is 3.0 W per l/s — a plausible figure for a
+    constant-volume system with some duct static.
+
+    Reads `rated_power_kw` on AIR-HANDLING equipment only, and that restriction
+    matters: the column means different things by type. On an AHU or a VAV it
+    is electrical input to the fan. On a chiller it is **thermal capacity** —
+    the seeded pair are 320 kW each, which as electrical input would imply a
+    megawatt of cooling for a 4,800 m2 building. Summing the column across
+    types would therefore add kilowatts of two different kinds. That ambiguity
+    is in the schema, not in this query; see §50.
+
+    None when the register has nothing to say, so the caller can decide rather
+    than be handed a default dressed as a measurement.
+    """
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT sum(e.rated_power_kw) AS kw,
+                   sum(e.rated_airflow_cmh) AS cmh
+              FROM equipment e
+              JOIN floors f ON f.id = e.floor_id
+             WHERE f.building_id = %s
+               AND e.equipment_type = 'ahu'
+               AND e.rated_power_kw IS NOT NULL
+               AND e.rated_airflow_cmh > 0
+            """,
+            (building_id,),
+        ).fetchone()
+
+    if not row or not row["kw"] or not row["cmh"]:
+        return None
+    # kW / (m3/h) -> W per l/s:  (kw * 1000) / (cmh * 1000 / 3600)
+    return float(row["kw"]) * 3600.0 / float(row["cmh"])
 
 
 def count_zones_without_profile(building_id: UUID) -> int:
@@ -261,7 +302,7 @@ RESULT_COLUMNS = (
     "peak_demand_kw", "indoor_temp_c",
     "solar_gain_kwh", "internal_gain_kwh", "envelope_loss_kwh",
     "ventilation_loss_kwh", "occupancy_count", "unmet_hours",
-    "latent_load_kwh",
+    "latent_load_kwh", "fan_load_kwh",
 )
 
 
@@ -349,6 +390,7 @@ def summarize(run_id: UUID) -> tuple[dict[str, Any] | None, list[dict[str, Any]]
             )
             SELECT sum(r.hvac_load_kwh) AS "hvacKwh",
                    sum(r.latent_load_kwh) AS "latentKwh",
+                   sum(r.fan_load_kwh) AS "fanKwh",
                    sum(r.lighting_kwh)  AS "lightingKwh",
                    sum(r.plug_kwh)      AS "plugKwh",
                    sum(r.total_kwh)     AS "totalKwh",
@@ -375,6 +417,7 @@ def summarize(run_id: UUID) -> tuple[dict[str, Any] | None, list[dict[str, Any]]
             SELECT r.zone_id AS "zoneId", z.name AS "zoneName",
                    sum(r.hvac_load_kwh) AS "hvacKwh",
                    sum(r.latent_load_kwh) AS "latentKwh",
+                   sum(r.fan_load_kwh) AS "fanKwh",
                    sum(r.lighting_kwh)  AS "lightingKwh",
                    sum(r.plug_kwh)      AS "plugKwh",
                    sum(r.total_kwh)     AS "totalKwh",

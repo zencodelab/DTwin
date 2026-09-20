@@ -239,6 +239,22 @@ try:
         ok("cooling now outweighs plug load, as latent load implies",
            b["hvacKwh"] > b["plugKwh"],
            f"hvac={b['hvacKwh']:.0f} > plug={b['plugKwh']:.0f} kWh")
+        # Fan power comes from the asset register, not a literature value
+        # (§14, §50): 4 AHUs rated 15 kW at 18,000 m3/h is 3.0 W per l/s.
+        #
+        # The resulting share is high — around a quarter of HVAC — and that is
+        # a fact about the seeded register rather than about the model. 3.0 W
+        # per l/s is roughly double what ASHRAE 90.1 allows a new VAV system,
+        # so this building's fans are modelled as the inefficient ones the
+        # register says they are. §14 is explicit that the simulator agrees
+        # with the register rather than the other way round.
+        ok("fan energy is reported and is a plausible share of HVAC",
+           b["fanKwh"] is not None
+           and 0.10 < b["fanKwh"] / b["hvacKwh"] < 0.40
+           and b["fanKwh"] < b["hvacKwh"],
+           f"fan={b['fanKwh']:.0f} of hvac={b['hvacKwh']:.0f} kWh "
+           f"({100 * b['fanKwh'] / b['hvacKwh']:.0f}%, at 3.0 W per l/s)")
+
         ok("latent is a material share of cooling, and a subset of it",
            b["latentKwh"] is not None
            and 0.15 < b["latentKwh"] / b["hvacKwh"] < 0.65

@@ -977,3 +977,71 @@ tests** — corner zones, edge zones, core zones, an unclosed ring, a wall just
 inside the outline and one well inside it. A swapped normal would otherwise
 show up only as a building whose afternoon peak is in the morning, which is a
 slow and ambiguous way to find a sign error.
+
+## 50. The air side comes from the asset register, and the register is ambiguous
+
+HVAC energy was thermal load divided by COP. Two things were missing from that,
+and finding the second is more useful than fixing the first.
+
+**One COP was used for both directions.** That is only right for a machine that
+has one. A reversible heat pump is usually better at heating than cooling; an
+electric resistance heater is exactly 1.0 and nothing else. `heating_cop` is
+now its own column, defaulting to `hvac_cop` when unset so a profile that has
+not been told its heating efficiency keeps behaving as it did. The seeded
+building reheats electrically at the VAV terminals, so it is 1.0 against a
+cooling 2.6–3.2. It barely moves this building's number — a Gulf tower heats
+almost never — which is exactly why it was worth fixing now: the error is
+currently invisible and would stop being invisible the first time this model is
+pointed at a building with a winter.
+
+**Moving air was free.** The supply fan runs whenever the coil does. Airflow
+follows the *sensible* load, since that is what a temperature rise across the
+coil carries; latent load rides on the same air and does not call for more of
+it. `SUPPLY_AIR_DELTA_T_K = 11` is the standard design range.
+
+**Specific fan power is derived from the register, not from literature.** §14
+says the simulator must agree with the asset register, and the register has the
+numbers: four AHUs rated 15 kW at 18,000 m³/h is **3.0 W per litre per second**.
+
+That produces a fan share of about **28% of HVAC**, which is high — and the
+honest reading is that it is a fact about the seeded register rather than about
+the model. 3.0 W/(l/s) is roughly double what ASHRAE 90.1 permits a new VAV
+system. This building's fans are modelled as the inefficient ones the register
+says they are, because §14 settles which of the two gives way. A real
+commissioning exercise would question the rating; the model should not quietly
+improve it.
+
+### The ambiguity worth knowing about
+
+**`equipment.rated_power_kw` means different things for different equipment
+types, and nothing in the schema says so.**
+
+| Type | Seeded value | What it evidently means |
+|---|---|---|
+| `chiller` | 320 kW ×2 | **Thermal capacity.** As electrical input it would imply a megawatt of cooling for a 4,800 m² building |
+| `ahu` | 15 kW at 18,000 m³/h | **Electrical** fan input — 3.0 W/(l/s) |
+| `vav` | 0.4 kW at 3,000 m³/h | Electrical, terminal fan and reheat |
+| `lighting_circuit` | 9.6 kW | Electrical connected load |
+
+Summing that column across types adds kilowatts of two different kinds. The
+fan query therefore restricts itself to `ahu` rows, and says why in its
+docstring. The schema-level fix is either a `rated_power_kind` discriminator or
+separate `rated_capacity_kw` and `rated_input_kw` columns; either is a
+migration plus a re-seed, and neither should happen without deciding which the
+BMS integration will actually populate.
+
+**Consequently the chillers' 320 kW is still not used for plant capacity.**
+§24's auto-sizing stands — its argument was against a flat W/m² rule, not
+against the register, so using the register would be consistent with it in
+principle. What stops it is that chiller capacity is a *building-level* number
+and §24's capacity is *per zone*: distributing one to the other means modelling
+the chiller→AHU→VAV tree that the schema already holds in
+`equipment_zone_service`. That is the next piece of air-side work, and it wants
+its own decision rather than being smuggled in here.
+
+**Also still not modelled:** fan heat into the supply air, which is a real gain
+of a few percent and introduces a feedback loop (more cooling, more air, more
+fan heat) that wants care rather than a line; duct leakage and thermal losses;
+and any part-load fan curve — power here is linear in flow, where a real
+variable-speed fan is closer to cubic, so this *overstates* fan energy at low
+load and understates the benefit of a VAV retrofit.

@@ -137,6 +137,14 @@ export const EnergyBreakdown = z.object({
    * docs/decisions.md §48.
    */
   latentKwh: z.number().nonnegative().nullable(),
+  /**
+   * Supply-fan electricity — also a SUBSET of `hvacKwh`.
+   *
+   * Separate from latent because they answer different questions: latent asks
+   * what the climate costs, fan asks what the air-side costs, and only one of
+   * those has an answer a facilities manager can act on this month.
+   */
+  fanKwh: z.number().nonnegative().nullable(),
   lightingKwh: z.number().nonnegative(),
   plugKwh: z.number().nonnegative(),
   totalKwh: z.number().nonnegative(),

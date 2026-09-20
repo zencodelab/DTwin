@@ -75,6 +75,13 @@ OCCUPANT_SENSIBLE_FRACTION = 0.62
 # is designed to hold.
 INDOOR_TARGET_RH_PCT = 50.0
 
+# Temperature rise across the cooling coil, K.
+#
+# Sets how much air has to move to carry a given sensible load: 10-12 K is the
+# standard design range for a comfort system, and it is what makes 3 W per l/s
+# of fan power into a believable share of the total rather than a free extra.
+SUPPLY_AIR_DELTA_T_K = 11.0
+
 
 class ZoneArrays:
     """Zone properties as parallel numpy arrays, in SI units."""
@@ -126,6 +133,11 @@ class ZoneArrays:
         self.setpoint = f("setpoint_temp_c") + (params.setpointDeltaK or 0.0)
         self.deadband = f("deadband_k")
         self.cop = f("hvac_cop") * (params.hvacCopScale or 1.0)
+        # Separate, because one COP for both directions is only right for a
+        # machine that has one. The seeded building reheats electrically, so
+        # its heating COP is 1.0 against a cooling 2.6-3.2 (§50). The scenario
+        # scale applies to cooling only: "chiller upgrade" is about the chiller.
+        self.heating_cop = f("heating_cop")
 
         # Which way each zone's exterior walls face, derived from the stored
         # polygons rather than stored alongside them (§49). An empty list means
@@ -304,6 +316,12 @@ def run(
     outdoor_humidity_series = psychro.humidity_ratio(series.dry_bulb_c, series.rh_pct)
     irradiance_by_zone = zone_irradiance(arrays, series, settings.ground_reflectance)
 
+    # Fan power per litre per second of supply air, from the asset register
+    # rather than a literature value (§14, §50). None means the register has
+    # nothing to say, and the honest answer is then to report no fan energy
+    # rather than to invent a plausible number.
+    sfp_w_per_l_s = repository.specific_fan_power_w_per_l_s(request.buildingId)
+
     temperature = arrays.setpoint.copy()
     interval_hours = request.intervalS / 3600.0
     dt = float(substep_s)
@@ -319,7 +337,7 @@ def run(
             key: np.zeros(len(zones))
             for key in ("hvac", "light", "plug", "solar", "internal",
                         "envelope", "ventilation", "unmet", "occupants", "temp",
-                        "latent")
+                        "latent", "fan")
         }
         steps_done = 0
 
@@ -415,7 +433,30 @@ def run(
             # unconditioned building in this climate does.
             latent_met = np.where(cooling > 0.0, q_latent, 0.0)
 
-            acc["hvac"] += (cooling + heating + latent_met) / arrays.cop * kwh
+            # Air-side energy. HVAC was thermal load divided by COP, with no
+            # term for moving the air — and moving air is not free: the supply
+            # fan runs whenever the coil does, and at 3 W per l/s it is a
+            # visible share of the total rather than a rounding error.
+            #
+            # Airflow follows the SENSIBLE load, because that is what a
+            # temperature rise across the coil carries. Latent load rides on
+            # the same air and does not call for more of it.
+            if sfp_w_per_l_s is None:
+                fan_w = np.zeros_like(cooling)
+            else:
+                airflow_l_s = (
+                    cooling / (AIR_CP_J_KGK * SUPPLY_AIR_DELTA_T_K * AIR_DENSITY_KG_M3)
+                ) * 1000.0
+                fan_w = airflow_l_s * sfp_w_per_l_s
+
+            # Not divided by COP: this is already electricity, not a thermal
+            # load a machine has to move.
+            acc["fan"] += fan_w * kwh
+            acc["hvac"] += (
+                (cooling + latent_met) / arrays.cop
+                + heating / arrays.heating_cop
+                + fan_w
+            ) * kwh
             acc["latent"] += latent_met / arrays.cop * kwh
             acc["light"] += q_light * kwh
             acc["plug"] += q_equip * kwh
@@ -452,7 +493,7 @@ def run(
                 float(acc["solar"][z]), float(acc["internal"][z]),
                 float(acc["envelope"][z]), float(acc["ventilation"][z]),
                 float(mean_occupants[z]), float(acc["unmet"][z]),
-                float(acc["latent"][z]),
+                float(acc["latent"][z]), float(acc["fan"][z]),
             ))
 
         # Flush periodically so a long run's memory stays flat, and so progress

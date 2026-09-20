@@ -86,6 +86,8 @@ class EnergyBreakdown(Wire):
     # Nullable because a run made before the latent model existed has none to
     # report, and 0.0 would claim it measured moisture and found none.
     latentKwh: float | None = None
+    # Also a subset of hvacKwh: supply-fan electricity.
+    fanKwh: float | None = None
     lightingKwh: float
     plugKwh: float
     totalKwh: float
