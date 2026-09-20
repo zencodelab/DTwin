@@ -222,7 +222,16 @@ try {
   serviceKey = (await createApiKey(TENANT, 'service', `smoke-service-${Date.now()}`,
     ['sim:notify'])).key;
 
-  server = spawn('npx', ['tsx', join(here, 'server.ts')], {
+  // The installed binary, not `npx`. Two reasons, and the second is why CI
+  // found this: npx is a wrapper process, so `server.kill('SIGTERM')` signals
+  // the wrapper and `exit` fires when the wrapper exits — while the node
+  // process that actually holds the port keeps running. On macOS the signal
+  // happened to reach through; on a Linux runner it did not, so [10] was
+  // asserting against a server that had never been asked to shut down. The
+  // Dockerfile already invokes the binary directly, for the adjacent reason
+  // that it keeps container start offline and instant.
+  const tsxBin = join(here, '..', '..', '..', 'node_modules', '.bin', 'tsx');
+  server = spawn(tsxBin, [join(here, 'server.ts')], {
     env: {
       ...process.env,
       INGEST_PORT: String(PORT),
@@ -882,11 +891,20 @@ try {
   const { rows: [before] } = await pool.query(`SELECT count(*) AS n FROM telemetry`);
   ws.close();
   server.kill('SIGTERM');
-  await new Promise<void>((r) => server!.once('exit', () => r()));
+  const exitCode = await new Promise<number | null>(
+    (r) => server!.once('exit', (code) => r(code)),
+  );
   await sleep(300);
   const { rows: [after] } = await pool.query(`SELECT count(*) AS n FROM telemetry`);
+
+  // The simulator is writing continuously at SIM_TICK_MS, so a clean shutdown
+  // must land MORE rows than were committed before the signal. `>=` would pass
+  // on a server that ignored SIGTERM entirely and lost its whole buffer, which
+  // is exactly what CI was doing while this check reported success.
   ok('buffered readings were flushed on SIGTERM, not lost',
-     Number(after.n) >= Number(before.n), `${before.n} -> ${after.n}`);
+     Number(after.n) > Number(before.n), `${before.n} -> ${after.n}`);
+  ok('the server exited on SIGTERM rather than being left running',
+     exitCode === 0, `exit code ${exitCode}`);
   ok('port released', await waitForPortFree(PORT));
 
 } finally {
