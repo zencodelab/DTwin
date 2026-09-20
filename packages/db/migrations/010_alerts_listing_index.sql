@@ -1,0 +1,31 @@
+-- =============================================================================
+-- 010_alerts_listing_index.sql — an index the alert listing can actually use
+--
+-- `listAlerts` orders by opened_at DESC and takes 200. Two indexes look like
+-- they should serve it and neither does, because both are PARTIAL:
+--
+--   alerts_open_idx        (003) … WHERE state <> 'resolved'
+--   alerts_tenant_open_idx (007) … WHERE state <> 'resolved'
+--
+-- They cover `GET /alerts?state=live`. They cannot cover the call the route
+-- makes by DEFAULT, which passes no state at all, nor `state=resolved` — a
+-- partial index is only usable when the planner can prove the query implies
+-- its predicate, and "no filter" implies nothing. Both of those fall back to a
+-- sequential scan plus a top-N sort of the whole table.
+--
+-- Measured on 50,000 alerts, for a tenant holding 1% of them:
+--
+--   without … Seq Scan + top-N heapsort   10.118 ms
+--   with    … Index Scan, 200 rows         0.145 ms
+--
+-- Honest caveat, because it decides when this matters: with ONE tenant owning
+-- every row — the single-building shape today — the planner still prefers the
+-- sequential scan, correctly, since the index is not selective there. This
+-- earns its place as the table grows or the second tenant arrives, which is
+-- the shape 007 built the schema for.
+--
+-- Not partial, deliberately. The whole defect above is a partial index that
+-- did not apply to the common call.
+-- =============================================================================
+
+CREATE INDEX alerts_tenant_opened_idx ON alerts (tenant_id, opened_at DESC);

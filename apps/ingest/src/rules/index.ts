@@ -1,6 +1,6 @@
 import { METRIC_UNITS, topics, type AlertWithContext, type Reading, type ServerMessage, type Topic } from '@dtwin/types';
 import type { Config } from '../config.ts';
-import type { Fanout } from '../fanout.ts';
+import { topicsFor, type Fanout } from '../fanout.ts';
 import type { RegisteredSensor, SensorRegistry } from '../registry.ts';
 import {
   evaluate, isEvaluable, FLATLINE_EPSILON,
@@ -334,11 +334,14 @@ export class AlertEngine {
     // The tenant's own alert stream, not a global one. `alerts:all` used to be
     // this line and was a cross-tenant broadcast of every alert in the system.
     const targets: Topic[] = tenantId ? [topics.tenantAlerts(tenantId)] : [];
-    if (sensor) {
-      if (sensor.zoneId) targets.push(topics.zone(sensor.zoneId));
-      if (sensor.floorId) targets.push(topics.floor(sensor.floorId));
-      if (sensor.buildingId) targets.push(topics.building(sensor.buildingId));
-    }
+
+    // `topicsFor`, not a second copy of the same expansion. This used to build
+    // its own list and left out the SENSOR topic, so a detail panel subscribed
+    // to `sensor:<id>` received that point's telemetry and never its alerts —
+    // the one subscription where you would most expect them. Two expansions of
+    // the same idea drifted, so now there is one.
+    if (sensor) targets.push(...topicsFor(sensor));
+
     for (const topic of targets) this.fanout.send(topic, message);
   }
 }

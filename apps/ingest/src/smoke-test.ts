@@ -505,6 +505,17 @@ try {
     if (p.ok) alertInbox.push(p.message);
   });
   alertWs.send(JSON.stringify({ type: 'subscribe', topics: [topics.tenantAlerts(TENANT)] }));
+
+  // A second socket on the SENSOR topic alone. The alert engine used to build
+  // its own topic list and leave this one out, so a detail panel watching one
+  // point received its telemetry and never its alerts.
+  const pointWs = await openSocket();
+  const pointInbox: ServerMessage[] = [];
+  pointWs.on('message', (d) => {
+    const p = parseServerMessage(d.toString());
+    if (p.ok) pointInbox.push(p.message);
+  });
+  pointWs.send(JSON.stringify({ type: 'subscribe', topics: [topics.sensor(probe.id)] }));
   await sleep(300);
 
   // -- debounce: a rule needing many consecutive breaches must not fire early --
@@ -538,6 +549,12 @@ try {
   ok('alert is joined to spatial context',
      hot?.zoneName != null && hot?.floorName != null,
      `${hot?.zoneName} / ${hot?.floorName}`);
+
+  await sleep(400);
+  ok('an alert reaches a subscriber watching only that sensor',
+     pointInbox.some((m) => m.type === 'alert.raised'),
+     [...new Set(pointInbox.map((m) => m.type))].join(',') || 'nothing received');
+  pointWs.close();
 
   ok('alert.raised was pushed over the WebSocket',
      alertInbox.some((m) => m.type === 'alert.raised' && m.alert.ruleId === hotRule));
@@ -957,6 +974,17 @@ try {
   const shutdownBatch = Array.from({ length: 5 }, (_, i) => ({
     externalId: probe.externalId, ts: shutdownTs + i, value: 21.5 + i / 100,
   }));
+
+  const shutdownFrom = new Date(shutdownTs);
+  const shutdownTo = new Date(shutdownTs + 1000);
+
+  // Clear the window first. Two runs started within a second of each other land
+  // in overlapping windows — an aborted run left rows behind and the next one
+  // counted six of five. The count has to be of this run's batch alone.
+  await pool.query(
+    'DELETE FROM telemetry WHERE sensor_id = $1 AND "time" >= $2 AND "time" < $3',
+    [probe.id, new Date(shutdownTs - 5_000), new Date(shutdownTs + 5_000)],
+  );
   const queued = await postJson(`${BASE}/ingest`, {
     readings: shutdownBatch, source: 'smoke-shutdown',
   });
@@ -974,8 +1002,6 @@ try {
   // and the simulator has been writing to this sensor the whole time, so an
   // open-ended range counts two days of its output as well — and the cleanup
   // below would then delete it.
-  const shutdownFrom = new Date(shutdownTs);
-  const shutdownTo = new Date(shutdownTs + 1000);
   const { rows: [landed] } = await pool.query<{ n: number }>(
     `SELECT count(*) AS n FROM telemetry
       WHERE sensor_id = $1 AND "time" >= $2 AND "time" < $3`,
