@@ -1228,6 +1228,14 @@ server started over its ceiling exits non-zero naming the variable; nine
 malformed or oversized query inputs are all 400; a century-long run and a
 one-second interval are both 422 and leave no run row behind.
 
+> **Since closed.** `listActiveTenants` now has a ceiling of 2,000 and throws
+> past it. "Deliberately" below was the wrong word for it: the docstring said
+> the design stops being right at thousands of tenants, and a limit is how a
+> design says where it stops. It throws rather than truncates for the same
+> reason the registry does — a list missing a tenant is a registry missing that
+> tenant's sensors, whose readings are then dropped as unknown ids, silently,
+> for whichever tenants sort last. And rate limiting arrived in §54.
+
 **Not bounded, deliberately:** `activeTenants()` still returns every tenant, and
 its own docstring already says why that is right for tens and wrong for
 thousands. The registry's spatial-id query is sized by zones rather than

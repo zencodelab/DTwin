@@ -185,22 +185,51 @@ export async function getTenant(
 }
 
 /**
+ * Most active tenants one call will return.
+ *
+ * The ceiling is where the design stops being right, not where the hardware
+ * gives out: ingest iterates this list and runs a scoped query per tenant per
+ * refresh, which is fine for tens and wrong for thousands. Past that the
+ * registry wants one query run as a role that can see across tenants, with the
+ * isolation moved into how the result is partitioned.
+ */
+export const MAX_ACTIVE_TENANTS = 2_000;
+
+export class TooManyTenantsError extends Error {
+  constructor(readonly limit: number) {
+    super(
+      `more than ${limit} active tenants. Every background loop in ingest runs one ` +
+      'scoped query per tenant per refresh, and that design was chosen for tens of ' +
+      'tenants. See MAX_ACTIVE_TENANTS in packages/db/src/queries/tenancy.ts.',
+    );
+    this.name = 'TooManyTenantsError';
+  }
+}
+
+/**
  * Every active tenant.
  *
  * For the multi-tenant background services — ingest builds its sensor registry
- * and loads alert rules by iterating this and scoping to each in turn. That is
- * one query per tenant per refresh, which is right for tens of tenants and
- * wrong for thousands; at that point the registry wants a single query run as a
- * role that can see across tenants, with the isolation moved into how the
- * result is partitioned. Worth knowing before this list gets long.
+ * and loads alert rules by iterating this and scoping to each in turn.
+ *
+ * Over the ceiling this THROWS rather than returning the first N
+ * (docs/decisions.md §53). A truncated tenant list is the worst of the
+ * available failures: the registry would load without the missing tenants'
+ * sensors, report their readings as unknown ids, and drop them — silently, for
+ * whichever tenants sort last by slug, and with every health check green. A
+ * throw fails the refresh, and a failed refresh keeps the previous registry.
  *
  * Unscoped, necessarily — the caller is asking which tenants exist.
  */
-export async function listActiveTenants(): Promise<Array<{ id: string; slug: string }>> {
+export async function listActiveTenants(
+  limit: number = MAX_ACTIVE_TENANTS,
+): Promise<Array<{ id: string; slug: string }>> {
   return withoutTenant(async (db) => {
     const { rows } = await db.query<{ id: string; slug: string }>(
-      `SELECT id, slug FROM tenants WHERE status = 'active' ORDER BY slug`,
+      `SELECT id, slug FROM tenants WHERE status = 'active' ORDER BY slug LIMIT $1`,
+      [limit + 1],
     );
+    if (rows.length > limit) throw new TooManyTenantsError(limit);
     return rows;
   });
 }

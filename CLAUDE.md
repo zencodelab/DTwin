@@ -30,7 +30,7 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **261 checks, all passing** (`db` 68, `ingest` 115, `sim` 55,
+Suites total **263 checks, all passing** (`db` 70, `ingest` 115, `sim` 55,
 `web` 23), plus **240 unit tests** (182 vitest, 58 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
@@ -97,7 +97,9 @@ Do not "optimise" it back to COPY.
   surfaced on `/healthz`.
 - **Every bound must say what it does when reached, and the answer differs**
   (`docs/decisions.md` §53). History truncates to the most recent; the spatial
-  tree THROWS, because there is no honest subset of a floor plan; the registry
+  tree THROWS, because there is no honest subset of a floor plan — and so does
+  the active-tenant list, since a list missing a tenant is a registry missing
+  its sensors; the registry
   keeps its previous copy; a request over its ceiling is refused before any row
   exists. Never clamp a query parameter silently — refuse and name the limit.
 - **Rate limits are per resource, keyed by whoever can exhaust it**

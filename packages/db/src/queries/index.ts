@@ -14,5 +14,6 @@ export {
   login, listMemberships, switchTenant, listBuildings, getTenant, listActiveTenants,
   createTenant, createUser, addMember, createApiKey,
   findUserByEmail, listApiKeys, revokeApiKey, rotateApiKey,
+  MAX_ACTIVE_TENANTS, TooManyTenantsError,
   type LoginResult, type CreatedApiKey,
 } from './tenancy.ts';

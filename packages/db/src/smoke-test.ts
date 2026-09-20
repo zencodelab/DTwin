@@ -21,6 +21,7 @@ import {
   getSpatialTree, findZoneAtPoint, insertReadings, SPATIAL_LIMITS, SpatialTreeTooLargeError,
   getLatestReadingsForZone, getSensorHistory, getZoneHeatmap,
   createTenant, listBuildings, getTenant, createUser, addMember, login,
+  listActiveTenants, TooManyTenantsError,
 } from './queries/index.ts';
 import {
   ClientMessage, TelemetryBatch, parseServerMessage,
@@ -451,6 +452,18 @@ const { rows: unscoped } = await owner.query<{ n: number }>(
 );
 ok('the owner pool still sees every building (it bypasses RLS, by design)',
    (unscoped[0]?.n ?? 0) >= 2, `got ${unscoped[0]?.n}`);
+
+// The tenant list is what every background loop in ingest iterates, so its
+// bound cannot truncate: a list missing a tenant means a registry missing that
+// tenant's sensors, whose readings are then dropped as unknown ids.
+const activeList = await listActiveTenants();
+ok('the tenant list holds both tenants within its ceiling',
+   activeList.some((t) => t.id === A.tenantId) && activeList.some((t) => t.id === bTenantId));
+let tenantCeiling: unknown = null;
+try { await listActiveTenants(1); } catch (err) { tenantCeiling = err; }
+ok('over its ceiling the tenant list throws rather than returning the first N',
+   tenantCeiling instanceof TooManyTenantsError,
+   tenantCeiling instanceof Error ? tenantCeiling.name : 'returned a truncated list');
 
 console.log('\n[9] Sign-in');
 // `login()` had no coverage in any suite: the web smoke runs on the demo tenant
