@@ -26,6 +26,7 @@ class WeatherSeries:
         dni: np.ndarray,
         dhi: np.ndarray,
         altitude_deg: np.ndarray,
+        azimuth_deg: np.ndarray,
         vertical_irradiance: np.ndarray,
         local_hour: np.ndarray,
         day_type_index: np.ndarray,
@@ -38,6 +39,9 @@ class WeatherSeries:
         self.dni = dni
         self.dhi = dhi
         self.altitude_deg = altitude_deg
+        # Carried so a zone can be given irradiance on its OWN facades rather
+        # than the cardinal average — see engine.zone_irradiance and §49.
+        self.azimuth_deg = azimuth_deg
         self.vertical_irradiance = vertical_irradiance
         self.local_hour = local_hour
         self.day_type_index = day_type_index
@@ -183,7 +187,7 @@ def build(
 
     return WeatherSeries(
         dry_bulb_c=dry_bulb, rh_pct=rh, ghi=ghi, dni=dni, dhi=dhi,
-        altitude_deg=altitude, vertical_irradiance=vertical,
+        altitude_deg=altitude, azimuth_deg=azimuth, vertical_irradiance=vertical,
         local_hour=local_hour, day_type_index=day_type,
     )
 

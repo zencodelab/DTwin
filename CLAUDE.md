@@ -121,8 +121,11 @@ service.
 - **HVAC uses ideal-loads control** — predict the unconditioned float, correct to
   the setpoint boundary. Never react after the deadband is crossed; that makes
   results depend on the integration step (`docs/decisions.md` §22).
-- **Solar gain uses real sun geometry.** Vertical-facade irradiance dips at solar
-  noon at this latitude — that is correct, not a bug.
+- **Solar gain uses real sun geometry**, on each zone's OWN facades — derived
+  from the stored polygons, never stored beside them (`docs/decisions.md` §49).
+  The cardinal average is the fallback for a zone whose geometry and asset
+  register disagree. Vertical-facade irradiance dips at solar noon at this
+  latitude — that is correct, not a bug.
 - **Latent load is a load on the COIL, not on the zone** (`docs/decisions.md`
   §48). Never put it in `q_net`: drying air does not change its temperature,
   and a building that cooled itself by dehumidifying would be the result. It is

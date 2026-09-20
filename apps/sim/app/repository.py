@@ -30,7 +30,12 @@ ZONE_SQL = """
          tp.lighting_power_density_w_m2, tp.equipment_power_density_w_m2,
          tp.occupancy_heat_gain_w_person,
          tp.setpoint_temp_c, tp.deadband_k,
-         tp.ventilation_l_s_person, tp.hvac_cop
+         tp.ventilation_l_s_person, tp.hvac_cop,
+         -- Geometry for deriving which way this zone's walls face. GeoJSON
+         -- rather than WKB because the consumer is Python doing vector maths,
+         -- not PostGIS doing a spatial predicate. See facade.py and §49.
+         ST_AsGeoJSON(z.boundary)::json -> 'coordinates' -> 0 AS zone_ring,
+         ST_AsGeoJSON(f.footprint)::json -> 'coordinates' -> 0 AS floor_ring
     FROM zones z
     JOIN floors f           ON f.id = z.floor_id
     JOIN thermal_profiles tp ON tp.id = z.thermal_profile_id

@@ -33,7 +33,7 @@ from uuid import UUID
 
 import numpy as np
 
-from . import psychro, repository
+from . import facade, psychro, repository, solar
 from . import weather as weather_mod
 from .config import settings
 from .models import SimulationRequest
@@ -127,6 +127,16 @@ class ZoneArrays:
         self.deadband = f("deadband_k")
         self.cop = f("hvac_cop") * (params.hvacCopScale or 1.0)
 
+        # Which way each zone's exterior walls face, derived from the stored
+        # polygons rather than stored alongside them (§49). An empty list means
+        # either a core zone with no outside wall, or geometry that did not
+        # resolve — the caller distinguishes them by exterior_wall_area_m2.
+        self.facades = [
+            facade.exterior_facades(z.get("zone_ring") or [], z.get("floor_ring") or [])
+            for z in zones
+        ]
+        self.exterior_wall_area = wall_area
+
         self.occupancy_scale = params.occupancyScale or 1.0
         self.capacity_w = np.zeros(n)  # sized once weather is known
 
@@ -172,6 +182,49 @@ class ZoneArrays:
             + (self.ua_envelope + self.ua_infiltration + ventilation_ua) * delta_t
         )
         self.capacity_w = settings.capacity_safety_factor * np.maximum(design_load, 1000.0)
+
+
+def zone_irradiance(
+    arrays: ZoneArrays, series: Any, ground_reflectance: float
+) -> np.ndarray:
+    """Irradiance on each zone's own glazing, `(zones, steps)` in W/m2.
+
+    The model used one series for every zone: the mean over the four cardinal
+    orientations, because orientation "is not in the schema". It is in the
+    geometry, so each zone now gets the length-weighted mean over the walls it
+    actually has.
+
+    This is not a refinement of a small error. A west office takes its peak
+    gain late in the afternoon, when outdoor temperature is also at its highest
+    and the plant has least headroom; an east office takes the same energy in
+    the morning, when it is cheap. The cardinal average puts both at the same
+    middling hour and erases the difference — which is precisely the difference
+    a facade-retrofit scenario would be asked about.
+
+    A zone whose geometry yields no exterior edge but which the asset register
+    says has exterior wall keeps the cardinal average. That is the honest
+    answer to a disagreement between two sources: fall back to the weaker
+    assumption rather than silently declaring the zone windowless.
+    """
+    n_steps = series.dry_bulb_c.size
+    out = np.zeros((len(arrays.ids), n_steps), dtype=float)
+
+    for z, facades in enumerate(arrays.facades):
+        if not facades:
+            if arrays.exterior_wall_area[z] > 0.0:
+                out[z, :] = series.vertical_irradiance
+            # else: a core zone, and zero is correct.
+            continue
+
+        total_length = sum(length for _, length in facades)
+        for azimuth, length in facades:
+            out[z, :] += (length / total_length) * solar.irradiance_on_surface(
+                series.dni, series.dhi, series.ghi,
+                series.altitude_deg, series.azimuth_deg,
+                azimuth, ground_reflectance,
+            )
+
+    return out
 
 
 def _schedule_tables(
@@ -249,6 +302,7 @@ def run(
         arrays.setpoint, np.full_like(arrays.setpoint, INDOOR_TARGET_RH_PCT)
     )
     outdoor_humidity_series = psychro.humidity_ratio(series.dry_bulb_c, series.rh_pct)
+    irradiance_by_zone = zone_irradiance(arrays, series, settings.ground_reflectance)
 
     temperature = arrays.setpoint.copy()
     interval_hours = request.intervalS / 3600.0
@@ -274,7 +328,7 @@ def run(
                 break
 
             t_out = series.dry_bulb_c[step_index]
-            irradiance = series.vertical_irradiance[step_index]
+            irradiance = irradiance_by_zone[:, step_index]
             hour = int(series.local_hour[step_index]) % 24
             day_type = int(series.day_type_index[step_index])
 

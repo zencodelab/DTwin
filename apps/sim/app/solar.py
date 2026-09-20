@@ -11,11 +11,12 @@ of a degree for a building-energy timestep, and the whole worker is currently
 one modest dependency set. Swapping in pvlib later is a drop-in for
 `solar_position`.
 
-ASSUMPTION worth knowing: zone facade orientation is not in the schema, so
-surface irradiance is averaged over the four cardinal orientations. That is
-correct for a zone with facades on all sides and conservative-to-wrong for a
-single-aspect perimeter zone. Recording orientation per zone is the fix, and it
-belongs in the model, not here.
+`mean_vertical_irradiance` averages over the four cardinal orientations and is
+now the FALLBACK, not the default. Orientation was never missing from the
+model — it is derivable from the stored polygons — so `engine.zone_irradiance`
+gives each zone irradiance on the walls it actually has, and falls back to this
+average only where the geometry and the asset register disagree. See
+`facade.py` and docs/decisions.md §49.
 """
 
 from __future__ import annotations

@@ -280,6 +280,35 @@ try:
         # evening. The profile therefore has twin peaks and a midday dip — which
         # is why east/west glazing, not south, is the problem in the tropics.
         # A model showing a noon peak here would have the geometry wrong.
+        # Orientation now comes from each zone's own walls, not an average
+        # over four aspects (§49). The decisive evidence is that two zones on
+        # the same floor, differing only in which side of the building they sit
+        # on, take their solar gain at different times of day. Averaging erased
+        # exactly this, and it is the difference a facade-retrofit question is
+        # asking about.
+        #
+        # OFF-100 is on the west edge, COR-102 on the east; both also have a
+        # south wall, which dilutes the contrast rather than creating it.
+        def peak_solar_hour_for(zone_name: str) -> int | None:
+            zone = next((z for z in base["byZone"] if z["zoneName"] == zone_name), None)
+            if zone is None:
+                return None
+            rows = client.get(
+                f"{BASE}/runs/{base['runId']}/results",
+                params={"zoneId": str(zone["zoneId"]), "limit": 10000},
+            ).json()["results"]
+            per_hour: dict[int, float] = {}
+            for r in rows:
+                h = datetime.fromisoformat(r["intervalStart"]).astimezone(TZ).hour
+                per_hour[h] = per_hour.get(h, 0.0) + r["solarGainKwh"]
+            return max(per_hour, key=lambda h: per_hour[h]) if per_hour else None
+
+        west_peak = peak_solar_hour_for("OFF-100")
+        east_peak = peak_solar_hour_for("COR-102")
+        ok("a west-edge zone takes its solar gain later than an east-edge one",
+           west_peak is not None and east_peak is not None and west_peak > east_peak,
+           f"west OFF-100 peaks {west_peak}:00, east COR-102 peaks {east_peak}:00")
+
         peak_solar_hour = max(solar_by_hour, key=lambda h: solar_by_hour[h])
         ok("vertical-facade solar peaks morning or afternoon, not at noon",
            peak_solar_hour in range(5, 10) or peak_solar_hour in range(14, 19),

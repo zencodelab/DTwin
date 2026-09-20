@@ -926,3 +926,54 @@ humidifier, so the model never adds moisture; no latent capacity limit separate
 from sensible, so a coil cannot run out of dehumidification while still having
 cooling left; and no sensible heat ratio on the equipment, so the split between
 the two is the load's, not the machine's.
+
+## 49. Facade orientation is derived from the geometry, not stored beside it
+
+`solar.py` averaged surface irradiance over the four cardinal orientations and
+said why: zone orientation "is not in the schema". Its own note added that
+recording it per zone "is the fix, and it belongs in the model, not here."
+
+It was already in the model. `zones.boundary` and `floors.footprint` are
+PostGIS polygons in a local metre CRS whose axes are declared — +X east,
++Y north (§1) — so which way a wall faces is a property of geometry the
+database already holds, not a new fact to record about it.
+
+**So it is derived, not added as a column.** A stored `facade_azimuth_deg`
+would be a second source of truth about where a wall points, free to drift from
+the polygon that actually says so. That is the failure §27 exists to avoid for
+the building as a whole, and it does not become acceptable one column at a
+time. An edge counts as exterior when its midpoint lies on the floor outline;
+the outward normal is whichever perpendicular points away from the zone
+centroid; the zone's irradiance is the length-weighted mean over the walls it
+has.
+
+**The averaged version was not a small error.** A west office takes its peak
+gain late in the afternoon, when the outdoor temperature is also at its highest
+and the plant has least headroom; an east office takes the same energy in the
+morning, when it is cheap. *Verified:* on one floor of the seeded building, the
+west-edge zone now peaks at **17:00** and the east-edge zone at **07:00**. The
+cardinal average put both at the same middling hour, which is exactly the
+difference a facade-retrofit or a shading scenario would be asked about —
+whole-building energy barely moved (8,043 to 8,003 kWh), because averaging over
+a building with all four aspects represented is nearly conservative in total
+and wrong for every zone individually.
+
+**Where the geometry and the asset register disagree, the weaker assumption
+wins.** A zone whose polygon yields no exterior edge but whose
+`exterior_wall_area_m2` says it has one keeps the cardinal average rather than
+being declared windowless. A core zone — no exterior edge and no wall area —
+gets zero, which is correct rather than conservative.
+
+**Limits worth stating.** The outward normal is chosen by comparing against the
+zone centroid, which is well defined for the convex, axis-aligned zones this
+building has and would need a proper point-in-polygon test for a concave one.
+Self-shading between wings, and shading from anything outside the building, are
+still not modelled. And the irradiance matrix is `(zones × steps)`: about
+20 MB for a year at a 300-second step, which is fine here and is the first
+thing to reconsider for a campus.
+
+The derivation is a pure function with no database in it, and has **12 unit
+tests** — corner zones, edge zones, core zones, an unclosed ring, a wall just
+inside the outline and one well inside it. A swapped normal would otherwise
+show up only as a building whose afternoon peak is in the morning, which is a
+slow and ambiguous way to find a sign error.
