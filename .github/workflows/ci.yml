@@ -105,6 +105,11 @@ jobs:
       SIM_BASE_URL: http://localhost:8000
       INGEST_BASE_URL: http://localhost:8787
       NEXT_PUBLIC_WS_URL: ws://localhost:8787/ws
+      # The web suite drives the dashboard without signing in, so it needs the
+      # demo-tenant fallback switched on. It defaults to off, which is the
+      # point — this line is the deliberate opt-in a deployment would have to
+      # make too, and CI failing without it is the guard working.
+      DTWIN_ALLOW_DEMO_TENANT: 'true'
 
     steps:
       - uses: actions/checkout@v4
