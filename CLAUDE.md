@@ -23,7 +23,9 @@ four packages are tenant-scoped:
   are authorised per tenant on subscribe.
 - `apps/web` — the tenant comes from the session cookie (`lib/tenant.ts`), never
   from a request parameter. With no session it falls back to
-  `DTWIN_DEMO_TENANT_ID`, which is **ignored when `NODE_ENV=production`**.
+  `DTWIN_DEMO_TENANT_ID`, which is **ignored when `NODE_ENV=production`**; an
+  unauthenticated request then redirects to `/login`. Routes return the one
+  shared `unauthorized()` 401 rather than hand-writing the body.
 - `apps/sim` — a ContextVar bound by `tenant_scope()`, read by `connection()`,
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
@@ -116,6 +118,15 @@ service.
 - Its venv is `apps/sim/.venv` (Python 3.12 via uv), matching the container.
 
 ## Web — `apps/web`
+
+- **There is a login screen** (`app/login`, `app/api/auth/*`), built on the
+  session machinery that already existed in `packages/db`. Before it, the
+  Compose stack was unusable: `next start` sets `NODE_ENV=production`, which
+  disables the demo-tenant fallback, and with no way to sign in the dashboard
+  rendered "Not signed in" and nothing else.
+- **The session cookie's `Secure` flag comes from the request protocol, not from
+  `NODE_ENV`.** Compose runs production over plain HTTP; a `Secure` cookie there
+  is dropped by every host except localhost.
 
 - **The 3D view is generated from the stored PostGIS geometry.** Do not
   introduce a GLB into the render path; it would be a second source of truth.

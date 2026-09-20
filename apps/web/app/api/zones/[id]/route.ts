@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withTenant } from '@dtwin/db';
 import { getLatestReadingsForZone } from '@dtwin/db/queries';
-import { currentTenant } from '@/lib/tenant';
+import { currentTenant, unauthorized } from '@/lib/tenant';
 
 export const dynamic = 'force-dynamic';
 
@@ -11,7 +11,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const ctx = await currentTenant();
-  if (!ctx) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+  if (!ctx) return unauthorized();
 
   const { id } = await params;
 

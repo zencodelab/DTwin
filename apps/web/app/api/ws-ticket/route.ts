@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { signWsTicket } from '@dtwin/db';
-import { currentTenant } from '@/lib/tenant';
+import { currentTenant, unauthorized } from '@/lib/tenant';
 
 export const dynamic = 'force-dynamic';
 
@@ -20,7 +20,7 @@ export const dynamic = 'force-dynamic';
  */
 export async function GET() {
   const ctx = await currentTenant();
-  if (!ctx) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+  if (!ctx) return unauthorized();
 
   const ticket = signWsTicket({
     tenantId: ctx.tenantId,

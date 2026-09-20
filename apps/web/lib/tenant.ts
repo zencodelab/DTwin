@@ -1,5 +1,8 @@
+import { cache } from 'react';
 import { cookies } from 'next/headers';
-import { resolveSession, type TenantContext } from '@dtwin/db';
+import { NextResponse } from 'next/server';
+import { resolveSession, type SessionRecord, type TenantContext } from '@dtwin/db';
+import type { TenantRole } from '@dtwin/types';
 
 /**
  * Who the dashboard is rendering for.
@@ -33,35 +36,88 @@ function demoTenant(): TenantContext | null {
   return tenantId ? { tenantId } : null;
 }
 
+/**
+ * One session resolution per request, shared by every caller below.
+ * `cache` is React's request-scoped memo, not a cross-request cache.
+ */
+const resolve = cache(async (): Promise<SessionRecord | null> => {
+  const token = (await cookies()).get(SESSION_COOKIE)?.value;
+  if (!token) return null;
+  return resolveSession(token);
+});
+
 /** Resolve the request's tenant, or null if the caller is not authenticated. */
 export async function currentTenant(): Promise<TenantContext | null> {
-  const token = (await cookies()).get(SESSION_COOKIE)?.value;
-
-  if (token) {
-    const session = await resolveSession(token);
-    if (session) {
-      return { tenantId: session.tenantId, userId: session.userId };
-    }
-  }
-
+  const session = await resolve();
+  if (session) return { tenantId: session.tenantId, userId: session.userId };
   return demoTenant();
 }
 
 /**
- * Resolve the tenant or throw.
+ * The one 401 every route returns.
  *
- * For API routes, where the alternative is returning data from no tenant at
- * all. Callers turn this into a 401; see `unauthorized()` below.
+ * It was written by hand in seven places, which is seven chances for the shape
+ * to drift and for a client to meet two different error bodies for the same
+ * condition. One function, one shape.
+ *
+ * This replaces a `requireTenant()` that threw an `UnauthenticatedError` nobody
+ * caught — it had no callers, and its own docstring pointed at an
+ * `unauthorized()` that had never been written. A throw is the wrong shape for
+ * a route handler anyway: every call site would need a try/catch to turn it
+ * back into a response, which is more code than the check it replaced.
  */
-export async function requireTenant(): Promise<TenantContext> {
-  const ctx = await currentTenant();
-  if (!ctx) throw new UnauthenticatedError();
-  return ctx;
+export function unauthorized(): NextResponse {
+  return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
 }
 
-export class UnauthenticatedError extends Error {
-  constructor() {
-    super('no session');
-    this.name = 'UnauthenticatedError';
-  }
+/**
+ * The signed-in person, when there is one.
+ *
+ * `currentTenant` answers "whose data" and is satisfied by the demo fallback;
+ * this answers "who" and is not — configuration is not a person, so in demo
+ * mode it returns null and the header renders a demo badge instead of a name.
+ *
+ * Wrapped in React's `cache` so a page that wants both the tenant and the
+ * viewer resolves the session once per request rather than once per caller.
+ */
+export interface Viewer {
+  tenantId: string;
+  userId: string;
+  sessionId: string;
+  displayName: string;
+  email: string;
+  role: TenantRole;
+}
+
+export async function currentViewer(): Promise<Viewer | null> {
+  const s = await resolve();
+  return s
+    ? {
+      tenantId: s.tenantId, userId: s.userId, sessionId: s.sessionId,
+      displayName: s.displayName, email: s.email, role: s.role,
+    }
+    : null;
+}
+
+/**
+ * Cookie attributes, in one place so the login and logout routes cannot
+ * disagree about them — a clear that does not match the set leaves the cookie
+ * behind and the user apparently signed in forever.
+ *
+ * `secure` is derived from the request rather than from NODE_ENV. The two are
+ * not the same thing: the Compose stack runs NODE_ENV=production over plain
+ * HTTP, and a Secure cookie there would be dropped by any browser that does not
+ * treat the host as trustworthy — that is, every host except localhost. Reading
+ * the forwarded protocol gets both cases right.
+ */
+export function cookieOptions(request: Request, expires?: Date) {
+  const forwarded = request.headers.get('x-forwarded-proto');
+  const proto = forwarded?.split(',')[0]?.trim() ?? new URL(request.url).protocol.replace(':', '');
+  return {
+    httpOnly: true,
+    sameSite: 'lax' as const,
+    secure: proto === 'https',
+    path: '/',
+    ...(expires ? { expires } : {}),
+  };
 }

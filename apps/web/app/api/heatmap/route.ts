@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withTenant } from '@dtwin/db';
 import { getZoneHeatmap } from '@dtwin/db/queries';
-import { currentTenant } from '@/lib/tenant';
+import { currentTenant, unauthorized } from '@/lib/tenant';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,7 +15,7 @@ export const dynamic = 'force-dynamic';
  */
 export async function GET(request: Request) {
   const ctx = await currentTenant();
-  if (!ctx) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+  if (!ctx) return unauthorized();
 
   const url = new URL(request.url);
   const buildingId = url.searchParams.get('buildingId');

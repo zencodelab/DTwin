@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { currentTenant } from '@/lib/tenant';
+import { currentTenant, unauthorized } from '@/lib/tenant';
 
 export const dynamic = 'force-dynamic';
 
@@ -17,7 +17,7 @@ const SIM_BASE = process.env.SIM_BASE_URL ?? 'http://localhost:8000';
  */
 export async function POST(request: Request) {
   const ctx = await currentTenant();
-  if (!ctx) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+  if (!ctx) return unauthorized();
 
   const body = await request.json();
   try {
@@ -40,7 +40,7 @@ export async function POST(request: Request) {
 
 export async function GET(request: Request) {
   const ctx = await currentTenant();
-  if (!ctx) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+  if (!ctx) return unauthorized();
 
   const runId = new URL(request.url).searchParams.get('runId');
   if (!runId) return NextResponse.json({ error: 'runId is required' }, { status: 400 });

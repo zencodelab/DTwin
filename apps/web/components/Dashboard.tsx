@@ -8,6 +8,7 @@ import { AlertList } from './panels/AlertList';
 import { Legend } from './panels/Legend';
 import { ScenarioPanel } from './panels/ScenarioPanel';
 import { ZonePanel } from './panels/ZonePanel';
+import { ViewerMenu } from './ViewerMenu';
 import {
   OVERLAY_LABELS, NO_DATA_DARK, NO_DATA_LIGHT, STATUS,
   magnitudeColor, temperatureColor, type OverlayMetric,
@@ -54,10 +55,14 @@ const OVERLAY_MAX: Record<OverlayMetric, number> = {
 export function Dashboard({
   tree,
   tenantId,
+  tenantName,
+  viewer,
   wsUrl,
 }: {
   tree: SpatialTree;
   tenantId: string;
+  tenantName: string;
+  viewer: { displayName: string; email: string; role: string } | null;
   wsUrl: string;
 }) {
   const [focusedFloorId, setFocusedFloorId] = useState<string | null>(null);
@@ -223,6 +228,7 @@ export function Dashboard({
             />
             {connected ? 'live' : 'reconnecting'}
           </span>
+          <ViewerMenu viewer={viewer} tenantName={tenantName} />
         </div>
       </header>
 

@@ -12,7 +12,7 @@
     "db:down": "docker compose down",
     "db:migrate": "npm run migrate -w @dtwin/db",
     "db:seed": "DTWIN_SEED_DEMO=true npm run migrate -w @dtwin/db",
-    "bootstrap": "npm run bootstrap -w @dtwin/db",
+    "bootstrap": "npm run bootstrap -w @dtwin/db --",
     "db:psql": "docker compose exec db psql -U dtwin -d dtwin",
     "typecheck": "npm run typecheck -w @dtwin/types && npm run typecheck -w @dtwin/db && npm run typecheck -w @dtwin/ingest && npm run typecheck -w @dtwin/web",
     "dev:ingest": "npm run dev -w @dtwin/ingest",
