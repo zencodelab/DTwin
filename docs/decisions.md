@@ -754,3 +754,40 @@ introduced now passes with no database fixture — `fakeRunId` still has no row 
 `simulation_runs` and does not need one — and `sim:<random uuid>` is still
 refused with `subscribe.denied`. Ingest went 82 passing + 1 failing to 84
 passing.
+
+## 46. A future-dated reading blinds the 5-minute view for everyone
+
+Found by CI, in the worst way: a test wrote five readings timestamped a day
+ahead — as a cheap way to claim a range nothing else writes to — deleted them
+immediately, and a *different* suite three steps later reported an empty
+history for a sensor that plainly had data.
+
+`telemetry_5m` is a continuous aggregate with `materialized_only = false`, so a
+read is the union of the materialised range and a live query over raw rows at
+or after the **materialisation watermark**. A refresh moves that watermark to
+the newest data it saw. If the newest data is dated tomorrow, the watermark
+goes to tomorrow — and every row subsequently written at the real "now" lands
+*below* the watermark, in the range the view answers from materialised results
+that were computed before those rows existed. The rows are in the hypertable
+and invisible in the view. Deleting the offending future row does not move the
+watermark back.
+
+*Verified* on a fresh database: one current row reads as one bucket; after a
+future row plus a refresh, a newly written current row adds no bucket, while
+the raw table shows it.
+
+Two consequences, and the second is the one that matters.
+
+**For tests:** claim a private range in the past, never the future. The past is
+below the watermark and already materialised, and any check that counts rows
+should read the hypertable rather than the rollup anyway.
+
+**For production: the watermark is a property of the hypertable, not of a
+tenant.** One gateway with a clock skewed into the future would blank the
+history view for *every tenant sharing that hypertable*, silently, with no
+error anywhere and the data sitting in the table the whole time. The quality
+gate checks that a value is plausible; nothing checks that a timestamp is.
+`assessQuality` should reject or clamp a reading dated beyond a small tolerance
+ahead of the server's clock, the same way it rejects a temperature of -273.
+That is not built — this decision records the hazard and the reason, and the
+fix belongs on the ingest path where the timestamp arrives.

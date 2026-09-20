@@ -898,7 +898,21 @@ try {
   // which is how CI reported `19311 -> 19311` as a failure. The quantity the
   // check is about is these specific readings, so it asks about these specific
   // readings.
-  const shutdownTs = Date.now() + 86_400_000; // future, so nothing else writes here
+  // Two days in the PAST, not the future.
+  //
+  // A future timestamp looked like the obvious way to claim a range nothing
+  // else writes to, and it broke the web suite on a different machine. Writing
+  // a row dated tomorrow and letting the continuous-aggregate policy refresh
+  // moves telemetry_5m's materialisation watermark past tomorrow — and
+  // real-time aggregation only covers buckets at or after the watermark. Every
+  // row written afterwards at the real "now" then falls into the materialised
+  // range, where it is not present, and the 5-minute view goes blank for
+  // everyone until the next refresh. Deleting the row does not move the
+  // watermark back. See docs/decisions.md §46.
+  //
+  // The past is safe: below the watermark, already materialised, and this check
+  // reads the raw hypertable directly, so materialisation is irrelevant to it.
+  const shutdownTs = Date.now() - 2 * 86_400_000;
   const shutdownBatch = Array.from({ length: 5 }, (_, i) => ({
     externalId: probe.externalId, ts: shutdownTs + i, value: 21.5 + i / 100,
   }));
@@ -915,9 +929,16 @@ try {
   );
   await sleep(300);
 
+  // A bounded window, not `>= shutdownTs`: the batch is five milliseconds wide
+  // and the simulator has been writing to this sensor the whole time, so an
+  // open-ended range counts two days of its output as well — and the cleanup
+  // below would then delete it.
+  const shutdownFrom = new Date(shutdownTs);
+  const shutdownTo = new Date(shutdownTs + 1000);
   const { rows: [landed] } = await pool.query<{ n: number }>(
-    `SELECT count(*) AS n FROM telemetry WHERE sensor_id = $1 AND "time" >= $2`,
-    [probe.id, new Date(shutdownTs)],
+    `SELECT count(*) AS n FROM telemetry
+      WHERE sensor_id = $1 AND "time" >= $2 AND "time" < $3`,
+    [probe.id, shutdownFrom, shutdownTo],
   );
   ok('buffered readings were flushed on SIGTERM, not lost',
      Number(landed?.n) === shutdownBatch.length,
@@ -925,8 +946,10 @@ try {
   ok('the server exited on SIGTERM rather than being left running',
      exitCode === 0, `exit code ${exitCode}`);
 
-  await pool.query('DELETE FROM telemetry WHERE sensor_id = $1 AND "time" >= $2',
-                   [probe.id, new Date(shutdownTs)]);
+  await pool.query(
+    'DELETE FROM telemetry WHERE sensor_id = $1 AND "time" >= $2 AND "time" < $3',
+    [probe.id, shutdownFrom, shutdownTo],
+  );
   ok('port released', await waitForPortFree(PORT));
 
 } finally {

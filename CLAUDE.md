@@ -68,6 +68,13 @@ Do not "optimise" it back to COPY.
   it and records `skipped:`, `db:seed` applies it, and the choice is one-way
   per database.
 - **SQL enums and `packages/types/src/enums.ts` must stay in sync.**
+- **Never write a future-dated reading, in a test or anywhere else.** A row
+  timestamped ahead of now moves `telemetry_5m`'s materialisation watermark past
+  the present when the refresh policy next runs, and real-time aggregation only
+  covers buckets at or after it — so every row written afterwards is in the
+  hypertable and invisible in the view, for **every tenant on that hypertable**,
+  until the next refresh. Deleting the row does not undo it. `docs/decisions.md`
+  §46, found by CI blanking an unrelated suite's history.
 - **Never average a cumulative meter.** `sensors.is_cumulative` marks them; use
   `delta(counter_agg)` from the hourly/daily aggregates.
 - **Parse at the boundary, never cast.** Everything arriving over HTTP or a
