@@ -9,7 +9,7 @@ cookie, with a non-production `DTWIN_DEMO_TENANT_ID` fallback) and `apps/sim`
 sets). `docker-compose.yml` and `.env.example` carry the new variables
 (`AUTH_SECRET`, `POSTGRES_APP_USER`/`POSTGRES_APP_PASSWORD`,
 `DATABASE_URL_OWNER`, `INGEST_API_KEY`, `DTWIN_DEMO_TENANT_ID`), and every
-service connects as the **app** role. The suites total 196 checks, 195 passing.
+service connects as the **app** role. The suites total 197 checks, all passing.
 
 **Two things the conversion forced that are worth knowing before changing
 anything:**
@@ -21,16 +21,13 @@ anything:**
    policy; connecting as a role that bypasses RLS would buy the speed back by
    discarding the guarantee.
 
-2. **`sim:<runId>` topics cannot be subscribed to at all.**
-   `Registry.maySubscribe` handles `alerts:` specially and otherwise defers to
-   `ownerOf`, which is keyed by sensor/zone/floor/building id and knows nothing
-   about run ids — so it returns undefined, which is correctly treated as
-   "refuse". The docstring above it says sim topics "are authorised separately,
-   against the run's own tenant"; that code was never written. Authorising them
-   needs a run→tenant lookup, i.e. I/O inside a subscribe path that is
-   synchronous today. **Not yet fixed** — the dashboard is unaffected, because
-   the server fans every sim event out to `topics.building(...)` too, and the
-   dashboard is already subscribed there.
+2. ~~**`sim:<runId>` topics cannot be subscribed to at all.**~~ **Fixed** —
+   simulation topics are now keyed by building rather than by run, so they
+   resolve through the same owner map as every other scope and need no lookup.
+   `maySubscribe` gained no branch; the change was deleting a docstring that
+   described code nobody had written. The reasoning, including why the three
+   obvious run-keyed fixes are each worse than the bug — one of them a
+   cross-tenant leak — is [decision 45](decisions.md#45-simulation-topics-are-keyed-by-building-not-by-run).
 
 DTwin is single-tenant today in the strongest sense: there is no tenant concept,
 no authentication, and no authorization. `buildingId` arrives as an unvalidated

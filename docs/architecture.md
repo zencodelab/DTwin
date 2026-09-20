@@ -159,10 +159,12 @@ the thermal model, and writes interval results in batches. Missing thermal
 profiles exclude zones, and the start response reports their count.
 
 Progress is stored on the run and posted best-effort to ingest. Ingest forwards
-events to `sim:<runId>` and `building:<buildingId>`. The browser supports these
-events and also polls HTTP. The dashboard currently changes from building to
-floor subscriptions when a floor is selected, so progress can fall back to
-polling in that view.
+events to `sim:<buildingId>` and `building:<buildingId>`. The browser supports
+these events and also polls HTTP. The sim topic is keyed by building, not by
+run ([decision 45](decisions.md#45-simulation-topics-are-keyed-by-building-not-by-run)),
+so it is stable for a session: a client can hold it while changing floor
+subscriptions, which is what closes the gap where a floor-focused dashboard
+falls back to polling for progress.
 
 The UI presets use the same fixed 20–23 June 2026 period and synthetic weather:
 baseline, +2 K setpoint, half lighting power, and 1.25× COP. The worker API is

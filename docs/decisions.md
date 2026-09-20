@@ -693,3 +693,58 @@ GRANT SELECT (sensor_id, "time") ON telemetry TO dtwin_app;
 ```
 
 *Verified:* the upsert works; `SELECT value` and `SELECT *` both remain denied.
+
+## 45. Simulation topics are keyed by building, not by run
+
+`sim:<runId>` could never be subscribed to. The topic-owner map is built from
+spatial ids at refresh, a run id is never in it, and `ownerOf` returning
+undefined is correctly treated as "refuse". Nobody noticed because every sim
+event is also fanned out to `building:<buildingId>`, where the dashboard already
+sits — and because **no client had ever subscribed to a sim topic**: `topics.sim`
+had exactly two call sites in the repository, the producer and the smoke test.
+
+Authorising a run id means a run→tenant lookup, which is I/O inside a subscribe
+path that is synchronous on purpose (`registry.ts`: "a database round trip there
+would make topic authorisation the slowest thing the socket does"). Three shapes
+were considered and each pays for that differently:
+
+- **An async predicate** needs per-connection frame serialisation to keep acks
+  in arrival order — including for `ping`, which the server deliberately answers
+  before the auth gate so a client can hold a socket while it fetches a ticket.
+  A tri-state `allow`/`deny`/`defer` does not avoid this: the frame after a
+  deferred one is dispatched immediately and its ack overtakes.
+- **An on-demand lookup** lets an authenticated client force one query per
+  unknown UUID, 64 per `subscribe` frame, with no rate limiting anywhere in
+  `server.ts`, against a ten-connection pool shared with the telemetry writer.
+  Random UUIDs are never repeated, so a negative cache buys nothing.
+- **A cache fed by the relay** is worse than the bug. `/internal/sim-event`
+  checks the event's `buildingId` against the key's tenant but nothing ties
+  `runId` to `buildingId`, so a holder of a valid `sim:notify` key for tenant A
+  could post an event naming its own building and tenant B's run id, caching
+  "run B is owned by A" — and `sim.complete` carries the full summary.
+
+The event already names the building, the building is already in the owner map,
+and the relay already performs exactly the ownership check that authorising a
+sim topic needs — once, on the write side, against an authenticated key. Keying
+the topic by building makes authorisation the check that already exists: no
+lookup, no cache, no ordering change, and one comparison now guards both
+destinations. `maySubscribe` needed no new branch; the fix was deleting a
+docstring that described code nobody had written.
+
+It also makes the topic **stable for a session**, which is what the client
+needs: `useLiveData` keys its effect on the topic list, so a run-keyed topic
+would tear down and reopen the socket once per simulation run.
+
+The cost, plainly: a client cannot follow exactly one run. Within a tenant it
+sees progress and summaries for every run on that building — colleagues'
+scenarios, never another tenant's. Every event still carries `runId`, and
+`ScenarioPanel` already filtered on it, so nothing downstream changed.
+Run-level addressing returns the day a client needs it, and it will arrive with
+the lookup, the per-connection rate limit and the bounded cache that make it
+safe. Building it now would pay that cost for a subscriber that does not exist.
+
+*Verified:* the smoke check that had been failing since the topic was
+introduced now passes with no database fixture — `fakeRunId` still has no row in
+`simulation_runs` and does not need one — and `sim:<random uuid>` is still
+refused with `subscribe.denied`. Ingest went 82 passing + 1 failing to 84
+passing.

@@ -42,7 +42,16 @@ export const topics = {
   floor: (id: string) => `floor:${id}` as Topic,
   zone: (id: string) => `zone:${id}` as Topic,
   sensor: (id: string) => `sensor:${id}` as Topic,
-  sim: (id: string) => `sim:${id}` as Topic,
+  /**
+   * Simulation events for one building's runs.
+   *
+   * Keyed by BUILDING, not by run — see docs/decisions.md §45. A run-keyed
+   * topic could never be authorised: the topic-owner map is built from spatial
+   * ids and has never heard of a run id. Every event already carries `runId`,
+   * so a client following one run filters on it, which is what the dashboard
+   * did anyway.
+   */
+  sim: (buildingId: string) => `sim:${buildingId}` as Topic,
   /** Every alert for one tenant. Replaces the old global `alerts:all`. */
   tenantAlerts: (tenantId: string) => `alerts:${tenantId}` as Topic,
 } as const;

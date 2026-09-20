@@ -12,14 +12,17 @@ definitions and smoke suites. **All four packages are tenant-scoped** —
 tenant-scoped queries, row-level security, API-key and WebSocket-ticket
 authentication in `packages/db` and `apps/ingest`; session-resolved tenancy in
 `apps/web`; and a context-bound scope in the Python worker. The stack builds and
-runs end to end, and the suites total **196 checks, 195 passing**.
+runs end to end. The suites total **197 checks, all passing**, plus **83 unit
+tests**, and CI runs all of it.
 
-**One known defect**, surfaced by the suite and left deliberately for a design
-decision rather than a rushed fix: `Registry.maySubscribe` has no `sim:` branch,
-so no client can subscribe to a `sim:<runId>` topic even though the docstring
-says those are authorised separately. It does not affect the dashboard, which
-receives run progress on the building topic the server also fans out to. See
-[multi-tenancy.md](docs/multi-tenancy.md).
+The one defect the suite had been carrying is closed. `sim:<runId>` topics could
+never be subscribed to — the topic-owner map is keyed by spatial ids and has
+never heard of a run id — while the docstring above it claimed they were
+"authorised separately". Simulation topics are now keyed by **building**, which
+makes authorisation the check the relay already performs. Each of the three
+obvious run-keyed fixes turned out worse than the bug, and one of them leaked
+across tenants; the reasoning is
+[decision 45](docs/decisions.md#45-simulation-topics-are-keyed-by-building-not-by-run).
 
 Email delivery and several reliability gaps also remain. See the dated
 [CTO assessment](docs/cto-assessment.md) and

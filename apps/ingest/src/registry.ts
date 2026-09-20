@@ -159,8 +159,10 @@ export class SensorRegistry {
    * not heard of is either not ours or not yet loaded, and neither is a reason
    * to stream data to a subscriber.
    *
-   * `sim:` topics are keyed by run id, which the registry does not track. They
-   * are authorised separately, against the run's own tenant.
+   * `sim:` topics need no special case: they are keyed by building id (§45),
+   * so they resolve through this same map. This paragraph used to claim they
+   * were "authorised separately, against the run's own tenant" — that code was
+   * never written, and while it said so every sim topic was silently refused.
    */
   ownerOf(topic: Topic): string | undefined {
     return this.#ownerById.get(topicId(topic));

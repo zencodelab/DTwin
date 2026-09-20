@@ -30,16 +30,20 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **196 checks, 195 passing** (`db` 58, `ingest` 82+1 failing,
-`sim` 37, `web` 18).
+Suites total **197 checks, all passing** (`db` 58, `ingest` 84, `sim` 37,
+`web` 18), plus **83 unit tests** (vitest + pytest). CI runs types, lint and
+unit tests in one job and the four smoke suites against a real database in
+another.
 
-**Known defect, left for a design decision:** `Registry.maySubscribe` has no
-`sim:` branch, so `sim:<runId>` topics can never be subscribed to — its own
-docstring says they are "authorised separately, against the run's own tenant",
-and that was never implemented. Authorising them needs a run→tenant lookup,
-which is I/O, and the socket message handler is synchronous today; making it
-async changes frame-ordering guarantees. The dashboard is unaffected because
-the server fans every sim event out to the building topic as well.
+**`sim:` topics are keyed by BUILDING, not by run** (`docs/decisions.md` §45).
+A run-keyed topic could never be authorised — the owner map is built from
+spatial ids — and every run-keyed fix is worse than the bug: an async predicate
+needs per-connection frame serialisation including for `ping`, an on-demand
+lookup lets a client force a query per unknown UUID against a shared ten-
+connection pool, and a relay-fed cache is a **cross-tenant leak** because the
+relay checks `buildingId` against the key's tenant but nothing ties `runId` to
+`buildingId`. Every event still carries `runId`; a client following one run
+filters on it.
 
 **Open item, pre-existing:** an email transport. The channel is wired and
 audited in `alert_notifications`; only the sender is missing, so email

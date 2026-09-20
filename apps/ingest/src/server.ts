@@ -126,10 +126,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         return send(res, 403, { error: 'building does not belong to this tenant' });
       }
 
-      // Both topics: a panel watching one run subscribes to sim:<id>, while the
-      // dashboard is already on the building topic and should not have to
-      // subscribe and unsubscribe per run to follow one.
-      for (const topic of [topics.sim(event.runId), topics.building(event.buildingId)]) {
+      // Both topics, and the check above now guards both: `sim:` is keyed by
+      // building (§45), so it authorises through the same owner map as
+      // `building:`. The dashboard sits on the building topic today; the sim
+      // topic is the one a client can hold without the telemetry firehose.
+      for (const topic of [topics.sim(event.buildingId), topics.building(event.buildingId)]) {
         pipeline.fanout.send(topic, event as ServerMessage);
       }
       return send(res, 202, { forwarded: true });

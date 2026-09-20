@@ -286,7 +286,7 @@ posting service key's tenant (see the ingest table above). Parse browser frames
 with `parseServerMessage` and tuples with `expandReading`.
 
 There is no durable event cursor, replay, or guaranteed delivery. Subscribe to
-the relevant `sim:<runId>` or building topic for simulation events, and retain
+the relevant `sim:<buildingId>` or building topic for simulation events, and retain
 HTTP recovery. See [architecture](architecture.md) for backpressure behavior.
 
 ## Webhook notifications

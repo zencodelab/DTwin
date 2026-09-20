@@ -9,6 +9,7 @@
  * Requires a migrated, seeded database. Run with:  npm run smoke -w @dtwin/ingest
  */
 import { createServer, type Server } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -692,9 +693,30 @@ try {
   const { rows: [bldg] } = await pool.query<{ id: string }>(
     'SELECT id FROM buildings LIMIT 1');
   const buildingId = bldg!.id;
+  // `fakeRunId` never gets a row in simulation_runs, and does not need one:
+  // the topic is keyed by building (§45), so the run id travels in the payload
+  // and is the client's business, not the authorisation's.
   const fakeRunId = '00000000-0000-4000-8000-000000000abc';
-  simWs.send(JSON.stringify({ type: 'subscribe', topics: [topics.sim(fakeRunId)] }));
+  simWs.send(JSON.stringify({ type: 'subscribe', topics: [topics.sim(buildingId)] }));
   await sleep(300);
+
+  // Re-keying the topic must not have turned the whole `sim:` scope into a
+  // wildcard. A building id this tenant does not own resolves to no owner, and
+  // an unknown owner is refused — the same rule every other scope obeys.
+  const strangerWs = await openSocket();
+  const strangerInbox: ServerMessage[] = [];
+  strangerWs.on('message', (d) => {
+    const parsed = parseServerMessage(d.toString());
+    if (parsed.ok) strangerInbox.push(parsed.message);
+  });
+  strangerWs.send(JSON.stringify({
+    type: 'subscribe', topics: [topics.sim(randomUUID())],
+  }));
+  await sleep(300);
+  ok('a sim topic for an unknown building is refused',
+     strangerInbox.some((m) => m.type === 'subscribe.denied'),
+     strangerInbox.map((m) => m.type).join(',') || 'nothing received');
+  strangerWs.close();
 
   const unauthorised = await fetch(`${BASE}/internal/sim-event`, {
     method: 'POST',
