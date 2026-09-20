@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **225 checks, all passing** (`db` 58, `ingest` 98, `sim` 51,
-`web` 18), plus **134 unit tests** (96 vitest, 38 pytest). CI runs types,
+Suites total **233 checks, all passing** (`db` 60, `ingest` 99, `sim` 54,
+`web` 20), plus **165 unit tests** (115 vitest, 50 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -88,6 +88,15 @@ Do not "optimise" it back to COPY.
 - **Shed load, never queue it unboundedly.** Slow WebSocket clients get frames
   skipped; the write buffer drops oldest on overflow. Both are counted and
   surfaced on `/healthz`.
+- **Every bound must say what it does when reached, and the answer differs**
+  (`docs/decisions.md` §53). History truncates to the most recent; the spatial
+  tree THROWS, because there is no honest subset of a floor plan; the registry
+  keeps its previous copy; a request over its ceiling is refused before any row
+  exists. Never clamp a query parameter silently — refuse and name the limit.
+- **Do not make the registry refresh incremental on `updated_at`.** The writer
+  stamps `last_seen_at` every flush, which fires the trigger, so every
+  reporting sensor has always "changed". It needs a column the writer does not
+  touch.
 - **The simulator must agree with the asset register.** If a value would
   contradict the seeded model, the generator is wrong, not the model.
 - **Alert rules: keep debounce symmetric, keep flagged readings out of value

@@ -44,16 +44,29 @@ export const SimulationParams = z.object({
 });
 export type SimulationParams = z.infer<typeof SimulationParams>;
 
+/**
+ * How much one request may ask for. Mirrors `apps/sim/app/models.py` — change
+ * one, change the other.
+ *
+ * The request was bounded only by `intervalS > 0`, so a century at one-second
+ * resolution was valid. 40,000 intervals is a year at fifteen minutes; the
+ * interval floor matters as much as the count, because the integration substep
+ * is min(300 s, interval).
+ */
+export const SIM_MAX_INTERVALS = 40_000;
+export const SIM_MIN_INTERVAL_S = 60;
+export const SIM_MAX_INTERVAL_S = 86_400;
+
 export const SimulationRequest = z.object({
   buildingId: BuildingId,
-  scenarioName: z.string().min(1),
-  description: z.string().optional(),
+  scenarioName: z.string().min(1).max(200),
+  description: z.string().max(2000).optional(),
   periodStart: z.coerce.date(),
   periodEnd: z.coerce.date(),
-  intervalS: z.number().int().positive().default(3600),
+  intervalS: z.number().int().min(SIM_MIN_INTERVAL_S).max(SIM_MAX_INTERVAL_S).default(3600),
   params: SimulationParams.default({}),
   /** Restrict to a subset of zones; omit to run the whole building. */
-  zoneIds: z.array(ZoneId).optional(),
+  zoneIds: z.array(ZoneId).max(5000).optional(),
   /**
    * Weather source. `observed` replays weather_observations for the period;
    * `inline` uses the supplied series; `synthetic` generates a design day.
@@ -61,7 +74,10 @@ export const SimulationRequest = z.object({
   weather: z
     .discriminatedUnion('mode', [
       z.object({ mode: z.literal('observed') }),
-      z.object({ mode: z.literal('inline'), series: z.array(WeatherPoint).min(1) }),
+      z.object({
+        mode: z.literal('inline'),
+        series: z.array(WeatherPoint).min(1).max(SIM_MAX_INTERVALS),
+      }),
       z.object({
         mode: z.literal('synthetic'),
         peakDryBulbC: z.number(),
@@ -73,7 +89,12 @@ export const SimulationRequest = z.object({
 })
   .refine((r) => r.periodEnd > r.periodStart, {
     message: 'periodEnd must be after periodStart',
-  });
+  })
+  .refine(
+    (r) => (r.periodEnd.getTime() - r.periodStart.getTime()) / 1000 / r.intervalS
+      <= SIM_MAX_INTERVALS,
+    { message: `period must be at most ${SIM_MAX_INTERVALS} intervals` },
+  );
 export type SimulationRequest = z.infer<typeof SimulationRequest>;
 
 export const SimulationRun = z.object({

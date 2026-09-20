@@ -1,9 +1,14 @@
-export { getSpatialTree, findZoneAtPoint } from './spatial.ts';
+export {
+  getSpatialTree, findZoneAtPoint, SPATIAL_LIMITS, SpatialTreeTooLargeError,
+  type SpatialLimits,
+} from './spatial.ts';
 export {
   insertReadings,
   getLatestReadingsForZone,
   getSensorHistory,
   getZoneHeatmap,
+  maxHistoryHours,
+  MAX_HEATMAP_HOURS,
 } from './telemetry.ts';
 export {
   login, listMemberships, switchTenant, listBuildings, getTenant, listActiveTenants,

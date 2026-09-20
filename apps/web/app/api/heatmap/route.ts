@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { withTenant } from '@dtwin/db';
-import { getZoneHeatmap } from '@dtwin/db/queries';
+import { getZoneHeatmap, MAX_HEATMAP_HOURS } from '@dtwin/db/queries';
+import { MetricType } from '@dtwin/types';
+import { badRequest, parseHours, parseUuid } from '@/lib/params';
 import { currentTenant, unauthorized } from '@/lib/tenant';
 
 export const dynamic = 'force-dynamic';
@@ -18,16 +20,23 @@ export async function GET(request: Request) {
   if (!ctx) return unauthorized();
 
   const url = new URL(request.url);
-  const buildingId = url.searchParams.get('buildingId');
-  const metric = url.searchParams.get('metric') ?? 'temperature_c';
-  const hours = Number(url.searchParams.get('hours') ?? 1);
 
-  if (!buildingId) {
-    return NextResponse.json({ error: 'buildingId is required' }, { status: 400 });
-  }
+  const building = parseUuid(url.searchParams.get('buildingId'), 'buildingId');
+  if (!building.ok) return building.response;
+  const buildingId = building.value;
+
+  // Parsed, not cast into the query: `$2::metric_type` raises on an unknown
+  // label, which made a typo in a metric name a 500.
+  const metricParam = MetricType.safeParse(url.searchParams.get('metric') ?? 'temperature_c');
+  if (!metricParam.success) return badRequest('unknown metric');
+  const metric = metricParam.data;
+
+  const window = parseHours(url.searchParams.get('hours'),
+                            { fallback: 1, max: MAX_HEATMAP_HOURS });
+  if (!window.ok) return window.response;
 
   const to = new Date();
-  const from = new Date(to.getTime() - hours * 3600_000);
+  const from = new Date(to.getTime() - window.value * 3600_000);
 
   // `buildingId` is still caller-supplied, but it is no longer load-bearing for
   // isolation: the query runs inside this tenant's scope, so naming another

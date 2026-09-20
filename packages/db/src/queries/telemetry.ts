@@ -130,6 +130,22 @@ const MAX_BUCKETS: Record<AggregateResolution, number> = {
   '1d': 1_830,  // five years
 };
 
+const BUCKET_HOURS: Record<AggregateResolution, number> = { '5m': 5 / 60, '1h': 1, '1d': 24 };
+
+/**
+ * The longest span `getSensorHistory` will answer in full, in hours.
+ *
+ * For a route to check BEFORE it queries. The LIMIT inside the query is the
+ * safety net and truncates silently; this is what lets a caller be told, with
+ * a 400 that names the limit, instead of being handed less than it asked for.
+ */
+export function maxHistoryHours(resolution: AggregateResolution): number {
+  return MAX_BUCKETS[resolution] * BUCKET_HOURS[resolution];
+}
+
+/** The heatmap reads the hourly rollup for every zone at once; a month is plenty. */
+export const MAX_HEATMAP_HOURS = 31 * 24;
+
 export async function getSensorHistory(
   db: Db,
   sensorId: string,

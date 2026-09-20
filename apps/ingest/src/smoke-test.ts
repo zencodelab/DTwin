@@ -250,6 +250,11 @@ try {
       // default. Opened deliberately here; the guard itself is tested directly.
       ALERT_WEBHOOK_ALLOW_PRIVATE: 'true',
       ALERT_NOTIFY_RETRY_MS: '1000',
+      // Far below the 190 seeded sensors, so the registry load crosses several
+      // page boundaries. At the default of 5,000 this suite would only ever
+      // exercise a single page, and an off-by-one at the boundary — a sensor
+      // dropped or fetched twice — is exactly what paging gets wrong.
+      INGEST_REGISTRY_PAGE_ROWS: '50',
       ALERT_SMTP_URL: 'smtp://127.0.0.1:9712',
       ALERT_EMAIL_FROM: 'dtwin-alerts@example.invalid',
       AUTH_SECRET,
@@ -264,7 +269,10 @@ try {
   console.log('\n[1] Health and registry');
   const health = await getJson<Health>(`${BASE}/healthz`);
   ok('healthz reports ok', health.status === 'ok', health.status);
-  ok('registry loaded 190 sensors', health.sensors === 190, String(health.sensors));
+  // Loaded in pages of 50 (see the server env above), so an exact 190 also
+  // says no sensor was dropped or fetched twice at a page boundary.
+  ok('registry loaded 190 sensors', health.sensors === 190,
+     `${health.sensors}, in pages of 50`);
 
   // Poll rather than assume: /healthz answers as soon as the server is
   // listening, which can be before the simulator's first tick.
@@ -1222,6 +1230,32 @@ try {
     [probe.id, shutdownFrom, shutdownTo],
   );
   ok('port released', await waitForPortFree(PORT));
+
+  // ------------------------------------------------------------- ceilings
+  console.log('\n[11] Bounds');
+  // The registry has to hold every active sensor, so its bound cannot be a
+  // LIMIT — a registry missing sensors reports real points as unknown. It is a
+  // ceiling that fails loudly. At boot there is no previous registry to fall
+  // back on, so the service must refuse to start rather than come up holding a
+  // partial one.
+  const refused = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    let stderr = '';
+    const child = spawn(tsxBin, [join(here, 'server.ts')], {
+      env: {
+        ...process.env, AUTH_SECRET,
+        INGEST_PORT: String(PORT + 1),
+        INGEST_REGISTRY_MAX_SENSORS: '100',
+        SIM_ENABLED: 'false',
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
+    child.once('exit', (code) => { clearTimeout(timer); resolve({ code, stderr }); });
+  });
+  ok('a registry over its ceiling refuses to start, and says why',
+     refused.code !== 0 && refused.stderr.includes('INGEST_REGISTRY_MAX_SENSORS'),
+     `exit ${refused.code}; ${refused.stderr.includes('would exceed') ? 'named the limit' : 'no explanation'}`);
 
 } finally {
   server?.kill('SIGKILL');

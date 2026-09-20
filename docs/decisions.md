@@ -1170,3 +1170,61 @@ server with zero hits.
 itself a proxy into a private network is outside what any client-side check can
 see, which is why the assessment's other recommendation — an egress policy on
 the host — remains the right complement rather than something this replaces.
+
+## 53. Every bound says what it does when it is reached
+
+"Shed load, never queue it unboundedly" was already a hard rule for the write
+buffer and the socket backlog. It had not been applied to reads, to the
+registry, or to what a single request may ask for. Going through them, the
+interesting part was not adding limits — it was that **the right behaviour at
+the limit is different each time**, and a bound that does the wrong thing when
+reached is a second bug.
+
+| What | Bound | At the limit | Why that, and not the other |
+|---|---|---|---|
+| Sensor history | buckets per resolution | route **refuses** (400, names the limit); query truncates to the most recent as a safety net | A capped time series still means something — it is the latest window |
+| Spatial tree | rows per collection | **throws** | There is no honest subset of a floor plan. Zones that are not drawn cannot be clicked, cannot alert, and look exactly like zones that do not exist |
+| Sensor registry | total sensors | refresh **abandoned, previous registry kept** | It must hold every sensor to work, so it cannot be a LIMIT — a registry missing sensors reports real points as unknown. Stale and correct beats current and OOM-killed. At boot there is no previous one, so the service refuses to start |
+| Unknown-id memory | entries | id **not remembered**, no early refresh | The map is written by callers — 10,000 invented ids a batch. Nothing is lost: the timer refresh still runs, and a flood of junk ids has no claim on an early one |
+| Simulation request | intervals, interval floor, zone-steps | **refused** (422), before any row exists | A 202 for a century at one second is a promise the worker cannot keep |
+| `?hours=` | per query | **refused**, not clamped | Clamping answers a different question without saying so: a chart asking for ten years and given a week draws a week and labels it ten years |
+
+Three things found on the way that were not about size at all:
+
+**An incremental registry refresh does not work here**, though it is the
+obvious improvement. The writer stamps `sensors.last_seen_at` on every flush,
+which fires the `updated_at` trigger — so every sensor that is reporting has
+"changed" since the last refresh, and `WHERE updated_at > $last` re-fetches
+exactly the sensors that matter. The load is keyset-paged instead, which bounds
+what any one statement returns; node-postgres buffers a whole result set, so
+the process used to hold the table twice, once as rows and once as the maps
+built from them. Making it truly incremental needs a column the writer does not
+touch.
+
+**`runId` went into the worker's URL path unchecked.**
+`GET /api/simulate?runId=../weather/generate` asked the worker for a different
+route. A GET, so limited — but ids bound for a `uuid` comparison or a URL path
+are now parsed as uuids, which also turns a class of 500s into 400s: Postgres
+raises on a malformed uuid rather than matching nothing, and `$2::metric_type`
+raises on an unknown label.
+
+**§47's admission cap bounded how many runs, not how large.** The request
+validated with `intervalS > 0` and nothing else. The interval floor matters as
+much as the count — the integration substep is `min(300 s, interval)` — and
+the product `zones × steps` needed its own ceiling, because §49's per-zone
+irradiance matrix is exactly that shape: 5,000 zones for a year at 300 seconds
+is four gigabytes in one allocation. It is checked before the weather series
+exists, since the point of a ceiling is not to have already allocated what it
+forbids.
+
+*Verified:* the spatial ceiling throws at 5 zones and loads at exactly 24; the
+registry loads 190 sensors in pages of 50 with none dropped or doubled, and a
+server started over its ceiling exits non-zero naming the variable; nine
+malformed or oversized query inputs are all 400; a century-long run and a
+one-second interval are both 422 and leave no run row behind.
+
+**Not bounded, deliberately:** `activeTenants()` still returns every tenant, and
+its own docstring already says why that is right for tens and wrong for
+thousands. The registry's spatial-id query is sized by zones rather than
+sensors and rides under the same practical ceiling. And none of this is rate
+limiting — a bound on one request says nothing about how many requests arrive.

@@ -57,6 +57,11 @@ const REGISTRY_SQL = `
       FROM sensors s
       LEFT JOIN equipment e ON e.id = s.equipment_id
      WHERE s.is_active
+       -- Keyset, not OFFSET: each page is an index range scan from where the
+       -- last one stopped, so page 100 costs the same as page 1.
+       AND s.id > $1::uuid
+     ORDER BY s.id
+     LIMIT $2
   )
   SELECT b.id, b.external_id AS "externalId", b.name, b.metric, b.unit,
          b.tenant_id AS "tenantId",
@@ -72,6 +77,43 @@ const REGISTRY_SQL = `
     LEFT JOIN floors zf ON zf.id = z.floor_id
     LEFT JOIN floors ef ON ef.id = b.eq_floor_id
 `;
+
+export interface RegistryOptions {
+  /** Rows per query while loading. */
+  pageRows: number;
+  /** Ceiling on sensors held, across every tenant. */
+  maxSensors: number;
+  /** Most unknown external ids remembered between refreshes. */
+  unknownMax: number;
+  unknownRetryMs: number;
+}
+
+const DEFAULT_OPTIONS: RegistryOptions = {
+  pageRows: 5_000,
+  maxSensors: 500_000,
+  unknownMax: 10_000,
+  unknownRetryMs: 30_000,
+};
+
+/** Sorts before every real id, so the first page starts at the beginning. */
+const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * The registry would exceed its ceiling.
+ *
+ * Thrown out of `refresh()` before the swap, so the maps in service are
+ * untouched: the process keeps running on the last good registry.
+ */
+export class RegistryTooLargeError extends Error {
+  constructor(readonly limit: number) {
+    super(
+      `sensor registry would exceed ${limit} sensors; keeping the previous ` +
+        'registry in service. Raise INGEST_REGISTRY_MAX_SENSORS deliberately, ' +
+        'or shard ingest by building.',
+    );
+    this.name = 'RegistryTooLargeError';
+  }
+}
 
 export class SensorRegistry {
   /**
@@ -93,8 +135,11 @@ export class SensorRegistry {
    */
   #unknown = new Map<string, number>();
   #refreshing: Promise<void> | null = null;
+  readonly #options: RegistryOptions;
 
-  static readonly UNKNOWN_RETRY_MS = 30_000;
+  constructor(options: Partial<RegistryOptions> = {}) {
+    this.#options = { ...DEFAULT_OPTIONS, ...options };
+  }
 
   static key(tenantId: string, externalId: string): string {
     return `${tenantId}:${externalId}`;
@@ -112,19 +157,46 @@ export class SensorRegistry {
 
       // One scoped pass per tenant. The registry spans tenants; every query
       // that builds it does not.
-      for (const tenant of await activeTenants()) {
-        const { rows } = await withTenant({ tenantId: tenant.id }, (db) =>
-          db.query<RegisteredSensor>(REGISTRY_SQL));
+      const { pageRows, maxSensors } = this.#options;
 
-        for (const r of rows) {
-          byExternalId.set(SensorRegistry.key(r.tenantId, r.externalId), r);
-          byId.set(r.id, r);
-          // Every id a topic can name maps to its owner.
-          ownerById.set(r.id, r.tenantId);
-          if (r.zoneId) ownerById.set(r.zoneId, r.tenantId);
-          if (r.floorId) ownerById.set(r.floorId, r.tenantId);
-          if (r.buildingId) ownerById.set(r.buildingId, r.tenantId);
-        }
+      for (const tenant of await activeTenants()) {
+        // Paged, because one statement used to return every active sensor the
+        // tenant has and node-postgres buffers a whole result set before
+        // handing any of it over — so the process briefly held the table
+        // twice, once as rows and once as the maps being built from them. The
+        // maps still hold everything, necessarily; what is bounded is the
+        // transient, and how long any one statement runs.
+        //
+        // An incremental "only what changed" refresh is the obvious better
+        // idea and does not work here: the writer stamps `last_seen_at` on
+        // every flush, which fires the `updated_at` trigger, so every sensor
+        // that is reporting has changed since the last refresh. It would
+        // re-fetch exactly the sensors that matter.
+        await withTenant({ tenantId: tenant.id }, async (db) => {
+          let cursor = NIL_UUID;
+          for (;;) {
+            const { rows } = await db.query<RegisteredSensor>(
+              REGISTRY_SQL, [cursor, pageRows]);
+
+            for (const r of rows) {
+              byExternalId.set(SensorRegistry.key(r.tenantId, r.externalId), r);
+              byId.set(r.id, r);
+              // Every id a topic can name maps to its owner.
+              ownerById.set(r.id, r.tenantId);
+              if (r.zoneId) ownerById.set(r.zoneId, r.tenantId);
+              if (r.floorId) ownerById.set(r.floorId, r.tenantId);
+              if (r.buildingId) ownerById.set(r.buildingId, r.tenantId);
+              // The outer query does not promise order, so track the page's
+              // highest id rather than trusting its last row.
+              if (r.id > cursor) cursor = r.id;
+            }
+
+            // Checked per page, not at the end: the point of a ceiling is not
+            // to have already allocated what it forbids.
+            if (byId.size > maxSensors) throw new RegistryTooLargeError(maxSensors);
+            if (rows.length < pageRows) break;
+          }
+        });
 
         // Buildings and floors with no sensors still own topics a dashboard
         // will subscribe to. Without this, an empty floor's topic resolves to
@@ -207,7 +279,16 @@ export class SensorRegistry {
   shouldRetryUnknown(tenantId: string, externalId: string, now = Date.now()): boolean {
     const key = SensorRegistry.key(tenantId, externalId);
     const last = this.#unknown.get(key);
-    if (last !== undefined && now - last < SensorRegistry.UNKNOWN_RETRY_MS) return false;
+    if (last !== undefined && now - last < this.#options.unknownRetryMs) return false;
+
+    // This map is written to by callers — one entry per invented id, and a
+    // batch may carry 10,000 of them. At the cap the id is simply not
+    // remembered and no refresh is asked for. Nothing is lost by that: the
+    // timer refresh still runs, so a genuinely new point appears within one
+    // interval, and the only thing forgone is the early refresh that a flood
+    // of junk ids has no claim on anyway.
+    if (last === undefined && this.#unknown.size >= this.#options.unknownMax) return false;
+
     this.#unknown.set(key, now);
     return true;
   }

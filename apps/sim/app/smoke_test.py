@@ -425,6 +425,36 @@ try:
         ok("an unreachable ingest leaves no error on the run",
            base["run"]["error"] is None)
 
+        # -- bounds: how large one run may be ---------------------------------
+        #
+        # Admission below limits how MANY runs there are. This is about how
+        # large one may be: the request used to be bounded only by
+        # `intervalS > 0`, so a century at one second validated and was
+        # accepted with a 202.
+        too_long = client.post(f"{BASE}/simulate", json={
+            "buildingId": BUILDING_ID, "scenarioName": "a century",
+            "periodStart": "1926-01-01T00:00:00Z", "periodEnd": "2026-01-01T00:00:00Z",
+            "weather": {"mode": "synthetic", "peakDryBulbC": 42.0, "minDryBulbC": 30.0},
+        })
+        ok("a run far over the interval ceiling is a 422, not a 202",
+           too_long.status_code == 422, str(too_long.status_code))
+
+        too_fine = client.post(f"{BASE}/simulate", json={
+            "buildingId": BUILDING_ID, "scenarioName": "one second",
+            "periodStart": PERIOD_START, "periodEnd": PERIOD_END, "intervalS": 1,
+            "weather": {"mode": "synthetic", "peakDryBulbC": 42.0, "minDryBulbC": 30.0},
+        })
+        ok("a one-second interval is refused", too_fine.status_code == 422,
+           str(too_fine.status_code))
+
+        with psycopg.connect(dsn) as check:
+            check.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT_ID,))
+            leaked = check.execute(
+                "SELECT count(*) FROM simulation_runs WHERE scenario_name IN (%s, %s)",
+                ("a century", "one second"),
+            ).fetchone()[0]
+        ok("a refused request creates no run row", leaked == 0, f"{leaked} row(s)")
+
         # -- durability: admission, cancellation, and orphan reaping ---------
         #
         # `cancelled` has been in the status enum since 004 with nothing able

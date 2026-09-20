@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { parseUuid } from '@/lib/params';
 import { currentTenant, unauthorized } from '@/lib/tenant';
 
 export const dynamic = 'force-dynamic';
@@ -57,8 +58,12 @@ export async function GET(request: Request) {
   const ctx = await currentTenant();
   if (!ctx) return unauthorized();
 
-  const runId = new URL(request.url).searchParams.get('runId');
-  if (!runId) return NextResponse.json({ error: 'runId is required' }, { status: 400 });
+  // Validated as a uuid because it is interpolated into the worker's URL path:
+  // `?runId=../weather/generate` should be a 400 here, not a request somewhere
+  // else on the worker.
+  const run = parseUuid(new URL(request.url).searchParams.get('runId'), 'runId');
+  if (!run.ok) return run.response;
+  const runId = run.value;
 
   const headers = { 'x-tenant-id': ctx.tenantId, ...workerAuth() };
 

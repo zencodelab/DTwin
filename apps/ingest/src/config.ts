@@ -33,6 +33,31 @@ const Env = z.object({
   INGEST_REGISTRY_REFRESH_MS: z.coerce.number().int().positive().default(60_000),
   /** How long a missing external id is remembered before it is looked up again. */
   INGEST_UNKNOWN_RETRY_MS: z.coerce.number().int().positive().default(30_000),
+  /**
+   * Most unknown external ids remembered at once.
+   *
+   * That memory is fed by callers: a gateway posting 10,000 invented ids per
+   * batch, which the batch schema allows, would otherwise grow it by 10,000
+   * entries a request until the next refresh cleared it. Past the cap an
+   * unknown id is simply not remembered, which costs nothing — see
+   * `SensorRegistry.shouldRetryUnknown`.
+   */
+  INGEST_UNKNOWN_MAX: z.coerce.number().int().positive().default(10_000),
+  /**
+   * Rows fetched per query while loading the registry. The load is keyset-paged
+   * so no single statement materialises the whole sensor table in this process.
+   */
+  INGEST_REGISTRY_PAGE_ROWS: z.coerce.number().int().positive().default(5_000),
+  /**
+   * Most sensors the registry will hold, across every tenant.
+   *
+   * The registry is an in-memory index and has to hold every active sensor to
+   * do its job, so this cannot be a LIMIT — a registry missing sensors reports
+   * real points as unknown. It is a ceiling that fails loudly instead: past it
+   * the refresh is abandoned and the PREVIOUS registry stays in service, which
+   * is stale and correct rather than current and killed by the OOM reaper.
+   */
+  INGEST_REGISTRY_MAX_SENSORS: z.coerce.number().int().positive().default(500_000),
 
   /** Largest accepted request body. A batch endpoint needs a stated ceiling. */
   INGEST_MAX_BODY_BYTES: z.coerce.number().int().positive().default(8 * 1024 * 1024),

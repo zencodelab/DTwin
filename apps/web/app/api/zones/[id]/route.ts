@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withTenant } from '@dtwin/db';
 import { getLatestReadingsForZone } from '@dtwin/db/queries';
+import { parseUuid } from '@/lib/params';
 import { currentTenant, unauthorized } from '@/lib/tenant';
 
 export const dynamic = 'force-dynamic';
@@ -13,7 +14,9 @@ export async function GET(
   const ctx = await currentTenant();
   if (!ctx) return unauthorized();
 
-  const { id } = await params;
+  const zone = parseUuid((await params).id, 'zone id');
+  if (!zone.ok) return zone.response;
+  const id = zone.value;
 
   const payload = await withTenant(ctx, async (db) => {
     const [readings, equipment, maintenance, profile] = await Promise.all([

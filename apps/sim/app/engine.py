@@ -290,6 +290,16 @@ def run(
     if not interval_starts or not step_stamps:
         raise ValueError("simulation period is shorter than one interval")
 
+    # Checked before the weather series or the irradiance matrix exist: the
+    # point of a ceiling is not to have already allocated what it forbids.
+    cells = len(zones) * len(step_stamps)
+    if cells > settings.max_cells:
+        raise ValueError(
+            f"run needs {cells:,} zone-steps ({len(zones)} zones x "
+            f"{len(step_stamps):,} steps); the limit is {settings.max_cells:,}. "
+            "Shorten the period, lengthen the interval, or pass zoneIds."
+        )
+
     series = weather_mod.build(request, building, step_stamps, settings.ground_reflectance)
     if series.dry_bulb_c.size:
         peak_i = int(np.argmax(series.dry_bulb_c))

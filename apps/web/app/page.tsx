@@ -1,6 +1,6 @@
 import { redirect } from 'next/navigation';
 import { withTenant } from '@dtwin/db';
-import { getSpatialTree, getTenant } from '@dtwin/db/queries';
+import { getSpatialTree, getTenant, SpatialTreeTooLargeError } from '@dtwin/db/queries';
 import { Dashboard } from '@/components/Dashboard';
 import { currentTenant, currentViewer } from '@/lib/tenant';
 
@@ -27,6 +27,12 @@ export default async function Page() {
 
   // One transaction for all three reads. The tenant scope IS the transaction
   // scope, so splitting these would open three of them to answer one page.
+  // A building over the tree's ceiling is reported here rather than left to
+  // the error boundary: in production Next replaces a server error's message
+  // with a digest, so the one explanation the operator needs — "this building
+  // is too large to load whole" — would be the part that got stripped.
+  let tooLarge: string | null = null;
+
   const result = await withTenant(ctx, async (db) => {
     const { rows } = await db.query<{ id: string }>(
       'SELECT id FROM buildings ORDER BY name LIMIT 1',
@@ -34,7 +40,13 @@ export default async function Page() {
     const buildingId = rows[0]?.id;
     if (!buildingId) return null;
     const [tree, tenant] = await Promise.all([
-      getSpatialTree(db, buildingId),
+      getSpatialTree(db, buildingId).catch((err: unknown) => {
+        if (err instanceof SpatialTreeTooLargeError) {
+          tooLarge = err.message;
+          return null;
+        }
+        throw err;
+      }),
       getTenant(db),
     ]);
     // getSpatialTree can still answer null — the id came from a row this
@@ -42,6 +54,8 @@ export default async function Page() {
     if (!tree) return null;
     return { tree, tenantName: tenant?.name ?? 'Unknown tenant' };
   });
+
+  if (tooLarge) return <EmptyState message={tooLarge} />;
 
   if (!result) {
     return (

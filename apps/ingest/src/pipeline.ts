@@ -27,7 +27,7 @@ export interface IngestResult {
 }
 
 export class Pipeline {
-  readonly registry = new SensorRegistry();
+  readonly registry: SensorRegistry;
   readonly writer: TelemetryWriter;
   readonly fanout: Fanout;
   readonly alerts: AlertEngine;
@@ -35,6 +35,12 @@ export class Pipeline {
   #refreshTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly config: Config) {
+    this.registry = new SensorRegistry({
+      pageRows: config.INGEST_REGISTRY_PAGE_ROWS,
+      maxSensors: config.INGEST_REGISTRY_MAX_SENSORS,
+      unknownMax: config.INGEST_UNKNOWN_MAX,
+      unknownRetryMs: config.INGEST_UNKNOWN_RETRY_MS,
+    });
     this.writer = new TelemetryWriter(config);
     // The registry owns the topic->tenant map, so it is what decides whether a
     // subscriber may listen to a topic.

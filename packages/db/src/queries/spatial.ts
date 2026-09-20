@@ -20,7 +20,71 @@ import type { Db } from '../client.ts';
  * belonging to another tenant simply returns null, the same as one that does
  * not exist, which is also the right thing to tell the caller.
  */
-export async function getSpatialTree(db: Db, buildingId: string): Promise<SpatialTree | null> {
+/**
+ * The most of each collection one tree may carry.
+ *
+ * The tree had no ceiling at all, and everything in it is handed to a browser
+ * in one piece: serialised into the page's flight payload, held in memory, and
+ * — for zones — turned into one extruded mesh each. So the limits are set by
+ * what that consumer can do with the answer, not by what Postgres can return.
+ * They are an order of magnitude above a large tower and well below the point
+ * where the dashboard stops being usable.
+ */
+export const SPATIAL_LIMITS = {
+  floors: 300,
+  zones: 5_000,
+  equipment: 20_000,
+  sensors: 50_000,
+  services: 60_000,
+} as const;
+
+export type SpatialLimits = Record<keyof typeof SPATIAL_LIMITS, number>;
+
+/**
+ * A building too large to load whole.
+ *
+ * Thrown rather than answered with a truncated tree, and the difference
+ * matters more here than it did for sensor history. A capped time series still
+ * means something — it is the most recent window. A capped spatial tree is a
+ * building with rooms missing, rendered with full confidence: zones that are
+ * not drawn cannot be clicked, cannot show an alert, and look exactly like
+ * zones that do not exist. There is no honest subset of a floor plan, so the
+ * caller is told the truth instead.
+ *
+ * Reaching this is the signal to load the tree per floor, which the schema
+ * already supports and nothing has needed yet.
+ */
+export class SpatialTreeTooLargeError extends Error {
+  constructor(
+    readonly collection: keyof typeof SPATIAL_LIMITS,
+    readonly limit: number,
+  ) {
+    super(
+      `building has more than ${limit} ${collection}; the spatial tree is ` +
+        'loaded whole and cannot be truncated without drawing a building with ' +
+        'parts missing. Load it per floor instead.',
+    );
+    this.name = 'SpatialTreeTooLargeError';
+  }
+}
+
+/**
+ * `limits` exists so the ceiling can be exercised without seeding five
+ * thousand zones. Production callers leave it alone.
+ */
+export async function getSpatialTree(
+  db: Db,
+  buildingId: string,
+  limits: SpatialLimits = SPATIAL_LIMITS,
+): Promise<SpatialTree | null> {
+  // One past the limit, so "exactly at it" and "over it" are distinguishable.
+  const over = (collection: keyof SpatialLimits) => limits[collection] + 1;
+  const enforce = (collection: keyof SpatialLimits, rowCount: number | null) => {
+    if ((rowCount ?? 0) > limits[collection]) {
+      throw new SpatialTreeTooLargeError(collection, limits[collection]);
+    }
+  };
+
   const building = await db.query(
     `SELECT id, name, address, timezone,
             CASE WHEN location IS NULL THEN NULL
@@ -45,8 +109,8 @@ export async function getSpatialTree(db: Db, buildingId: string): Promise<Spatia
               ST_AsGeoJSON(footprint)::json AS footprint,
               gltf_node_id AS "gltfNodeId",
               created_at AS "createdAt", updated_at AS "updatedAt"
-         FROM floors WHERE building_id = $1 ORDER BY level`,
-      [buildingId],
+         FROM floors WHERE building_id = $1 ORDER BY level LIMIT $2`,
+      [buildingId, over('floors')],
     ),
     db.query<{ id: string; floorId: string }>(
       `SELECT z.id, z.floor_id AS "floorId", z.name, z.zone_type AS "zoneType",
@@ -59,8 +123,8 @@ export async function getSpatialTree(db: Db, buildingId: string): Promise<Spatia
               z.occupancy_schedule_id AS "occupancyScheduleId",
               z.created_at AS "createdAt", z.updated_at AS "updatedAt"
          FROM zones z JOIN floors f ON f.id = z.floor_id
-        WHERE f.building_id = $1 ORDER BY f.level, z.name`,
-      [buildingId],
+        WHERE f.building_id = $1 ORDER BY f.level, z.name LIMIT $2`,
+      [buildingId, over('zones')],
     ),
     db.query(
       `SELECT id, building_id AS "buildingId", floor_id AS "floorId", zone_id AS "zoneId",
@@ -74,8 +138,8 @@ export async function getSpatialTree(db: Db, buildingId: string): Promise<Spatia
                                           'z', ST_Z(position)) END AS position,
               gltf_node_id AS "gltfNodeId", metadata,
               created_at AS "createdAt", updated_at AS "updatedAt"
-         FROM equipment WHERE building_id = $1 ORDER BY tag`,
-      [buildingId],
+         FROM equipment WHERE building_id = $1 ORDER BY tag LIMIT $2`,
+      [buildingId, over('equipment')],
     ),
     db.query(
       `SELECT s.id, s.external_id AS "externalId", s.name, s.metric, s.unit,
@@ -90,18 +154,24 @@ export async function getSpatialTree(db: Db, buildingId: string): Promise<Spatia
          LEFT JOIN zones z     ON z.id = s.zone_id
          LEFT JOIN floors f    ON f.id = z.floor_id
         WHERE e.building_id = $1 OR f.building_id = $1
-        ORDER BY s.external_id`,
-      [buildingId],
+        ORDER BY s.external_id LIMIT $2`,
+      [buildingId, over('sensors')],
     ),
     db.query(
       `SELECT es.equipment_id AS "equipmentId", es.zone_id AS "zoneId",
               es.role, es.load_fraction AS "loadFraction"
          FROM equipment_zone_service es
          JOIN equipment e ON e.id = es.equipment_id
-        WHERE e.building_id = $1`,
-      [buildingId],
+        WHERE e.building_id = $1 LIMIT $2`,
+      [buildingId, over('services')],
     ),
   ]);
+
+  enforce('floors', floors.rowCount);
+  enforce('zones', zones.rowCount);
+  enforce('equipment', equipment.rowCount);
+  enforce('sensors', sensors.rowCount);
+  enforce('services', services.rowCount);
 
   const zonesByFloor = new Map<string, unknown[]>();
   // Assembled here rather than by a five-way join: joining floors x zones x

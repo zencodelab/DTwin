@@ -133,6 +133,32 @@ async function main(): Promise<void> {
     ok('an invalid resolution is rejected',
        (await fetch(`${BASE}/api/sensors/${sensorId}/history?resolution=7m`)).status === 400);
 
+    // Every one of these used to be a 500 or a scan of the whole hypertable.
+    // `hours` went through a bare Number(): `abc` became NaN, then an Invalid
+    // Date, then a Postgres error; `1e9` became a rollup read across every
+    // chunk there is. Ids went into uuid comparisons unchecked, which raise
+    // rather than match nothing.
+    const status = async (path: string) => (await fetch(`${BASE}${path}`)).status;
+    const bad = {
+      'non-numeric hours': await status(`/api/sensors/${sensorId}/history?hours=abc`),
+      'an absurd span': await status(`/api/sensors/${sensorId}/history?hours=1e9`),
+      'a span over the 5m ceiling': await status(`/api/sensors/${sensorId}/history?resolution=5m&hours=169`),
+      'a malformed sensor id': await status('/api/sensors/not-a-uuid/history'),
+      'a malformed zone id': await status('/api/zones/not-a-uuid'),
+      'an unknown metric': await status(`/api/heatmap?buildingId=${building.id}&metric=vibes`),
+      'heatmap hours over a month': await status(`/api/heatmap?buildingId=${building.id}&hours=100000`),
+      'a malformed building id': await status('/api/heatmap?buildingId=nope'),
+      // Interpolated into the worker's URL path, so this one is not cosmetic.
+      'a path-traversing runId': await status('/api/simulate?runId=../weather/generate'),
+    };
+    const wrong = Object.entries(bad).filter(([, code]) => code !== 400);
+    ok('malformed and oversized query inputs are 400s, not 500s or full scans',
+       wrong.length === 0,
+       wrong.length ? wrong.map(([k, v]) => `${k} -> ${v}`).join('; ')
+                    : `${Object.keys(bad).length} cases`);
+    ok('the same span is accepted at a coarser resolution',
+       (await status(`/api/sensors/${sensorId}/history?resolution=1h&hours=169`)) === 200);
+
     console.log('\n[5] Alerts');
     const alerts = await getJson<{ alerts: unknown[] }>('/api/alerts');
     ok('alerts endpoint answers', Array.isArray(alerts.alerts));

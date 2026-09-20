@@ -50,6 +50,18 @@ class Settings(BaseModel):
         default_factory=lambda: int(os.environ.get("SIM_MAX_CONCURRENT_RUNS", 2))
     )
 
+    # Most (zones x integration steps) one run may allocate.
+    #
+    # The per-zone irradiance matrix from §49 is exactly this shape, in float64.
+    # The request's interval ceiling bounds the steps and the spatial tree
+    # bounds the zones, but nothing bounded their PRODUCT: 5,000 zones for a
+    # year at a 300-second step is four gigabytes in one allocation. Five
+    # million cells is 40 MB, and covers the seeded 24 zones for a year twice
+    # over.
+    max_cells: int = Field(
+        default_factory=lambda: int(os.environ.get("SIM_MAX_CELLS", 5_000_000))
+    )
+
     # Fail runs left mid-flight by a previous process, at startup.
     #
     # A BackgroundTask dies with its process, so a restart leaves rows at

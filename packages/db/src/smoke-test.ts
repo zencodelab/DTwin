@@ -18,7 +18,7 @@
  */
 import { getOwnerPool, closePool, withTenant } from './client.ts';
 import {
-  getSpatialTree, findZoneAtPoint, insertReadings,
+  getSpatialTree, findZoneAtPoint, insertReadings, SPATIAL_LIMITS, SpatialTreeTooLargeError,
   getLatestReadingsForZone, getSensorHistory, getZoneHeatmap,
   createTenant, listBuildings, getTenant,
 } from './queries/index.ts';
@@ -88,6 +88,23 @@ const ahuParent = tree!.equipment.find((e) => e.id === vavParent?.parentEquipmen
 ok('serving tree VAV -> AHU -> chiller',
    vavParent?.equipmentType === 'ahu' && ahuParent?.equipmentType === 'chiller',
    `${vav.tag} -> ${vavParent?.tag} -> ${ahuParent?.tag}`);
+
+// The tree is loaded whole and handed to a browser, so it has ceilings — and
+// breaching one THROWS rather than truncating. A capped time series still means
+// something; a capped floor plan is a building drawn with rooms missing, and
+// zones that are not drawn look exactly like zones that do not exist.
+const overLimit = await withTenant(A, (db) =>
+  getSpatialTree(db, A.buildingId, { ...SPATIAL_LIMITS, zones: 5 }))
+  .then(() => null, (err: unknown) => err);
+ok('a tree over its ceiling is refused, not truncated',
+   overLimit instanceof SpatialTreeTooLargeError
+     && overLimit.collection === 'zones' && overLimit.limit === 5,
+   overLimit instanceof Error ? overLimit.message.slice(0, 60) : 'returned a tree');
+
+const atLimit = await withTenant(A, (db) =>
+  getSpatialTree(db, A.buildingId, { ...SPATIAL_LIMITS, zones: 24 }));
+ok('a tree exactly AT its ceiling still loads',
+   atLimit?.floors.reduce((n, f) => n + f.zones.length, 0) === 24);
 
 // -------------------------------------------------------------- 3D picking
 console.log('\n[2] 3D picking (elevation disambiguation)');
