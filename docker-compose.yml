@@ -81,6 +81,9 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_APP_USER:-dtwin_app}:${POSTGRES_APP_PASSWORD:-dtwin_app_dev_pwd}@db:5432/${POSTGRES_DB:-dtwin}
       - NEXT_PUBLIC_WS_URL=ws://localhost:8787/ws
       - SIM_BASE_URL=http://sim:8000
+      # The worker refuses a caller that cannot present a key with the sim:run
+      # scope. `npm run bootstrap` mints it.
+      - SIM_API_KEY=${SIM_API_KEY:-}
       # Signs the WebSocket tickets ingest verifies — the two must match.
       - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET is required — see .env.example}
       # Inert unless DTWIN_ALLOW_DEMO_TENANT is also 'true', which is not set

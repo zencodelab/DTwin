@@ -18,6 +18,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Qu
 from fastapi.responses import JSONResponse
 
 from . import engine, notify, repository, weather
+from .auth import verify_caller
 from .config import settings
 from .db import close_pool, connection, connection_unscoped, tenant_scope
 from .models import (
@@ -77,9 +78,12 @@ def tenant_id(x_tenant_id: str | None = Header(default=None)) -> str:
     compose — and never resolved from `buildingId`, which is caller-supplied
     and would make the building id the access-control decision.
 
-    This trusts its caller, which is sound only while the worker is unreachable
-    from outside. When that stops being true it should present a service API
-    key like the one it already uses to reach `POST /internal/sim-event`.
+    The header is believed only because the caller has already presented an
+    API key carrying the `sim:run` scope — see auth.verify_caller, which every
+    tenant-scoped route depends on. The key says who is calling and whether
+    they may name a tenant at all; this header says which one. Splitting the
+    two is what lets one web service serve every tenant without needing a key
+    per tenant.
     """
     if not x_tenant_id:
         raise HTTPException(status_code=401, detail="X-Tenant-Id header is required")
@@ -204,6 +208,7 @@ def simulate(
     request: SimulationRequest,
     background: BackgroundTasks,
     tenant: str = Depends(tenant_id),
+    _: None = Depends(verify_caller),
 ) -> dict[str, Any]:
     with tenant_scope(tenant):
         # `buildingId` is still caller-supplied, but it no longer decides access:
@@ -247,7 +252,11 @@ def simulate(
 
 
 @app.post("/runs/{run_id}/cancel", status_code=200)
-def cancel_run(run_id: UUID, tenant: str = Depends(tenant_id)) -> dict[str, Any]:
+def cancel_run(
+    run_id: UUID,
+    tenant: str = Depends(tenant_id),
+    _: None = Depends(verify_caller),
+) -> dict[str, Any]:
     """Stop a queued or running simulation.
 
     `cancelled` has been in the status enum since 004 with nothing able to set
@@ -274,7 +283,11 @@ def cancel_run(run_id: UUID, tenant: str = Depends(tenant_id)) -> dict[str, Any]
 
 
 @app.get("/runs/{run_id}")
-def get_run(run_id: UUID, tenant: str = Depends(tenant_id)) -> SimulationRun:
+def get_run(
+    run_id: UUID,
+    tenant: str = Depends(tenant_id),
+    _: None = Depends(verify_caller),
+) -> SimulationRun:
     with tenant_scope(tenant):
         row = repository.get_run(run_id)
     if row is None:
@@ -283,7 +296,11 @@ def get_run(run_id: UUID, tenant: str = Depends(tenant_id)) -> SimulationRun:
 
 
 @app.get("/runs/{run_id}/summary")
-def get_summary(run_id: UUID, tenant: str = Depends(tenant_id)) -> SimulationSummary:
+def get_summary(
+    run_id: UUID,
+    tenant: str = Depends(tenant_id),
+    _: None = Depends(verify_caller),
+) -> SimulationSummary:
     with tenant_scope(tenant):
         row = repository.get_run(run_id)
         if row is None:
@@ -306,6 +323,7 @@ def get_results(
     zone_id: UUID | None = Query(default=None, alias="zoneId"),
     limit: int = Query(default=500, le=10_000),
     tenant: str = Depends(tenant_id),
+    _: None = Depends(verify_caller),
 ) -> dict[str, Any]:
     query = """
         SELECT zone_id AS "zoneId", interval_start AS "intervalStart",
@@ -334,6 +352,7 @@ def get_results(
 def generate_weather(
     request: WeatherGenerateRequest,
     tenant: str = Depends(tenant_id),
+    _: None = Depends(verify_caller),
 ) -> dict[str, Any]:
     """Populate `weather_observations` with a synthetic clear-sky series.
 

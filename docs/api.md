@@ -155,9 +155,19 @@ Source: [FastAPI routes](../apps/sim/app/main.py).
 Interactive worker documentation is available at
 [`http://localhost:8000/docs`](http://localhost:8000/docs) when running.
 
+Every route below except `/healthz` requires **both** an API key carrying the
+`sim:run` scope and an `X-Tenant-Id` header. The key answers *who is calling*
+and whether they may name a tenant at all; the header answers *for whom*. They
+are separate because one web service serves every tenant and would otherwise
+need a key per tenant — the same shape as ingest's `x-acting-user`, where a
+header is trusted only once the credential beside it has been verified. A
+missing, revoked or wrongly-scoped key is 401, all with one message.
+`SIM_REQUIRE_API_KEY=false` disables the check for a worker on a closed
+network; it defaults to on.
+
 | Method and path | Input | Current response |
 |---|---|---|
-| `GET /healthz` | None | 200 `{status, substepS}` or 503 on database failure |
+| `GET /healthz` | None | 200 `{status, substepS}` or 503 on database failure. Open, since a load balancer has no key |
 | `POST /simulate` | `SimulationRequest` | 202 `{runId, status: "queued", zonesWithoutProfile}`; unknown building 404; **429** when `SIM_MAX_CONCURRENT_RUNS` are already executing — admission happens before the row is created, so a refusal strands nothing ([§47](decisions.md#47-a-run-is-admitted-cancellable-and-reaped--but-still-not-queued)) |
 | `POST /runs/{id}/cancel` | Run UUID | 200 `{runId, status: "cancelled"}`; 404 unknown; **409** if it has already finished. The loop notices at its next progress step (every 2%), so cancellation is prompt rather than instant |
 | `GET /runs/{id}` | Run UUID | Run lifecycle and progress; unknown run 404. A run left in flight by a restarted worker reads `failed` with `worker restarted while this run was in flight` |

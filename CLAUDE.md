@@ -102,6 +102,10 @@ Do not "optimise" it back to COPY.
   local receiver, not for production.
 - **The simulation worker must not open its own socket.** It posts to
   `/internal/sim-event`; ingest owns every subscription.
+- **The worker authenticates its caller.** Every route but `/healthz` wants an
+  API key with the `sim:run` scope *and* an `X-Tenant-Id` header. The key says
+  the caller may name a tenant; the header says which one. They are separate
+  because one web service serves every tenant — do not collapse them.
 
 ## Python — `apps/sim` only
 

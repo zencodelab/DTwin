@@ -92,7 +92,20 @@ export const Principal = z.discriminatedUnion('kind', [
 export type Principal = z.infer<typeof Principal>;
 
 /** Scopes an API key can carry. Checked on the routes that accept keys. */
-export const API_SCOPES = ['ingest:write', 'sim:notify'] as const;
+export const API_SCOPES = [
+  /** A device or gateway posting telemetry to `POST /ingest`. */
+  'ingest:write',
+  /** The simulation worker relaying run events to `POST /internal/sim-event`. */
+  'sim:notify',
+  /**
+   * The web service asking the simulation worker to run something.
+   *
+   * It authenticates the CALLER, not the tenant: one web service serves every
+   * tenant, so the tenant still travels in `X-Tenant-Id`. The key is what makes
+   * believing that header sound — see apps/sim/app/auth.py.
+   */
+  'sim:run',
+] as const;
 export type ApiScope = (typeof API_SCOPES)[number];
 
 export function hasScope(principal: Principal, scope: ApiScope): boolean {

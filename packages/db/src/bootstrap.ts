@@ -48,6 +48,12 @@ const KEYS = [
     note: 'the Python worker\'s credential for POST /internal/sim-event',
   },
   {
+    kind: 'service', name: 'web-proxy', scopes: ['sim:run'],
+    // apps/web reads SIM_API_KEY when it proxies to the simulation worker.
+    env: 'SIM_API_KEY',
+    note: "the web service's credential for the simulation worker",
+  },
+  {
     kind: 'device', name: 'dev-gateway', scopes: ['ingest:write'],
     env: null,
     note: 'present this as `authorization: Bearer …` to POST /ingest',

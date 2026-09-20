@@ -9,7 +9,9 @@ Requires a migrated, seeded database.  Run:  python -m app.smoke_test
 
 from __future__ import annotations
 
+import hashlib
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -109,6 +111,30 @@ try:
             raise SystemExit(f"no building visible for tenant {TENANT_ID}")
         BUILDING_ID = str(row[0])
 
+        # Mint this suite's own keys, the way the ingest suite does. Inserted
+        # directly because createApiKey lives in TypeScript; the hash is the
+        # same unsalted SHA-256 the worker verifies against.
+        tenant_row = conn.execute(
+            "SELECT id FROM tenants WHERE id = %s", (TENANT_ID,)
+        ).fetchone()
+        if tenant_row is None:
+            raise SystemExit(f"tenant {TENANT_ID} not found")
+
+        def _mint(scopes: list[str], name: str) -> str:
+            raw = secrets.token_urlsafe(32)
+            conn.execute(
+                """INSERT INTO api_keys
+                        (tenant_id, kind, name, key_prefix, key_hash, scopes)
+                   VALUES (%s, 'service', %s, %s, %s, %s)""",
+                (TENANT_ID, f"{name}-{int(time.time())}", raw[:8],
+                 hashlib.sha256(raw.encode()).hexdigest(), scopes),
+            )
+            return raw
+
+        SMOKE_API_KEY = _mint(["sim:run"], "smoke-sim-run")
+        WRONG_SCOPE_KEY = _mint(["ingest:write"], "smoke-wrong-scope")
+        conn.commit()
+
     server = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(PORT), "--log-level", "warning"],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -125,9 +151,28 @@ try:
         },
     )
 
-    # Every request carries the tenant, exactly as the web service sets it.
-    with httpx.Client(timeout=30.0, headers={"x-tenant-id": TENANT_ID}) as client:
+    # Every request carries the tenant AND a key, exactly as the web service
+    # sends them: the key says this caller may name a tenant, the header says
+    # which one.
+    with httpx.Client(
+        timeout=30.0,
+        headers={"x-tenant-id": TENANT_ID, "authorization": f"Bearer {SMOKE_API_KEY}"},
+    ) as client:
         wait_healthy(client)
+
+        # The credential half, before anything that depends on it. A worker
+        # that accepted these would be trusting X-Tenant-Id on its own, which
+        # is the gap this key closes.
+        ok("a request with no API key is refused",
+           httpx.post(f"{BASE}/simulate", json={}, timeout=10.0,
+                      headers={"x-tenant-id": TENANT_ID}).status_code == 401)
+        ok("a key without the sim:run scope is refused",
+           httpx.post(f"{BASE}/simulate", json={}, timeout=10.0,
+                      headers={"x-tenant-id": TENANT_ID,
+                               "authorization": f"Bearer {WRONG_SCOPE_KEY}"}
+                      ).status_code == 401)
+        ok("healthz stays open, since a probe has no key",
+           httpx.get(f"{BASE}/healthz", timeout=10.0).status_code == 200)
 
         # ------------------------------------------------------------ plumbing
         print("\n[1] Service and validation")

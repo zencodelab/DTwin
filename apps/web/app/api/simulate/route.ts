@@ -3,6 +3,20 @@ import { currentTenant, unauthorized } from '@/lib/tenant';
 
 export const dynamic = 'force-dynamic';
 
+/**
+ * The worker will not act for a tenant on the word of a header alone; it wants
+ * a key with the `sim:run` scope beside it. The key says this service may name
+ * a tenant, the header says which one — one key serves every tenant, so the
+ * two cannot be the same credential.
+ *
+ * Absent, the worker answers 401 and this route reports it, rather than the
+ * request failing somewhere less legible. `npm run bootstrap` prints the value.
+ */
+function workerAuth(): Record<string, string> {
+  const key = process.env.SIM_API_KEY;
+  return key ? { authorization: `Bearer ${key}` } : {};
+}
+
 const SIM_BASE = process.env.SIM_BASE_URL ?? 'http://localhost:8000';
 
 /**
@@ -26,6 +40,7 @@ export async function POST(request: Request) {
       headers: {
         'content-type': 'application/json',
         'x-tenant-id': ctx.tenantId,
+        ...workerAuth(),
       },
       body: JSON.stringify(body),
     });
@@ -45,7 +60,7 @@ export async function GET(request: Request) {
   const runId = new URL(request.url).searchParams.get('runId');
   if (!runId) return NextResponse.json({ error: 'runId is required' }, { status: 400 });
 
-  const headers = { 'x-tenant-id': ctx.tenantId };
+  const headers = { 'x-tenant-id': ctx.tenantId, ...workerAuth() };
 
   try {
     // `.ok` is checked before `.json()`. Without it a worker 404 or 500 parsed
