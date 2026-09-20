@@ -67,6 +67,31 @@ measured requirement rather than precede the first dependable pilot.
 
 ## Risks and completion criteria
 
+> 📌 **Status update, 20 September 2026.** The table below is the 18 September
+> review, kept as written. Much of it has since been addressed, and the
+> reviewer's own findings are more useful next to what happened than quietly
+> edited:
+>
+> | Finding | Now |
+> |---|---|
+> | P0 — web service not converted to the tenant-scoped signatures | **Closed.** Converted, plus a login screen, logout and a tenant switcher; the routes share one `unauthorized()` |
+> | P0 — live UI keeps only sensor values; failures silent | **Partly closed.** Four silent `.catch(() => undefined)` now surface, and `error.tsx`/`loading.tsx` exist. Quality and staleness in the live map is still open |
+> | P1 — HTTP routes use casts instead of boundary schemas | **Closed for ingest.** Malformed JSON is 400 and oversized 413, bodies go through an object guard, and `kind` validates against `FAULT_KINDS` |
+> | P1 — simulation jobs have no admission, cancellation or restart recovery | **Closed.** 429 past a concurrency cap, a cancel endpoint, and a startup reaper ([§47](decisions.md#47-a-run-is-admitted-cancellable-and-reaped--but-still-not-queued)). A durable queue is still deliberately absent |
+> | P1 — email recorded as failed; there is no sender | **Closed.** SMTP, tested against a real server |
+> | P1 — sim events target topics no floor-focused client listens to | **Closed** ([§45](decisions.md#45-simulation-topics-are-keyed-by-building-not-by-run)) |
+> | P1 — no CI; DB smoke prints failures without a failing exit code | **Closed.** CI runs types, both linters, 83 unit tests, a production build and all four suites; the exit-code claim was already stale when written |
+> | P1 — notification records created after alert insertion | **Open.** A crash between the two still loses the record |
+> | P1 — webhook address checks not pinned to the connection | **Open** |
+> | Not in the table — the sim worker trusted `X-Tenant-Id` alone | **Closed.** It requires a key with the `sim:run` scope; the header names the tenant, the key says the caller may |
+>
+> Three defects this review did not find were found afterwards, all by CI
+> rather than by reading: a future-dated reading blinds the rollups for every
+> tenant ([§46](decisions.md#46-a-future-dated-reading-blinds-the-5-minute-view-for-everyone)),
+> the alert listing had no usable index, and alerts never reached a
+> sensor-scoped subscriber.
+
+
 These are source-review findings unless the verification section says otherwise.
 Priorities are recommendations, not scheduled commitments. P0 means resolve
 before exposing the service to untrusted clients or relying on its alerts.

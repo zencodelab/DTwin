@@ -14,7 +14,7 @@ definitions and smoke suites. **All four packages are tenant-scoped** —
 tenant-scoped queries, row-level security, API-key and WebSocket-ticket
 authentication in `packages/db` and `apps/ingest`; session-resolved tenancy in
 `apps/web`; and a context-bound scope in the Python worker. The stack builds and
-runs end to end. The suites total **199 checks, all passing**, plus
+runs end to end. The suites total **216 checks, all passing**, plus
 **83 unit tests**, and [CI](.github/workflows/ci.yml) runs all of it on
 every push.
 
