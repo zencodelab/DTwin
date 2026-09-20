@@ -126,13 +126,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         return send(res, 403, { error: 'building does not belong to this tenant' });
       }
 
-      // Both topics, and the check above now guards both: `sim:` is keyed by
-      // building (§45), so it authorises through the same owner map as
-      // `building:`. The dashboard sits on the building topic today; the sim
-      // topic is the one a client can hold without the telemetry firehose.
-      for (const topic of [topics.sim(event.buildingId), topics.building(event.buildingId)]) {
-        pipeline.fanout.send(topic, event as ServerMessage);
-      }
+      // One destination. `sim:` is keyed by building (§45) and authorises
+      // through the same owner map as `building:`, so the check above guards
+      // it, and a client holds it for the whole session without taking the
+      // telemetry firehose with it.
+      //
+      // The building topic is deliberately NOT a second destination any more:
+      // it was only ever carrying these events because sim topics could not be
+      // subscribed to, and every subscriber that wants them is now on the sim
+      // topic. Sending to both would deliver twice to the root view.
+      pipeline.fanout.send(topics.sim(event.buildingId), event as ServerMessage);
       return send(res, 202, { forwarded: true });
     }
 

@@ -76,8 +76,19 @@ export function Dashboard({
   // Subscribe to the floor in frame, not the whole building: the server fans
   // out per topic, so a building-wide subscription would ship all 190 points to
   // a view showing 45 of them.
+  //
+  // The sim topic is held for the whole session alongside whichever spatial
+  // topic is in frame. That is only possible because it is keyed by building
+  // rather than by run (decisions.md §45): it never changes, so it cannot churn
+  // the socket, and simulation progress no longer disappears when a floor is
+  // selected. Before this the dashboard saw sim events only as a side effect of
+  // sitting on the building topic, so a floor-focused view fell back to HTTP
+  // polling — a gap architecture.md documented rather than fixed.
   const subscribed = useMemo<Topic[]>(() => {
-    const list: Topic[] = [topicFor.tenantAlerts(tenantId)];
+    const list: Topic[] = [
+      topicFor.tenantAlerts(tenantId),
+      topicFor.sim(tree.building.id),
+    ];
     list.push(
       focusedFloorId
         ? topicFor.floor(focusedFloorId)

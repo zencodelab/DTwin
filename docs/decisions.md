@@ -743,6 +743,12 @@ Run-level addressing returns the day a client needs it, and it will arrive with
 the lookup, the per-connection rate limit and the bounded cache that make it
 safe. Building it now would pay that cost for a subscriber that does not exist.
 
+Once the topic is stable, the dashboard can simply hold it, so the building
+topic stops being a second destination for sim events. It was only ever
+carrying them because sim topics could not be subscribed to. Sending to both
+would now deliver twice to the root view, and the building topic goes back to
+meaning telemetry.
+
 *Verified:* the smoke check that had been failing since the topic was
 introduced now passes with no database fixture — `fakeRunId` still has no row in
 `simulation_runs` and does not need one — and `sim:<random uuid>` is still
