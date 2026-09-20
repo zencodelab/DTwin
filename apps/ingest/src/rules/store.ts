@@ -1,5 +1,6 @@
 import { withTenant, type Db } from '@dtwin/db';
 import type { AlertSeverity, AlertWithContext } from '@dtwin/types';
+import type { NotifyTarget } from './notify.ts';
 
 /**
  * Alert persistence.
@@ -43,16 +44,34 @@ export interface OpenAlertInput {
   triggerValue: number | null;
   threshold: number | null;
   context: Record<string, unknown>;
+  /**
+   * Where this alert must be sent, written in the SAME transaction as the
+   * alert itself. See the note on `openAlert`.
+   */
+  notifyTargets: NotifyTarget[];
 }
 
 /**
- * Open an alert, or return null if one is already live for this target.
+ * Open an alert AND record what has to be sent about it, in one transaction.
  *
  * The conflict target matches the partial unique index in 003_alerting.sql. It
  * is not belt-and-braces: the engine's own state says whether an alert is open,
  * but that state is per-process, and a second ingest replica would otherwise
  * duplicate every alert. The database is the only place that fact can be
  * settled.
+ *
+ * The `alert_notifications` rows are inserted here rather than by the notifier
+ * afterwards, and that is the point. Previously the alert committed, the
+ * process called the notifier, and the notifier opened its OWN transaction to
+ * write `pending` rows — so a crash in between left an alert with no delivery
+ * record, and nothing would ever create one, because the retry sweep only
+ * retries rows that exist. The alert was durable and the intent to tell anyone
+ * about it was not.
+ *
+ * Writing them together makes the table the source of truth for what must be
+ * delivered. The dispatch that follows is a latency optimisation: if it never
+ * runs, the sweep finds the rows anyway, and the cost is one sweep interval
+ * rather than a lost notification. See docs/decisions.md §51.
  */
 export async function openAlert(input: OpenAlertInput): Promise<AlertWithContext | null> {
   return withTenant({ tenantId: input.tenantId }, async (db) => {
@@ -71,7 +90,26 @@ export async function openAlert(input: OpenAlertInput): Promise<AlertWithContext
       ],
     );
     const id = rows[0]?.id;
-    return id ? await selectById(db, id) : null;
+    if (!id) return null; // another replica already holds it
+
+    if (input.notifyTargets.length > 0) {
+      // One statement rather than one per target: this runs inside the alert's
+      // own transaction, on the path that opens an alert, and a round trip per
+      // destination would be paid by every rule that names more than one.
+      await db.query(
+        `INSERT INTO alert_notifications (tenant_id, alert_id, channel, target, status)
+         SELECT $1, $2, c::notification_channel, t, 'pending'
+           FROM unnest($3::text[], $4::text[]) AS x(c, t)
+         ON CONFLICT (alert_id, channel, target) DO NOTHING`,
+        [
+          input.tenantId, id,
+          input.notifyTargets.map((t) => t.channel),
+          input.notifyTargets.map((t) => t.target),
+        ],
+      );
+    }
+
+    return selectById(db, id);
   });
 }
 

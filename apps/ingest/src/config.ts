@@ -79,6 +79,16 @@ const Env = z.object({
   ALERT_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
 
   /**
+   * How long a claimed notification stays claimed before another worker may
+   * take it. Long enough to cover a slow webhook plus its timeout, short
+   * enough that a worker which died mid-delivery does not hold its rows for
+   * minutes. See docs/decisions.md §51.
+   */
+  ALERT_NOTIFY_LEASE_MS: z.coerce.number().int().positive().default(60_000),
+  /** Rows one worker takes per sweep. Bounds the blast radius of a slow batch. */
+  ALERT_NOTIFY_BATCH: z.coerce.number().int().positive().default(50),
+
+  /**
    * SMTP transport for the email channel, as a URL:
    * `smtp://user:pass@host:587` or `smtps://…` for implicit TLS.
    *

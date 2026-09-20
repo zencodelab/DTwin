@@ -191,6 +191,24 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return send(res, 202, { forwarded: true });
     }
 
+    case 'POST /internal/notify-sweep': {
+      const auth = await authenticate(req, 'ingest:write');
+      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+
+      // Run the notification sweep now rather than at the next interval.
+      //
+      // An operator action, not test scaffolding: after fixing a webhook
+      // receiver that has been refusing deliveries, the alternative is waiting
+      // out ALERT_NOTIFY_RETRY_MS with no way to tell whether the fix worked.
+      //
+      // Safe to call concurrently, and worth calling that out — the claim uses
+      // FOR UPDATE SKIP LOCKED, so two of these take disjoint sets rather than
+      // both sending the same row. That is the same property that makes a
+      // second ingest replica safe.
+      const delivered = await pipeline.alerts.notifier.retryPending();
+      return send(res, 200, { delivered });
+    }
+
     case 'GET /alerts': {
       const auth = await authenticate(req, 'ingest:write');
       if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });

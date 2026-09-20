@@ -58,6 +58,7 @@ Source: [ingest server](../apps/ingest/src/server.ts).
 | `POST /alerts/ack` | `ingest:write` | `{alertId}` plus header `x-acting-user: <userId>` | 200 `{alert}`; missing fields 400; alert not open **or belonging to another tenant** 409 — the two cases are deliberately indistinguishable, so a caller cannot use this route to learn that an id exists elsewhere |
 | `POST /simulator/fault` | `ingest:write` | `{sensorId}` or `{externalId}`, plus `kind`, optional `magnitude` | 200 with sensor/kind; missing sensor, or a sensor id belonging to another tenant, 404; missing kind 400 |
 | `DELETE /simulator/fault` | `ingest:write` | Optional `sensorId` query parameter | Clears that sensor's fault (404 if it is another tenant's), or every fault **for the key's own tenant** when the parameter is omitted — never every fault on the process |
+| `POST /internal/notify-sweep` | `ingest:write` | none | 200 `{delivered}` — runs the notification sweep now instead of at the next interval, for when a webhook receiver has just been fixed. Safe to call concurrently: workers claim disjoint sets ([§51](decisions.md#51-the-delivery-record-commits-with-the-alert-and-one-worker-owns-each-row)) |
 | `POST /internal/sim-event` | `sim:notify` | `SimEvent` | 202 `{forwarded: true}`; invalid event 400; the event's `buildingId` must belong to the key's tenant or the request is refused with 403 |
 
 Every row above except `/healthz` returns `401` for a missing or unrecognised

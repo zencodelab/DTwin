@@ -30,7 +30,7 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **220 checks, all passing** (`db` 58, `ingest` 93, `sim` 51,
+Suites total **223 checks, all passing** (`db` 58, `ingest` 96, `sim` 51,
 `web` 18), plus **95 unit tests** (57 vitest, 38 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
@@ -97,7 +97,13 @@ Do not "optimise" it back to COPY.
 - **Alerts are never coalesced or shed.** Telemetry has a successor; an alert
   does not.
 - **Notification delivery is recorded in `alert_notifications`,** never
-  fire-and-forget, and is dispatched off the alert path.
+  fire-and-forget, and is dispatched off the alert path. The rows are written
+  **in the alert's own transaction** (`openAlert`), which makes the table the
+  source of truth and the dispatch that follows an optimisation — lose it and
+  the sweep still delivers (`docs/decisions.md` §51). Workers claim rows with
+  `FOR UPDATE SKIP LOCKED` under a lease, so two replicas cannot send the same
+  row. Never re-add a channel filter to the sweep: a channel it ignores is a
+  channel that never recovers from a restart.
 - **Never relax the webhook destination check.** It resolves the hostname and
   blocks private addresses because rule config is operator-edited input that
   this service makes requests to. `ALERT_WEBHOOK_ALLOW_PRIVATE` is for testing a

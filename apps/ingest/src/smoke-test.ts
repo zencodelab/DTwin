@@ -839,6 +839,88 @@ try {
      received.length === deliveredSoFar,
      `${received.length - deliveredSoFar} extra call(s)`);
 
+  // -- the outbox: the record commits WITH the alert ------------------------
+  //
+  // The gap this closes: the alert used to commit, and the notifier then
+  // opened its own transaction to write the `pending` rows. A crash in
+  // between left an alert with no delivery record and nothing that would ever
+  // create one, because the sweep only retries rows that exist.
+  //
+  // A crash cannot be staged here, but the property that makes it survivable
+  // can be checked directly: every alert this rule opened has its full set of
+  // destinations recorded, and they were created no later than the alert.
+  const { rows: [outbox] } = await pool.query<{
+    alerts: number; without_rows: number; late: number;
+  }>(
+    `SELECT count(*)::int AS alerts,
+            count(*) FILTER (WHERE n.n IS NULL OR n.n < 3)::int AS without_rows,
+            count(*) FILTER (WHERE n.first_created > a.opened_at)::int AS late
+       FROM alerts a
+       LEFT JOIN LATERAL (
+              SELECT count(*) AS n, min(created_at) AS first_created
+                FROM alert_notifications WHERE alert_id = a.id
+            ) n ON TRUE
+      WHERE a.rule_id = $1`,
+    [notifyRule],
+  );
+  ok('every alert has its full set of delivery rows',
+     Number(outbox?.alerts) > 0 && Number(outbox?.without_rows) === 0,
+     `${outbox?.alerts} alert(s), ${outbox?.without_rows} missing rows`);
+  ok('the rows were committed with the alert, not after it',
+     Number(outbox?.late) === 0,
+     `${outbox?.late} recorded later than the alert they belong to`);
+
+  // -- claiming: two sweeps racing must not send the same row twice ---------
+  //
+  // Two ingest replicas both used to SELECT the same pending row and both
+  // deliver it. The claim uses FOR UPDATE SKIP LOCKED, so concurrent sweeps
+  // take disjoint sets. Firing several at once is the closest this suite gets
+  // to a second replica.
+  //
+  // Eight extra rows, not one: with a single pending row three sweeps cannot
+  // meaningfully collide, and the check would pass whether or not the claim
+  // worked. Nine rows against three sweeps would produce up to 27 calls if
+  // each sweep took the whole set.
+  const RACE_ROWS = 8;
+  const beforeRace = received.length;
+  await pool.query(
+    `UPDATE alert_notifications SET status='pending', claimed_at=NULL,
+            attempts=0, delivered_at=NULL
+      WHERE alert_id IN (SELECT id FROM alerts WHERE rule_id = $1)
+        AND channel='webhook'`,
+    [notifyRule],
+  );
+  await pool.query(
+    `INSERT INTO alert_notifications (tenant_id, alert_id, channel, target, status)
+     SELECT $1, a.id, 'webhook', 'http://127.0.0.1:9711/race/' || g, 'pending'
+       FROM alerts a, generate_series(1, $3) g
+      WHERE a.rule_id = $2
+     ON CONFLICT (alert_id, channel, target) DO NOTHING`,
+    [TENANT, notifyRule, RACE_ROWS],
+  );
+  const { rows: [toSend] } = await pool.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM alert_notifications
+      WHERE alert_id IN (SELECT id FROM alerts WHERE rule_id = $1)
+        AND channel='webhook' AND status <> 'delivered'`,
+    [notifyRule],
+  );
+
+  const sweeps = await Promise.all([
+    postJson(`${BASE}/internal/notify-sweep`, {}),
+    postJson(`${BASE}/internal/notify-sweep`, {}),
+    postJson(`${BASE}/internal/notify-sweep`, {}),
+  ]);
+  await sleep(1200);
+  const claims = await Promise.all(sweeps.map((r) => r.json()));
+  const claimedTotal = claims.reduce(
+    (sum: number, body) => sum + Number((body as { delivered: number }).delivered), 0);
+
+  ok('concurrent sweeps claim disjoint sets, so nothing is sent twice',
+     received.length - beforeRace === Number(toSend?.n)
+       && claimedTotal === Number(toSend?.n),
+     `${received.length - beforeRace} call(s) and ${claimedTotal} claim(s) `
+     + `for ${toSend?.n} pending row(s)`);
+
   await del(`${BASE}/simulator/fault?sensorId=${probe.id}`);
   await new Promise<void>((r) => receiver.close(() => r()));
   // Drop any lingering SMTP session so close() can actually complete.

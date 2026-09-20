@@ -1045,3 +1045,62 @@ fan heat) that wants care rather than a line; duct leakage and thermal losses;
 and any part-load fan curve — power here is linear in flow, where a real
 variable-speed fan is closer to cubic, so this *overstates* fan energy at low
 load and understates the benefit of a VAV retrofit.
+
+## 51. The delivery record commits with the alert, and one worker owns each row
+
+Two defects, both named in `docs/cto-assessment.md`, both about the same table.
+
+**The record was written after the alert, in a different transaction.** The
+engine opened the alert, committed, and then called the notifier, which opened
+its own transaction to insert the `pending` rows. A crash in between left an
+alert with **no notification rows at all** — and nothing would ever create
+them, because the retry sweep only retries rows that exist. The alert was
+durable and the intent to tell anyone about it was not.
+
+The rows are now inserted by `openAlert`, inside the alert's own transaction.
+That is the whole of the outbox pattern, and the consequence worth stating is
+what it does to the dispatch that follows: **it becomes an optimisation.** If
+the process dies before it runs, or it throws, the sweep finds the rows. The
+cost of losing it is one sweep interval, not a notification.
+
+**Nothing stopped two workers sending the same row.** The sweep did a plain
+`SELECT` and then delivered, so two ingest replicas read the same `pending` row
+and both sent it. Claiming is now an `UPDATE … WHERE id IN (SELECT … FOR UPDATE
+SKIP LOCKED)`: each worker takes a disjoint set and the others step over the
+locked rows rather than blocking behind them.
+
+`claimed_at` is a **lease**, not a flag. A worker that dies mid-delivery would
+otherwise hold its rows forever; past `ALERT_NOTIFY_LEASE_MS` they are
+claimable again. The honest cost is at-least-once: a worker that is merely
+*slow* can have a row taken from under it and the receiver sees it twice. Every
+payload carries the alert id, which is what a receiver keys its own idempotency
+on. Exactly-once would need the receiver's cooperation and is not something
+this side can promise alone.
+
+**The sweep no longer filters `channel = 'webhook'`.** That filter was
+survivable while the notifier created rows and delivered them in the same
+breath — a log or email row was never left pending. Now that rows commit with
+the alert and are delivered afterwards, a channel the sweep ignores is a
+channel that never recovers from a restart.
+
+**Notifications disabled means no rows, not queued rows.**
+`ALERT_NOTIFY_ENABLED` is false by default, so writing the outbox anyway would
+give every deployment that has not opted in an unbounded queue of `pending`
+deliveries — and flood every one of them the moment somebody enabled it. A
+switch that says "this deployment does not send notifications" must not be
+quietly accumulating the ones it did not send. The `skipped` counter still
+moves, so the difference is visible on `/healthz` rather than unexplained.
+
+`POST /internal/notify-sweep` runs the sweep now rather than at the next
+interval. An operator action, not test scaffolding: after fixing a receiver
+that has been refusing deliveries, the alternative is waiting out
+`ALERT_NOTIFY_RETRY_MS` with no way to tell whether the fix worked. It is safe
+to call concurrently, which is the same property that makes a second replica
+safe.
+
+*Verified:* every alert a rule opens has its full set of destination rows, and
+none of them is timestamped after the alert it belongs to; nine pending rows
+against three concurrent sweeps produce exactly nine deliveries and nine
+claims, where an unclaimed sweep would produce up to twenty-seven. Reverting
+the claim to the old `SELECT` pattern fails eight checks, so none of this is
+asserted vacuously.

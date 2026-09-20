@@ -27,6 +27,14 @@ import type { Config } from '../config.ts';
  * booted.
  */
 
+/** A row this worker has claimed and is responsible for delivering. */
+interface ClaimedRow {
+  id: string;
+  alert_id: string;
+  channel: string;
+  target: string;
+}
+
 export interface NotifyTarget {
   channel: 'webhook' | 'email' | 'log';
   target: string;
@@ -185,25 +193,66 @@ export class Notifier {
    * delivery record lives in `alert_notifications`, which is policy-scoped, so
    * writing it needs the tenant the alert belongs to.
    */
-  async dispatch(tenantId: string, alert: AlertWithContext, notify: unknown): Promise<void> {
+  /**
+   * Deliver everything already recorded for one alert.
+   *
+   * The fast path after `openAlert` committed the rows. It claims them the
+   * same way the sweep does, so the two cannot both send the same row — a
+   * sweep that happens to be running when an alert opens is the ordinary case,
+   * not an edge one.
+   */
+  async deliverForAlert(tenantId: string, alert: AlertWithContext): Promise<void> {
+    if (!this.config.ALERT_NOTIFY_ENABLED) return;
+    const claimed = await this.#claim(tenantId, alert.id);
+    await this.#deliverClaimed(tenantId, claimed, alert);
+  }
+
+  /**
+   * The destinations to record for an alert, given this deployment's config.
+   *
+   * Empty when notifications are disabled, and that is deliberate rather than
+   * an oversight in the outbox. `ALERT_NOTIFY_ENABLED` is false by default, so
+   * writing the rows anyway would give every deployment that has not opted in
+   * an unbounded queue of `pending` deliveries — and then flood every one of
+   * them the moment somebody turned it on. A switch that says "this deployment
+   * does not send notifications" should not be quietly accumulating the ones
+   * it did not send.
+   *
+   * The count still moves, so /healthz can say how many were skipped rather
+   * than leaving the difference unexplained.
+   */
+  targetsFor(notify: unknown): NotifyTarget[] {
     const targets = parseTargets(notify);
-    if (targets.length === 0) return;
+    if (this.config.ALERT_NOTIFY_ENABLED) return targets;
+    this.#stats.skipped += targets.length;
+    return [];
+  }
 
-    if (!this.config.ALERT_NOTIFY_ENABLED) {
-      this.#stats.skipped += targets.length;
-      return;
+  /** Deliver a batch of claimed rows, loading each alert only if needed. */
+  async #deliverClaimed(
+    tenantId: string,
+    rows: ClaimedRow[],
+    known?: AlertWithContext,
+  ): Promise<void> {
+    for (const row of rows) {
+      const alert = known && known.id === row.alert_id
+        ? known
+        : await loadAlert(tenantId, row.alert_id);
+      if (!alert) continue; // the alert was deleted under us; nothing to send
+      await this.#deliverOne(tenantId, alert, row);
     }
-
-    await Promise.all(targets.map((t) => this.#deliverOne(tenantId, alert, t)));
   }
 
   async #deliverOne(
     tenantId: string,
     alert: AlertWithContext,
-    target: NotifyTarget,
+    row: ClaimedRow,
   ): Promise<void> {
-    const id = await this.#record(tenantId, alert.id, target);
-    if (!id) return; // already recorded for this alert+channel+target
+    const id = row.id;
+    const target: NotifyTarget = {
+      channel: row.channel as NotifyTarget['channel'],
+      target: row.target,
+    };
 
     if (target.channel === 'log') {
       console.log(`[notify] ${alert.severity.toUpperCase()} ${alert.message}`);
@@ -320,58 +369,83 @@ export class Notifier {
   }
 
   /**
-   * Retry what has not landed.
+   * Deliver everything outstanding, for every tenant.
    *
-   * Bounded by attempt count: an endpoint that has been down for a day should
-   * stop being called, and the row keeps the last error so the reason survives.
+   * This is the outbox's actual engine, not merely a retry. Every `pending`
+   * row arrives here eventually, whether the fast path after `openAlert` ran
+   * or not — which is what makes losing that call cost one interval rather
+   * than a notification.
+   *
+   * It used to filter `channel = 'webhook'`, which was survivable while the
+   * notifier created its own rows immediately after an alert: a log or email
+   * row was written and delivered in the same breath, so it was never left
+   * pending. Now that the rows are committed with the alert and delivered
+   * afterwards, a channel this sweep ignores is a channel that never recovers
+   * from a restart.
+   *
+   * Bounded by attempt count: an endpoint down for a day should stop being
+   * called, and the row keeps the last error so the reason survives.
    */
   async retryPending(): Promise<number> {
+    if (!this.config.ALERT_NOTIFY_ENABLED) return 0;
+
     let total = 0;
     // Per tenant: the sweep reads policy-scoped tables, so there is no single
     // query that can see every pending delivery.
     for (const tenant of await activeTenants()) {
-      const rows = await withTenant({ tenantId: tenant.id }, async (db) => {
-        const { rows } = await db.query<{
-          id: string; alert_id: string; channel: string; target: string;
-        }>(
-          `SELECT n.id, n.alert_id, n.channel, n.target
-             FROM alert_notifications n
-             JOIN alerts a ON a.id = n.alert_id
-            WHERE n.status <> 'delivered'
-              AND n.channel = 'webhook'
-              AND n.attempts < $1
-              AND a.state <> 'resolved'
-            ORDER BY n.created_at
-            LIMIT 50`,
-          [this.config.ALERT_WEBHOOK_MAX_ATTEMPTS],
-        );
-        return rows;
-      });
-
-      for (const row of rows) {
-        const alert = await loadAlert(tenant.id, row.alert_id);
-        if (alert) await this.#deliverWebhook(tenant.id, row.id, alert, row.target);
-      }
+      const rows = await this.#claim(tenant.id, null);
+      await this.#deliverClaimed(tenant.id, rows);
       total += rows.length;
     }
     return total;
   }
 
-  /** Insert the attempt row, or null if this destination is already recorded. */
-  async #record(
-    tenantId: string,
-    alertId: string,
-    target: NotifyTarget,
-  ): Promise<string | null> {
+  /**
+   * Take ownership of deliverable rows, so no other worker sends them.
+   *
+   * `FOR UPDATE SKIP LOCKED` is what makes this safe with more than one ingest
+   * replica: each worker locks a disjoint set and the others step over them
+   * instead of blocking. Without it the sweep was a plain SELECT, and two
+   * replicas read the same row and both sent it.
+   *
+   * `claimed_at` is a LEASE, not a flag. A worker that dies mid-delivery would
+   * otherwise hold its rows forever; past the lease they are claimable again.
+   * The cost is the honest limit of at-least-once: a worker that is merely
+   * slow, rather than dead, can have a row taken from under it and the
+   * receiver sees it twice. Every payload carries the alert id, which is what
+   * a receiver would key its own idempotency on.
+   *
+   * `alertId` narrows it to one alert for the fast path; null sweeps the
+   * tenant.
+   */
+  async #claim(tenantId: string, alertId: string | null): Promise<ClaimedRow[]> {
     return withTenant({ tenantId }, async (db) => {
-      const { rows } = await db.query<{ id: string }>(
-        `INSERT INTO alert_notifications (tenant_id, alert_id, channel, target, status)
-         VALUES ($1, $2, $3::notification_channel, $4, 'pending')
-         ON CONFLICT (alert_id, channel, target) DO NOTHING
-         RETURNING id`,
-        [tenantId, alertId, target.channel, target.target],
+      const { rows } = await db.query<ClaimedRow>(
+        `UPDATE alert_notifications n
+            SET claimed_at = now()
+          WHERE n.id IN (
+                  SELECT c.id
+                    FROM alert_notifications c
+                    JOIN alerts a ON a.id = c.alert_id
+                   WHERE c.status <> 'delivered'
+                     AND c.attempts < $1
+                     AND a.state <> 'resolved'
+                     AND ($2::uuid IS NULL OR c.alert_id = $2::uuid)
+                     AND (c.claimed_at IS NULL
+                          OR c.claimed_at < now() - ($3 || ' milliseconds')::interval)
+                   ORDER BY c.created_at
+                   LIMIT $4
+                   FOR UPDATE OF c SKIP LOCKED
+                )
+      RETURNING n.id, n.alert_id, n.channel, n.target`,
+        [
+          this.config.ALERT_WEBHOOK_MAX_ATTEMPTS,
+          alertId,
+          this.config.ALERT_NOTIFY_LEASE_MS,
+          this.config.ALERT_NOTIFY_BATCH,
+        ],
       );
-      return rows[0]?.id ?? null;
+      return rows;
     });
   }
 

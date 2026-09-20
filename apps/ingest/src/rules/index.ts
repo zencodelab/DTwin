@@ -274,6 +274,11 @@ export class AlertEngine {
         triggerValue: value,
         threshold: rule.threshold,
         context: { condition: rule.condition, windowS: rule.windowS, metric: sensor.metric },
+        // Parsed here so the destinations commit with the alert. A rule whose
+        // notify config is malformed yields an empty list, which is an alert
+        // nobody is told about — visibly, as zero rows, rather than as a
+        // delivery that silently never happened.
+        notifyTargets: this.notifier.targetsFor(rule.notify),
       });
 
       const ts = this.#targetState.get(key);
@@ -285,9 +290,10 @@ export class AlertEngine {
       this.#counts.opened++;
       this.#emit({ type: 'alert.raised', alert }, sensor);
 
-      // Delivery is recorded and retried independently; a webhook that is down
-      // must not prevent the alert from being opened or broadcast.
-      void this.notifier.dispatch(sensor.tenantId, alert, rule.notify).catch((err: unknown) => {
+      // The rows already exist, committed with the alert above. This is the
+      // fast path that delivers them now instead of at the next sweep; if it
+      // throws, or the process dies before it runs, the sweep finds them.
+      void this.notifier.deliverForAlert(sensor.tenantId, alert).catch((err: unknown) => {
         console.error('[alerts] notify failed:', (err as Error).message);
       });
     } catch (err) {
