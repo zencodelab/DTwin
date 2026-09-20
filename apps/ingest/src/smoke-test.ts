@@ -1061,6 +1061,31 @@ try {
   ok('/healthz stays open, since a load balancer has no key',
      (await fetch(`${BASE}/healthz`)).ok);
 
+  // The probes and the scrape endpoint are open for the same reason, which is
+  // only acceptable because none of them says anything about a tenant.
+  const [livez, readyz, metricsRes] = await Promise.all(
+    ['livez', 'readyz', 'metrics'].map((path) => fetch(`${BASE}/${path}`)));
+  ok('/livez and /readyz answer without a key', livez!.status === 200 && readyz!.status === 200,
+     `${livez!.status}, ${readyz!.status}`);
+
+  const metricsText = await metricsRes!.text();
+  const metricValue = (name: string): number => {
+    const line = metricsText.split('\n').find((l) => l.startsWith(`${name} `));
+    return line ? Number(line.split(' ')[1]) : NaN;
+  };
+  const healthNow = await getJson<{ writer: { written: number } }>(`${BASE}/healthz`);
+  ok('/metrics is Prometheus text, and agrees with /healthz',
+     (metricsRes!.headers.get('content-type') ?? '').startsWith('text/plain; version=0.0.4')
+       && metricValue('dtwin_ingest_ready') === 1
+       // Read a moment apart on a live server, so the counter may have moved on
+       // — but only forwards, and it cannot be zero this far into the suite.
+       && metricValue('dtwin_ingest_readings_written_total') > 0
+       && metricValue('dtwin_ingest_readings_written_total') <= healthNow.writer.written,
+     `written_total ${metricValue('dtwin_ingest_readings_written_total')} ≤ healthz ${healthNow.writer.written}`);
+  ok('no tenant, sensor or key id appears in any metric label',
+     !metricsText.split('\n').filter((l) => !l.startsWith('#'))
+       .some((l) => /[0-9a-f]{8}-[0-9a-f]{4}-/.test(l) || /tenant/i.test(l)));
+
   // A second tenant with its own device key. Its key must not be able to write
   // to, or even resolve, tenant A's points.
   const otherTenant = await createTenant(`smoke-b-${Date.now().toString(36)}`, 'Smoke Tenant B');

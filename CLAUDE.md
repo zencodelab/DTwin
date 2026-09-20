@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **257 checks, all passing** (`db` 68, `ingest` 112, `sim` 54,
-`web` 23), plus **223 unit tests** (173 vitest, 50 pytest). CI runs types,
+Suites total **260 checks, all passing** (`db` 68, `ingest` 115, `sim` 54,
+`web` 23), plus **232 unit tests** (182 vitest, 50 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -111,6 +111,12 @@ Do not "optimise" it back to COPY.
 - **Never hold a database connection across a password hash.** `login()` is
   three steps for this reason; scrypt also shares libuv's four threads with
   hostname resolution, which is why the sign-in ceiling is three, not four.
+- **Liveness never asks the database** (`docs/decisions.md` §58). `/livez` is
+  the liveness probe, `/readyz` readiness; pointing liveness at `/healthz`
+  restarts ingest during a database outage and discards the write buffer.
+  `/metrics` is a pure formatter over the same counters and carries **no
+  per-tenant labels** — it is served without a key. Counters end in `_total`;
+  a value that does not exist yet is `NaN`, never `0`.
 - **Do not make the registry refresh incremental on `updated_at`.** The writer
   stamps `last_seen_at` every flush, which fires the trigger, so every
   reporting sensor has always "changed". It needs a column the writer does not

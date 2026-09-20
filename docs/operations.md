@@ -111,7 +111,8 @@ exists** — that is, only on a seeded database — and creates **no user and no
 API key** on any database. Nothing shipped in a migration can authenticate,
 deliberately: a migration that carries credentials carries them to production.
 
-Every HTTP route on `apps/ingest` except `/healthz` requires a key, and its
+Every HTTP route on `apps/ingest` except `/healthz`, `/livez`, `/readyz` and
+`/metrics` requires a key, and its
 WebSocket requires a signed ticket minted from a logged-in session, so
 `apps/ingest`'s own smoke suite (and any manual exercise of it) needs both
 provisioned first. The building blocks are in
@@ -191,16 +192,34 @@ the ingest table in [api.md](api.md).
 Configure notification destinations in `alert_rules.notify`; enabling the flag
 alone does not create destinations. For example, `{"log": true}` enables a log
 target for a rule, while `{"webhook": "https://receiver.example/alerts"}` defines
-a webhook. Email configuration is accepted but currently records failure.
+a webhook. Email is delivered when `ALERT_SMTP_URL` and `ALERT_EMAIL_FROM` are
+set, and records `failed` with "no email transport configured" when they are not.
 There is no rule-administration API in the current application.
 
 ## Health and diagnosis
 
 ```bash
-curl --fail http://localhost:8787/healthz
+curl --fail http://localhost:8787/healthz     # readiness, with the full stats tree
+curl --fail http://localhost:8787/readyz      # readiness, one boolean
+curl --fail http://localhost:8787/livez       # liveness — never asks the database
+curl        http://localhost:8787/metrics     # Prometheus text
 curl --fail http://localhost:8000/healthz
 docker compose logs --tail=100 ingest sim web
 ```
+
+Under an orchestrator, liveness is `/livez` and readiness is `/readyz`. **Do not
+point a liveness probe at `/healthz` or `/readyz`**: both go 503 during a
+database outage, and restarting ingest then discards the write buffer that
+exists to ride the outage out
+([§58](decisions.md#58-liveness-does-not-ask-the-database-metrics-carry-no-tenant)).
+
+Worth alerting on from `/metrics`: any increase in
+`dtwin_ingest_readings_dropped_total` (data was lost),
+`dtwin_ingest_writer_failed_flushes_total`, sustained growth in
+`dtwin_ingest_writer_buffered_readings` (it precedes drops),
+`dtwin_ingest_ws_backlogged_closed_total` (clients are being made to
+reconcile), and `dtwin_ingest_rate_limit_refused_total` by `limiter`. Metrics
+carry no tenant labels by design; per-tenant figures come from the database.
 
 Ingest returns 200 when its registry is nonempty, buffered rows are below the
 cap, and the last writer error is null; otherwise 503. This is not a fresh DB
@@ -212,7 +231,9 @@ health endpoint. Inspect the page and its API/socket behavior separately.
 |---|---|---|
 | Live values move but history does not | `writer.lastError`, `failedFlushes`, `buffered`, `dropped` | Restore DB connectivity; check recovery of writes and quantify the lost interval |
 | Missing gateway readings | Ingest `unknownIds`, registry contents, active sensors | Correct external-ID mapping; wait for refresh and resend with the original timestamps |
-| Frozen or suspect colors | Socket connection, sensor timestamps/quality, aggregate data | Check the source readings; a connected socket alone does not prove freshness |
+| A zone is grey with "no reading · N min" or "reading flagged" | That zone's sensors: `last_seen_at`, and `quality` on recent rows in `telemetry` | The map is reporting a real condition, not failing: only good readings under three sample intervals old colour a zone ([§55](decisions.md#55-the-live-map-judges-a-reading-before-it-draws-one)). Fix the point; colour returns on its next good reading |
+| Clients reconnect whenever an alert fires | `fanout.backloggedClosed` on `/healthz` | Those clients were too backlogged to take an alert frame, which is never skipped ([§56](decisions.md#56-an-alert-frame-is-never-skipped-a-client-too-slow-for-one-is-disconnected)). Look at their link, or at `INGEST_CLIENT_BUFFER_MAX_BYTES` |
+| Gateways receive 429 | `limits` on `/healthz`; the `Retry-After` header | A tenant is over its reading budget, or an address is failing authentication. Raise `INGEST_RATE_*` only after confirming the traffic is legitimate ([§54](decisions.md#54-rate-limits-are-per-resource-keyed-by-whoever-can-exhaust-it)) |
 | Alert appears resolved in DB but open on screen | Fresh `/api/alerts` versus browser state | Reload to refresh the snapshot; track the browser reconciliation defect |
 | No notification arrives | `ALERT_NOTIFY_ENABLED`, rule config, `alert_notifications`, `alerts.notify` health counters | Inspect status and last error; exhausted attempts and resolved alerts are not automatically retried |
 | Scenario completes without progress | Worker relay address/token and current browser topics | Compare HTTP run status; floor-focused subscriptions currently miss simulation events |

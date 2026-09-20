@@ -53,6 +53,9 @@ Source: [ingest server](../apps/ingest/src/server.ts).
 | Method and path | Auth scope | Input | Current response |
 |---|---|---|---|
 | `GET /healthz` | none | — | 200 or 503; registry, writer, fan-out, alert/notification, simulator statistics, and `limits` — tracked keys, refusals and overflows for each rate limiter. Reports process-level counters only, deliberately, so it can stay open with no key |
+| `GET /livez` | none | — | Always 200 while the process is up. Never consults the database; this is the liveness probe ([§58](decisions.md#58-liveness-does-not-ask-the-database-metrics-carry-no-tenant)) |
+| `GET /readyz` | none | — | 200 or 503 by the same judgement as `/healthz`, without the payload; the readiness probe |
+| `GET /metrics` | none | — | Prometheus text exposition (`text/plain; version=0.0.4`) of the same counters. Process-level only: no tenant, sensor or key appears in any label, which is what lets it be served without a key |
 | `POST /ingest` | `ingest:write` | `RawTelemetryBatch` | 202 `{accepted, unknownIds, flagged, futureDated}`; a malformed JSON body is 400 and an oversized one 413. `unknownIds` also covers a real external id that belongs to **another tenant** — the key's own tenant genuinely does not have that point. `futureDated` counts readings refused for a timestamp more than `INGEST_MAX_CLOCK_SKEW_MS` (default 60 s) ahead of the server clock: unlike every other bad reading, those are not stored with a quality flag, because one of them blinds the rollups for every tenant ([§46](decisions.md#46-a-future-dated-reading-blinds-the-5-minute-view-for-everyone)) |
 | `GET /alerts` | `ingest:write` | Optional `state=live` or `state=resolved` | `{alerts: [...]}` for the key's own tenant; missing/unrecognized filter means all states |
 | `POST /alerts/ack` | `ingest:write` | `{alertId}` plus header `x-acting-user: <userId>` | 200 `{alert}`; missing fields 400; alert not open **or belonging to another tenant** 409 — the two cases are deliberately indistinguishable, so a caller cannot use this route to learn that an id exists elsewhere |
@@ -61,7 +64,7 @@ Source: [ingest server](../apps/ingest/src/server.ts).
 | `POST /internal/notify-sweep` | `ingest:write` | none | 200 `{delivered}` — runs the notification sweep now instead of at the next interval, for when a webhook receiver has just been fixed. Safe to call concurrently: workers claim disjoint sets ([§51](decisions.md#51-the-delivery-record-commits-with-the-alert-and-one-worker-owns-each-row)) |
 | `POST /internal/sim-event` | `sim:notify` | `SimEvent` | 202 `{forwarded: true}`; invalid event 400; the event's `buildingId` must belong to the key's tenant or the request is refused with 403 |
 
-Every row above except `/healthz` returns `401` for a missing or unrecognised
+Every row above except `/healthz`, `/livez`, `/readyz` and `/metrics` returns `401` for a missing or unrecognised
 key and `403` for a key that authenticates but does not carry the scope
 column names. See [Addresses, validation, and identity](#addresses-validation-and-identity)
 above for how a key is presented and what a key's tenant means for every field

@@ -8,6 +8,7 @@ import {
 import { listAlerts } from './rules/store.ts';
 import { authenticate, type AuthFailure } from './auth.ts';
 import { createLimits } from './limits.ts';
+import { ingestMetrics, renderMetrics } from './metrics.ts';
 import { loadConfig } from './config.ts';
 import { Pipeline } from './pipeline.ts';
 import { DeviceSimulator, FAULT_KINDS, isFaultKind } from './simulator/index.ts';
@@ -140,31 +141,76 @@ const httpServer = createServer((req, res) => {
   });
 });
 
+/**
+ * Ready means the write path is actually draining. A service that accepts
+ * readings and silently fails to persist them looks fine on a liveness check
+ * and is useless.
+ */
+function isReady(): boolean {
+  const stats = pipeline.stats();
+  return stats.sensors > 0
+    && stats.writer.buffered < config.INGEST_BUFFER_MAX_ROWS
+    && stats.writer.lastError === null;
+}
+
+function limiterStats() {
+  return {
+    authFailures: limits.authFailures.stats,
+    requests: limits.requests.stats,
+    readings: limits.readings.stats,
+    frames: limits.frames.stats,
+  };
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const route = `${req.method} ${url.pathname}`;
 
   switch (route) {
+    // Liveness: the process is up and its event loop is turning. Nothing else.
+    // It must NOT consult the database — an orchestrator restarts a container
+    // that fails liveness, and restarting ingest because Postgres blipped turns
+    // a database outage into a database outage plus a restart loop, discarding
+    // the write buffer that exists to ride the outage out (decisions.md §58).
+    case 'GET /livez':
+      return send(res, 200, { status: 'alive' });
+
+    // Readiness: should traffic be sent here? The same judgement as /healthz
+    // without the detail, so a probe every few seconds is not serialising the
+    // whole stats tree to read one boolean.
+    case 'GET /readyz': {
+      const ready = isReady();
+      return send(res, ready ? 200 : 503, { status: ready ? 'ready' : 'degraded' });
+    }
+
+    case 'GET /metrics': {
+      const stats = pipeline.stats();
+      const body = renderMetrics(ingestMetrics({
+        ready: isReady(),
+        uptimeS: process.uptime(),
+        sensors: stats.sensors,
+        writer: stats.writer,
+        fanout: stats.fanout,
+        alerts: 'enabled' in stats.alerts ? null : stats.alerts,
+        limits: limiterStats(),
+      }));
+      res.writeHead(200, {
+        'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+        'content-length': Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
+    }
+
     case 'GET /healthz': {
       const stats = pipeline.stats();
-      // Healthy means the write path is actually draining. A service that
-      // accepts readings and silently fails to persist them looks fine on a
-      // liveness check and is useless.
-      const healthy =
-        stats.sensors > 0 &&
-        stats.writer.buffered < config.INGEST_BUFFER_MAX_ROWS &&
-        stats.writer.lastError === null;
+      const healthy = isReady();
       return send(res, healthy ? 200 : 503, {
         status: healthy ? 'ok' : 'degraded',
         ...stats,
         // Refusals are counted where shed load already is. A limit nobody can
         // see firing is indistinguishable from one set too high to matter.
-        limits: {
-          authFailures: limits.authFailures.stats,
-          requests: limits.requests.stats,
-          readings: limits.readings.stats,
-          frames: limits.frames.stats,
-        },
+        limits: limiterStats(),
         simulator: config.SIM_ENABLED ? simulator.stats : { enabled: false as const },
       });
     }

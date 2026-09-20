@@ -1481,3 +1481,51 @@ carried a `spike` fault earlier the same day — 51 flagged readings peaking at
 247 °C — shows an hourly max of 24.76 °C. The db suite writes both fixtures
 above and asserts the flagged samples are counted, excluded, and that a
 5-minute bucket holding nothing else has no mean at all rather than a wrong one.
+
+---
+
+## 58. Liveness does not ask the database; metrics carry no tenant
+
+The original plan listed three observability items and the delivery note for
+that phase said the phase was complete. It was not: none of the three existed.
+Recorded here because a plan marked done is exactly the kind of derived
+document that drifts silently.
+
+**`/healthz` was one endpoint doing two jobs.** It returns 503 when the write
+path is not draining — registry empty, buffer at its cap, last flush failed.
+That is the right answer to "should traffic come here?" and the wrong answer to
+"should this process be restarted?". Pointed at by a liveness probe, a database
+outage restarts ingest in a loop, and each restart discards the in-memory write
+buffer whose entire purpose is to ride that outage out. So:
+
+| | Asks | Consults the database |
+|---|---|---|
+| `GET /livez` | is the event loop turning? | **never** |
+| `GET /readyz` | should traffic be sent here? | through the writer's last result |
+| `GET /healthz` | the same as `/readyz`, with the full stats tree | the same |
+
+`/healthz` keeps its behaviour; existing checks and the CI wait loop use it.
+Docker has one probe where an orchestrator has two, so the image has to choose:
+it uses `/readyz`, which is right for Compose (reports, does not restart) and
+wrong anywhere unhealthy means restart. The Dockerfile says so.
+
+**`/metrics` is a formatter, not instrumentation.** Every number was already
+being counted — shed load has been surfaced since §12 — but only as JSON on a
+health endpoint, which can say "it is dropping frames" and cannot say "since
+when". It is a pure function of a snapshot, so its output is tested without
+starting a pipeline. It refuses, at render time, the three mistakes a scraper
+punishes by rejecting the WHOLE payload: a duplicate name, an invalid name, and
+a counter not ending in `_total`. A duration that does not exist yet is `NaN`,
+not `0`, and with the alert engine disabled its series are absent rather than
+zero — "no alerts opened" and "nothing was looking" must not read the same.
+
+**There are deliberately no per-tenant labels.** They would be the first thing
+anyone asked for. The endpoint is served without a key, like `/healthz`, which
+is only acceptable while it says nothing that belongs to a tenant; per-tenant
+series would turn it into a list of who the customers are and how busy each one
+is, and make the series count a function of the customer count. Per-tenant
+figures belong behind authentication, from the database.
+
+**Not done:** structured JSON logging with a correlation id from gateway to
+database. The services still log lines of text. And neither the worker nor the
+web service exposes metrics.
