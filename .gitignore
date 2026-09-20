@@ -20,3 +20,8 @@ venv/
 models/*.glb
 models/*.gltf
 !models/sample-building.glb
+
+# The interview pack lives beside this repo, not in it: it is rehearsal
+# material about talking to interviewers, and this repository is public.
+# See ../DTwin-interview/. Ignored here so it cannot wander back in.
+interview/
