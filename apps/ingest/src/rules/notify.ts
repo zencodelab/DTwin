@@ -1,9 +1,9 @@
-import { lookup } from 'node:dns/promises';
 import { createTransport, type Transporter } from 'nodemailer';
 import { withTenant } from '@dtwin/db';
 import { activeTenants } from '../tenants.ts';
 import type { AlertWithContext } from '@dtwin/types';
 import type { Config } from '../config.ts';
+import { checkDestination, postPinned } from './destination.ts';
 
 /**
  * Alert notification delivery.
@@ -74,50 +74,10 @@ export function parseTargets(notify: unknown): NotifyTarget[] {
   return out;
 }
 
-const PRIVATE_V4 = [
-  /^10\./, /^127\./, /^169\.254\./, /^192\.168\./, /^0\./,
-  /^172\.(1[6-9]|2\d|3[01])\./,
-];
-
-/**
- * Whether a destination is safe to request.
- *
- * Resolution happens here rather than being left to fetch, because the decision
- * has to be made about the address actually contacted.
- */
-export async function checkDestination(
-  rawUrl: string,
-  allowPrivate: boolean,
-): Promise<{ ok: true; url: URL } | { ok: false; reason: string }> {
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return { ok: false, reason: 'not a valid URL' };
-  }
-
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    return { ok: false, reason: `unsupported protocol ${url.protocol}` };
-  }
-
-  if (allowPrivate) return { ok: true, url };
-
-  try {
-    const { address, family } = await lookup(url.hostname);
-    const isPrivate =
-      family === 6
-        ? /^(::1|fc|fd|fe80)/i.test(address)
-        : PRIVATE_V4.some((re) => re.test(address));
-
-    if (isPrivate) {
-      return { ok: false, reason: `resolves to a private address (${address})` };
-    }
-  } catch (err) {
-    return { ok: false, reason: `DNS lookup failed: ${(err as Error).message}` };
-  }
-
-  return { ok: true, url };
-}
+// The destination check and the pinned request live in destination.ts.
+// Re-exported because the smoke suite, and anything else that wants to ask
+// "may I send here?", has always imported it from this module.
+export { checkDestination } from './destination.ts';
 
 export class Notifier {
   #stats: NotifyStats = { delivered: 0, failed: 0, blocked: 0, skipped: 0 };
@@ -343,18 +303,18 @@ export class Notifier {
     }
 
     try {
-      const response = await fetch(check.url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ event: 'alert.raised', alert }),
-        // Bounded: a hung endpoint must not pin a connection while alerts keep
-        // arriving. `redirect: manual` stops a public URL redirecting into the
-        // private range the check just cleared it of.
-        signal: AbortSignal.timeout(this.config.ALERT_WEBHOOK_TIMEOUT_MS),
-        redirect: 'manual',
-      });
+      // `postPinned`, not `fetch`: the socket is opened to the addresses the
+      // check above judged, and to no others. `fetch` would resolve the name a
+      // second time and connect to whatever DNS said then — which is the whole
+      // of a rebinding attack. It also never follows a redirect, so a public
+      // URL cannot 302 its way into the range it was just cleared of.
+      const response = await postPinned(
+        check,
+        JSON.stringify({ event: 'alert.raised', alert }),
+        this.config.ALERT_WEBHOOK_TIMEOUT_MS,
+      );
 
-      if (!response.ok) {
+      if (response.status < 200 || response.status >= 300) {
         await this.#markFailed(tenantId, id, `HTTP ${response.status}`);
         this.#stats.failed++;
         return;

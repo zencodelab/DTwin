@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **223 checks, all passing** (`db` 58, `ingest` 96, `sim` 51,
-`web` 18), plus **95 unit tests** (57 vitest, 38 pytest). CI runs types,
+Suites total **225 checks, all passing** (`db` 58, `ingest` 98, `sim` 51,
+`web` 18), plus **134 unit tests** (96 vitest, 38 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -104,10 +104,13 @@ Do not "optimise" it back to COPY.
   `FOR UPDATE SKIP LOCKED` under a lease, so two replicas cannot send the same
   row. Never re-add a channel filter to the sweep: a channel it ignores is a
   channel that never recovers from a restart.
-- **Never relax the webhook destination check.** It resolves the hostname and
-  blocks private addresses because rule config is operator-edited input that
-  this service makes requests to. `ALERT_WEBHOOK_ALLOW_PRIVATE` is for testing a
-  local receiver, not for production.
+- **Never relax the webhook destination check, and never send a webhook with
+  `fetch`.** The check resolves the name ONCE, judges every record, and
+  `postPinned` connects only to the addresses that were judged
+  (`docs/decisions.md` §52). `fetch` would resolve a second time and connect to
+  whatever DNS said then, which is the whole of a rebinding attack.
+  `ALERT_WEBHOOK_ALLOW_PRIVATE` skips the judgement but keeps the pin; it is for
+  testing a local receiver, not for production.
 - **The simulation worker must not open its own socket.** It posts to
   `/internal/sim-event`; ingest owns every subscription.
 - **The worker authenticates its caller.** Every route but `/healthz` wants an

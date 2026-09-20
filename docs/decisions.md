@@ -483,6 +483,10 @@ just cleared it of. Private destinations are allowed only behind an explicit
 flag, which exists so a local receiver can be tested — and the guard itself is
 tested directly rather than through that opening.
 
+*The reasoning here stands; the mechanism did not hold.* The check resolved the
+name and `fetch` then resolved it again, so the address judged was not
+necessarily the address contacted. §52 closes that and keeps everything above.
+
 The whole feature is off by default. Sending is outward-facing, and a dev
 database seeded with someone's real webhook should not start calling it because
 a service booted.
@@ -1104,3 +1108,65 @@ against three concurrent sweeps produce exactly nine deliveries and nine
 claims, where an unclaimed sweep would produce up to twenty-seven. Reverting
 the claim to the old `SELECT` pattern fails eight checks, so none of this is
 asserted vacuously.
+
+## 52. The webhook connects to the address that was checked, and only that one
+
+§34 resolves a webhook hostname and refuses private addresses, because rule
+config is operator-edited input that this service makes requests to. The check
+was sound and the request that followed it was a different request. Three
+holes, all of the kind that every legitimate webhook sails past:
+
+**The check and the connection resolved the name separately.** `lookup` said
+"public", then `fetch` asked DNS again and connected to whatever it was told the
+second time. A name with a short TTL that answers public first and `127.0.0.1`
+second — DNS rebinding — walks straight through, and the check was looking at an
+address nobody connected to. `docs/cto-assessment.md` said as much: the existing
+checks "should not be treated as complete SSRF protection."
+
+**Only the first record was examined.** A name with one public and one private
+record passed. Which one the client dials is the resolver's ordering, which is
+to say the name owner's.
+
+**The range list was a handful of regexes.** It missed carrier-grade NAT,
+multicast and the reserved blocks, matched IPv6 link-local by the literal prefix
+`fe80` when the range is `fe80::/10`, and did not know that `::ffff:127.0.0.1`
+is loopback wearing an IPv6 address.
+
+The fix is to resolve **once**, judge **every** address, and hand the connection
+exactly the addresses that were judged. `postPinned` uses `node:http` with a
+`lookup` that answers only from that list, because `fetch` offers no way to say
+which address to connect to — and a guard that cannot constrain the connection
+is a guard over a different request from the one that gets made. The hostname is
+still used for the Host header, for SNI and for certificate verification; only
+the question "where is it?" has been taken away from DNS.
+
+Two things fall out of that choice rather than being added to it. `node:http`
+cannot follow a redirect, so a public URL answering `302` to
+`http://127.0.0.1/` is reported as the failed delivery it is — the old code
+needed `redirect: 'manual'` to get the same. And each delivery uses its own
+socket (`agent: false`): a kept-alive socket would be reused without passing
+through `lookup`, which is harmless for an already-checked address and harder
+to reason about than it is worth.
+
+Ranges are RFC 6890's special-purpose space in `net.BlockList`, not regexes, and
+an IPv4-mapped IPv6 address is judged as the IPv4 host it reaches. WHATWG `URL`
+already normalises the exotic IPv4 spellings — `2130706433`, `0x7f.0.0.1`,
+`0177.0.0.1`, `127.1` — to dotted form before the check sees them, which is
+tested rather than assumed. Credentials in a URL are refused outright: they end
+up in logs and in `alert_notifications.target`.
+
+`ALERT_WEBHOOK_ALLOW_PRIVATE` skips the judgement and **keeps the pin**, so the
+smoke suite — which has to reach a receiver on loopback — exercises the real
+request path end to end rather than a test-only one.
+
+*Verified:* 39 unit tests with no network. The one that matters sends to
+`webhook.invalid`, a name reserved never to resolve, with `127.0.0.1` pinned:
+it succeeds, and with the `lookup` line removed it fails with `ENOTFOUND` — so
+the socket demonstrably goes where it was told, not where DNS says. A rebinding
+resolver is asked exactly once. A `302` to a second local server leaves that
+server with zero hits.
+
+**Still true:** this is one layer. A receiver on a public address that is
+itself a proxy into a private network is outside what any client-side check can
+see, which is why the assessment's other recommendation — an egress policy on
+the host — remains the right complement rather than something this replaces.

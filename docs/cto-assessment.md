@@ -82,7 +82,7 @@ measured requirement rather than precede the first dependable pilot.
 > | P1 — sim events target topics no floor-focused client listens to | **Closed** ([§45](decisions.md#45-simulation-topics-are-keyed-by-building-not-by-run)) |
 > | P1 — no CI; DB smoke prints failures without a failing exit code | **Closed.** CI runs types, both linters, 83 unit tests, a production build and all four suites; the exit-code claim was already stale when written |
 > | P1 — notification records created after alert insertion | **Closed.** The rows commit in the alert's own transaction, and the sweep claims with FOR UPDATE SKIP LOCKED so replicas cannot double-send ([§51](decisions.md#51-the-delivery-record-commits-with-the-alert-and-one-worker-owns-each-row)) |
-> | P1 — webhook address checks not pinned to the connection | **Open** |
+> | P1 — webhook address checks not pinned to the connection | **Closed.** One resolution, every record judged, and the socket opened only to those addresses ([§52](decisions.md#52-the-webhook-connects-to-the-address-that-was-checked-and-only-that-one)). An egress policy on the host is still the right complement |
 > | Not in the table — the sim worker trusted `X-Tenant-Id` alone | **Closed.** It requires a key with the `sim:run` scope; the header names the tenant, the key says the caller may |
 >
 > Three defects this review did not find were found afterwards, all by CI

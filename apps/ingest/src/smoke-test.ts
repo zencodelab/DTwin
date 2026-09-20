@@ -720,6 +720,14 @@ try {
   const blockedMetadata = await checkDestination('http://169.254.169.254/latest/meta-data', false);
   ok('the cloud metadata address is blocked',
      !blockedMetadata.ok, 'the classic SSRF target');
+  // Loopback wearing an IPv6 address. The old guard matched a handful of
+  // prefixes and had no idea this was 127.0.0.1.
+  const blockedMapped = await checkDestination('http://[::ffff:127.0.0.1]:9/hook', false);
+  ok('an IPv4-mapped IPv6 loopback is blocked',
+     !blockedMapped.ok, blockedMapped.ok ? 'allowed' : blockedMapped.reason);
+  const blockedDecimal = await checkDestination('http://2130706433/hook', false);
+  ok('a decimal-encoded loopback is blocked',
+     !blockedDecimal.ok, blockedDecimal.ok ? 'allowed' : blockedDecimal.reason);
   const blockedScheme = await checkDestination('file:///etc/passwd', false);
   ok('a non-HTTP scheme is rejected', !blockedScheme.ok);
   ok('a public destination is allowed',
@@ -915,11 +923,27 @@ try {
   const claimedTotal = claims.reduce(
     (sum: number, body) => sum + Number((body as { delivered: number }).delivered), 0);
 
+  // The service's own retry timer is a fourth competitor here, and a
+  // legitimate one — it can take some or all of the rows before these three
+  // do. So the manual sweeps' claim count is bounded, not fixed: asserting it
+  // equalled the row count passed only when the timer happened to lose the
+  // race. What must hold regardless of who won is that every row was attempted
+  // exactly once and the receiver saw exactly one call per row.
+  const { rows: [attempts] } = await pool.query<{ once: number; total: number }>(
+    `SELECT count(*) FILTER (WHERE attempts = 1 AND status = 'delivered')::int AS once,
+            count(*)::int AS total
+       FROM alert_notifications
+      WHERE alert_id IN (SELECT id FROM alerts WHERE rule_id = $1)
+        AND channel = 'webhook'`,
+    [notifyRule],
+  );
   ok('concurrent sweeps claim disjoint sets, so nothing is sent twice',
      received.length - beforeRace === Number(toSend?.n)
-       && claimedTotal === Number(toSend?.n),
-     `${received.length - beforeRace} call(s) and ${claimedTotal} claim(s) `
-     + `for ${toSend?.n} pending row(s)`);
+       && claimedTotal <= Number(toSend?.n)
+       && attempts?.once === attempts?.total,
+     `${received.length - beforeRace} call(s) for ${toSend?.n} row(s); `
+     + `${attempts?.once}/${attempts?.total} attempted exactly once; `
+     + `${claimedTotal} taken by these sweeps, the rest by the timer`);
 
   await del(`${BASE}/simulator/fault?sensorId=${probe.id}`);
   await new Promise<void>((r) => receiver.close(() => r()));
