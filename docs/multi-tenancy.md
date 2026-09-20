@@ -9,7 +9,7 @@ cookie, with a non-production `DTWIN_DEMO_TENANT_ID` fallback) and `apps/sim`
 sets). `docker-compose.yml` and `.env.example` carry the new variables
 (`AUTH_SECRET`, `POSTGRES_APP_USER`/`POSTGRES_APP_PASSWORD`,
 `DATABASE_URL_OWNER`, `INGEST_API_KEY`, `DTWIN_DEMO_TENANT_ID`), and every
-service connects as the **app** role. The suites total 216 checks, all passing.
+service connects as the **app** role. The suites total 220 checks, all passing.
 
 **Two things the conversion forced that are worth knowing before changing
 anything:**

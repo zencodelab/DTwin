@@ -90,6 +90,22 @@ measured requirement rather than precede the first dependable pilot.
 > tenant ([§46](decisions.md#46-a-future-dated-reading-blinds-the-5-minute-view-for-everyone)),
 > the alert listing had no usable index, and alerts never reached a
 > sensor-scoped subscriber.
+>
+> **The simulation-credibility section below has also moved on.** Latent load
+> ([§48](decisions.md#48-latent-load-is-a-load-on-the-coil-not-on-the-zone)),
+> per-zone facade orientation
+> ([§49](decisions.md#49-facade-orientation-is-derived-from-the-geometry-not-stored-beside-it)),
+> separate heating and cooling COPs and supply-fan energy
+> ([§50](decisions.md#50-the-air-side-comes-from-the-asset-register-and-the-register-is-ambiguous))
+> are all modelled now. Whole-building HVAC went from about 5,000 kWh to about
+> 11,000 over the same three days as a result, which is a fair measure of how
+> much a sensible-only, orientation-blind, fanless model was leaving out.
+>
+> What has NOT changed is the section's conclusion: still no calibration
+> against a reference tool, still no measured baseline, and the run still does
+> not snapshot its inputs for exact reproduction. More terms modelled is not
+> the same as validated, and the standing advice — comparative exploration yes,
+> absolute kWh to a client no — is unaffected.
 
 
 These are source-review findings unless the verification section says otherwise.
