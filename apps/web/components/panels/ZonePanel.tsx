@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { METRIC_UNITS, type MetricType } from '@dtwin/types';
 import { STATUS } from '@/lib/colors';
+import { ageMs, formatAge, isStale, type LiveReading } from '@/lib/live';
 import { Sparkline, type Point } from './Sparkline';
 
 interface Reading {
@@ -33,14 +34,19 @@ interface ZoneDetail {
 }
 
 export function ZonePanel({
-  zoneId, zoneName, zoneType, areaM2, floorName, liveValues,
+  zoneId, zoneName, zoneType, areaM2, floorName,
+  liveReadings, sampleIntervals, listeningSince, now,
 }: {
   zoneId: string;
   zoneName: string;
   zoneType: string;
   areaM2: number | null;
   floorName: string;
-  liveValues: Map<string, number>;
+  liveReadings: Map<string, LiveReading>;
+  /** Sample interval per sensor id, from the spatial tree. */
+  sampleIntervals: Map<string, number>;
+  listeningSince: number | null;
+  now: number;
 }) {
   const [detail, setDetail] = useState<ZoneDetail | null>(null);
   const [history, setHistory] = useState<Point[]>([]);
@@ -113,12 +119,35 @@ export function ZonePanel({
   // The live socket wins over the value fetched at open: it is newer by
   // definition, and a panel showing a stale number beside a live 3D view is
   // worse than one that shows nothing.
-  const valueOf = (r: Reading) => liveValues.get(r.sensorId) ?? r.value;
+  //
+  // It wins with its quality and its age, not only its value. The panel used
+  // to clear the "stale" mark the moment ANY live reading existed for a point,
+  // and then never set it again — so a sensor that reported once and died read
+  // as live for as long as the panel stayed open.
+  const stateOf = (r: Reading) => {
+    const live = liveReadings.get(r.sensorId);
+    if (!live) {
+      return { value: r.value, stale: r.isStale, flagged: r.quality !== 0, age: null };
+    }
+    const interval = sampleIntervals.get(r.sensorId) ?? 60;
+    const since = listeningSince ?? now;
+    return {
+      value: live.value,
+      stale: isStale(live, interval, now, since),
+      flagged: live.quality !== 0,
+      age: ageMs(live, now, since),
+    };
+  };
 
   const temperature = detail.readings.find((r) => r.metric === 'temperature_c');
+  const temperatureState = temperature ? stateOf(temperature) : null;
+  // A deviation from setpoint computed on a reading the quality gate rejected,
+  // or on one from an hour ago, is a number with nothing behind it.
+  const temperatureUsable =
+    temperatureState !== null && !temperatureState.stale && !temperatureState.flagged;
   const setpoint = detail.profile?.setpointC ?? null;
   const deviation =
-    temperature && setpoint !== null ? valueOf(temperature) - setpoint : null;
+    temperatureState && setpoint !== null ? temperatureState.value - setpoint : null;
   const deadband = detail.profile?.deadbandK ?? 1;
   const inBand = deviation !== null && Math.abs(deviation) <= deadband / 2;
 
@@ -134,23 +163,33 @@ export function ZonePanel({
 
       {/* Thermal condition as a hero figure: one number the reader came for,
           with its comparison beside it rather than in a separate chart. */}
-      {temperature && setpoint !== null && (
+      {temperatureState && setpoint !== null && (
         <section className="mx-4 mb-3 panel px-4 py-3">
           <div className="flex items-baseline gap-2">
-            <span className="tnum text-3xl font-semibold">
-              {valueOf(temperature).toFixed(1)}
+            <span
+              className="tnum text-3xl font-semibold"
+              style={{ color: temperatureUsable ? undefined : 'var(--text-muted)' }}
+            >
+              {temperatureState.value.toFixed(1)}
             </span>
             <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>°C</span>
             <span
               className="ml-auto text-xs font-medium"
-              style={{ color: inBand ? STATUS.good : STATUS.warning }}
+              style={{ color: temperatureUsable && inBand ? STATUS.good : STATUS.warning }}
             >
-              {inBand ? '✓ within deadband' : '▲ outside deadband'}
+              {!temperatureUsable
+                ? temperatureState.stale ? '◌ no recent reading' : '◌ reading flagged'
+                : inBand ? '✓ within deadband' : '▲ outside deadband'}
             </span>
           </div>
           <div className="tnum mt-1 text-xs" style={{ color: 'var(--text-secondary)' }}>
-            setpoint {setpoint.toFixed(1)} °C · deviation{' '}
-            {deviation! >= 0 ? '+' : ''}{deviation!.toFixed(1)} K · deadband ±{(deadband / 2).toFixed(1)} K
+            setpoint {setpoint.toFixed(1)} °C
+            {temperatureUsable && (
+              <>
+                {' '}· deviation {deviation! >= 0 ? '+' : ''}{deviation!.toFixed(1)} K
+              </>
+            )}
+            {' '}· deadband ±{(deadband / 2).toFixed(1)} K
           </div>
         </section>
       )}
@@ -160,6 +199,7 @@ export function ZonePanel({
           <tbody>
             {detail.readings.map((reading) => {
               const active = selectedSensor?.sensorId === reading.sensorId;
+              const state = stateOf(reading);
               return (
                 <tr
                   key={reading.sensorId}
@@ -170,13 +210,23 @@ export function ZonePanel({
                   <td className="py-1 pl-4 pr-2" style={{ color: 'var(--text-secondary)' }}>
                     {reading.metric.replace(/_.*$/, '').replace('temperature', 'temp')}
                   </td>
-                  <td className="tnum py-1 pr-1 text-right">
-                    {valueOf(reading).toFixed(reading.metric === 'occupancy_count' ? 0 : 1)}
+                  <td
+                    className="tnum py-1 pr-1 text-right"
+                    style={{ color: state.stale || state.flagged ? 'var(--text-muted)' : undefined }}
+                  >
+                    {state.value.toFixed(reading.metric === 'occupancy_count' ? 0 : 1)}
                   </td>
                   <td className="py-1 pr-4 text-xs" style={{ color: 'var(--text-muted)' }}>
                     {METRIC_UNITS[reading.metric]}
-                    {reading.isStale && !liveValues.has(reading.sensorId) && (
-                      <span title="No recent reading" style={{ color: STATUS.warning }}> stale</span>
+                    {state.stale ? (
+                      <span title="No recent reading" style={{ color: STATUS.warning }}>
+                        {' '}stale{state.age !== null ? ` · ${formatAge(state.age)}` : ''}
+                      </span>
+                    ) : state.flagged && (
+                      <span
+                        title="The quality gate flagged this reading; alerts do not evaluate it"
+                        style={{ color: STATUS.warning }}
+                      > flagged</span>
                     )}
                   </td>
                 </tr>

@@ -13,6 +13,7 @@ import {
   OVERLAY_LABELS, NO_DATA_DARK, NO_DATA_LIGHT, STATUS,
   magnitudeColor, temperatureColor, type OverlayMetric,
 } from '@/lib/colors';
+import { formatAge, isStale, reduceZone, zoneSource } from '@/lib/live';
 import { useIsDark } from '@/lib/theme';
 import { useLiveData } from '@/lib/ws';
 
@@ -41,6 +42,23 @@ interface ZoneProfile {
   value: number | null;
   setpointC: number | null;
   deadbandK: number | null;
+}
+
+/**
+ * A clock the render can depend on.
+ *
+ * Staleness is the one thing on this screen that changes when NOTHING arrives,
+ * so it cannot be driven by frames: a building whose gateway has died sends no
+ * frame to re-render on, and would stay coloured for ever. Ten seconds is far
+ * below the shortest stale threshold (three sample intervals).
+ */
+function useNow(everyMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), everyMs);
+    return () => clearInterval(timer);
+  }, [everyMs]);
+  return now;
 }
 
 const OVERLAYS: OverlayMetric[] = ['temperature_c', 'occupancy_count', 'co2_ppm'];
@@ -98,7 +116,10 @@ export function Dashboard({
     return list;
   }, [focusedFloorId, tree.building.id, tenantId]);
 
-  const { values, alerts: liveAlerts, simRuns, connected } = useLiveData(wsUrl, subscribed);
+  const {
+    readings, listeningSince, alerts: liveAlerts, simRuns, connected,
+  } = useLiveData(wsUrl, subscribed);
+  const now = useNow(10_000);
 
   // Historical means for the first paint. Live values replace them as they
   // arrive, but they only cover points that have reported since the page
@@ -157,41 +178,74 @@ export function Dashboard({
 
   /** Sensors per zone for the active overlay metric, resolved once. */
   const sensorsByZone = useMemo(() => {
-    const map = new Map<string, string[]>();
+    const map = new Map<string, Array<{ id: string; sampleIntervalS: number }>>();
     for (const sensor of tree.sensors) {
       if (sensor.metric !== overlay || !sensor.zoneId) continue;
+      const entry = { id: sensor.id, sampleIntervalS: sensor.sampleIntervalS };
       const list = map.get(sensor.zoneId);
-      if (list) list.push(sensor.id);
-      else map.set(sensor.zoneId, [sensor.id]);
+      if (list) list.push(entry);
+      else map.set(sensor.zoneId, [entry]);
     }
     return map;
   }, [tree.sensors, overlay]);
+
+  const sampleIntervals = useMemo(
+    () => new Map(tree.sensors.map((s) => [s.id, s.sampleIntervalS])),
+    [tree.sensors],
+  );
 
   const visuals = useMemo(() => {
     const out = new Map<string, ZoneVisual>();
 
     for (const floor of tree.floors) {
+      // Only the floor in frame is subscribed to, so every other floor hears
+      // nothing BY DESIGN and its silence says nothing about its sensors.
+      // Those zones are judged as of the moment listening began — which holds
+      // whatever they last showed — rather than being greyed out for a silence
+      // we arranged ourselves.
+      const inScope = focusedFloorId === null || focusedFloorId === floor.id;
+      const since = inScope ? (listeningSince ?? now) : now;
+
       for (const zone of floor.zones) {
-        const live = (sensorsByZone.get(zone.id) ?? [])
-          .map((id) => values.get(id))
-          .filter((v): v is number => v !== undefined);
+        const points = sensorsByZone.get(zone.id) ?? [];
+        const live = reduceZone(
+          points.map((p) => ({ sampleIntervalS: p.sampleIntervalS, reading: readings.get(p.id) })),
+          now, since,
+        );
 
         const fallback = baseline.get(zone.id);
+        const source = zoneSource(live, fallback?.value != null);
         const value =
-          live.length > 0
-            ? live.reduce((s, v) => s + v, 0) / live.length
-            : fallback?.value ?? null;
+          source === 'live' ? live.value
+          : source === 'baseline' ? fallback?.value ?? null
+          : null;
 
         if (value === null) {
           // Absent is not zero. Painting a zone with no coverage as the bottom
           // of the ramp invents a cold spot where there is simply no sensor.
+          //
+          // And a zone whose points have gone quiet or are all flagged is drawn
+          // the same way, WITH the reason: the last colour a dead sensor showed
+          // is not information about the zone, and holding it under a green
+          // "live" light is the most misleading thing this view could do.
           out.set(zone.id, {
             color: isDark ? NO_DATA_DARK : NO_DATA_LIGHT,
             label: null,
+            note:
+              source === 'stale'
+                ? live.staleForMs !== null
+                  ? `no reading · ${formatAge(live.staleForMs)}`
+                  : 'no reading'
+                : source === 'flagged' ? 'reading flagged'
+                : null,
             alerting: alertingZones.has(zone.id),
           });
           continue;
         }
+
+        // Some points usable, some not: the colour is honest but rests on
+        // fewer points than the zone has, and that is worth one short line.
+        const unusable = live.stale + live.silent + live.flagged;
 
         const setpoint = fallback?.setpointC ?? 23;
         out.set(zone.id, {
@@ -203,12 +257,18 @@ export function Dashboard({
             overlay === 'temperature_c' ? `${value.toFixed(1)} °C`
             : overlay === 'co2_ppm' ? `${value.toFixed(0)} ppm`
             : `${value.toFixed(0)} ppl`,
+          note: source === 'live' && unusable > 0
+            ? `${live.used} of ${points.length} points`
+            : null,
           alerting: alertingZones.has(zone.id),
         });
       }
     }
     return out;
-  }, [tree.floors, sensorsByZone, values, baseline, overlay, alertingZones, isDark]);
+  }, [
+    tree.floors, sensorsByZone, readings, baseline, overlay, alertingZones, isDark,
+    now, listeningSince, focusedFloorId,
+  ]);
 
   const selected = useMemo(() => {
     for (const floor of tree.floors) {
@@ -218,14 +278,36 @@ export function Dashboard({
     return null;
   }, [tree.floors, selectedZoneId]);
 
-  const livePowerKw = useMemo(() => {
+  /**
+   * Live load, and how many of the meters it rests on.
+   *
+   * It used to add `values.get(id) ?? 0`, which has two failure modes pointing
+   * opposite ways: a meter that died went on contributing its last reading for
+   * ever, and one never heard from contributed zero — and both produced a
+   * plausible-looking total. The sum now takes fresh, good readings only and
+   * says how many meters that was, because "41 kW" and "41 kW from 7 of 12
+   * meters" are different facts.
+   *
+   * Power meters hang off equipment, which is spread across floors, so with a
+   * floor in frame most of them are out of scope like any other floor's points
+   * and are held rather than judged.
+   */
+  const livePower = useMemo(() => {
+    const since = focusedFloorId === null ? (listeningSince ?? now) : now;
     let sum = 0;
+    let reporting = 0;
+    let meters = 0;
     for (const sensor of tree.sensors) {
       if (sensor.metric !== 'power_kw') continue;
-      sum += values.get(sensor.id) ?? 0;
+      meters += 1;
+      const reading = readings.get(sensor.id);
+      if (!reading || reading.quality !== 0) continue;
+      if (isStale(reading, sensor.sampleIntervalS, now, since)) continue;
+      sum += reading.value;
+      reporting += 1;
     }
-    return sum;
-  }, [tree.sensors, values]);
+    return { kw: sum, reporting, meters };
+  }, [tree.sensors, readings, now, listeningSince, focusedFloorId]);
 
   const selectZoneFromAlert = useCallback((zoneId: string) => {
     const floor = tree.floors.find((f) => f.zones.some((z) => z.id === zoneId));
@@ -249,7 +331,16 @@ export function Dashboard({
         </span>
 
         <div className="ml-auto flex items-center gap-4 text-xs">
-          <Kpi label="Live load" value={`${livePowerKw.toFixed(1)} kW`} />
+          <Kpi
+            label="Live load"
+            value={
+              livePower.reporting === 0 ? '—'
+              : livePower.reporting < livePower.meters
+                ? `${livePower.kw.toFixed(1)} kW · ${livePower.reporting}/${livePower.meters} meters`
+                : `${livePower.kw.toFixed(1)} kW`
+            }
+            color={livePower.reporting < livePower.meters ? STATUS.warning : undefined}
+          />
           <Kpi
             label="Open alerts"
             value={String(alerts.length)}
@@ -399,7 +490,10 @@ export function Dashboard({
               zoneType={selected.zone.zoneType}
               areaM2={selected.zone.areaM2}
               floorName={selected.floor.name}
-              liveValues={values}
+              liveReadings={readings}
+              sampleIntervals={sampleIntervals}
+              listeningSince={listeningSince}
+              now={now}
             />
           </>
         ) : (

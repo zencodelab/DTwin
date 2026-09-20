@@ -1305,3 +1305,61 @@ version of that measurement read 54%, which is how the thread-pool contention
 in the table above was found: it was mostly watching connections being opened
 behind the hashes.
 
+---
+
+## 55. The live map judges a reading before it draws one
+
+The dashboard kept `Map<sensorId, number>`: the latest value and nothing else.
+
+- **A flagged reading coloured its zone.** −273 °C from a failed probe painted
+  the zone deep blue, while the alert engine — correctly, per §17 — refused to
+  evaluate that same reading. A map and an alert list that disagree invite the
+  wrong conclusion about which is broken.
+- **A value never aged.** A sensor that stopped an hour ago went on painting its
+  zone the colour it had when it died, under a green "live" light.
+- **The zone panel cleared its "stale" mark** the moment any live reading
+  existed for a point, and never set it again.
+- **Live load summed `value ?? 0`**, so a dead meter contributed its last
+  reading for ever and one never heard from contributed zero. Both produce a
+  plausible total.
+
+The client now keeps value, timestamp, quality and arrival time, and a pure
+module (`apps/web/lib/live.ts`) decides what may be drawn:
+
+**Only `Good`, fresh readings enter a zone's mean** — the same rule the alert
+engine applies, so the two cannot disagree. Stale means more than three sample
+intervals, the multiple `getZoneDetail` already used in SQL.
+
+**Age is `now − min(ts, receivedAt)`.** A device clock running ahead cannot make
+a reading look fresher than its own arrival; a backfilled reading from
+yesterday is as old as its timestamp says.
+
+**Silence is only evidence while we were listening.** The dashboard subscribes
+to the floor in frame (§31), so every other floor hears nothing *by design*.
+Ages are floored at the moment the current subscription was accepted, and
+out-of-scope floors are held rather than judged — otherwise focusing a floor
+would grey out the rest of the building three minutes later, for a silence the
+client arranged itself.
+
+**The historical baseline is for the first paint only.** It stands in while a
+point has not yet been listened to for long enough to expect it, and never for
+a point that has gone quiet: a one-hour mean fetched when the page opened is
+older than the reading it would replace.
+
+**Staleness needs a clock, not a frame.** It is the one thing on the screen that
+changes when nothing arrives, so a ten-second tick drives it. A building whose
+gateway has died sends no frame to re-render on.
+
+A grey zone now carries its reason — "no reading · 4 min", "reading flagged",
+"2 of 3 points" — because grey alone reads as "no sensor here", which is a
+different fact.
+
+**Found on the way: the `ZoneMesh` memo from the rendering work never held.**
+That change stabilised the `onSelect` callback and said the memo now worked. It
+did not: `visual` is a fresh object for every zone on every recompute, and the
+default comparison is by reference. It now compares what the visual says.
+
+*Verified in a browser, against the running stack:* a `spike` fault greys its
+zone as "reading flagged" within one sample; an `offline` fault greys its zone
+with a growing age once three intervals pass; clearing both restores colour on
+the next frame.

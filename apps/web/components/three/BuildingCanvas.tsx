@@ -17,7 +17,20 @@ export interface ZoneVisual {
   color: string;
   /** Formatted value for the on-canvas label — colour never stands alone. */
   label: string | null;
+  /**
+   * Why the zone is grey, or what its colour rests on — "no reading · 4 min",
+   * "reading flagged", "2 of 3 points". A grey zone with no words reads as "no
+   * sensor here", which is a different fact from "the sensor here went quiet".
+   */
+  note: string | null;
   alerting: boolean;
+}
+
+function sameVisual(a: ZoneVisual | undefined, b: ZoneVisual | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.color === b.color && a.label === b.label
+    && a.note === b.note && a.alerting === b.alerting;
 }
 
 interface Props {
@@ -263,12 +276,26 @@ const ZoneMesh = memo(function ZoneMesh({
                style={{ background: 'rgba(13,13,13,0.78)', color: '#fff' }}>
             <div className="font-medium">{zone.name}</div>
             {visual.label && <div className="tnum opacity-90">{visual.label}</div>}
+            {visual.note && (
+              <div className="tnum text-[10px]" style={{ color: STATUS.warning }}>{visual.note}</div>
+            )}
           </div>
         </Html>
       )}
     </group>
   );
-});
+}, (prev, next) =>
+  // The default comparison is by reference, and `visual` is a fresh object for
+  // every zone each time the dashboard recomputes — which is every telemetry
+  // frame. So the memo added with the stable `onSelect` never once held: the
+  // callback was fixed and this prop was not. Compare what the visual SAYS.
+  prev.zone === next.zone
+  && prev.height === next.height
+  && prev.dimmed === next.dimmed
+  && prev.showLabel === next.showLabel
+  && prev.selected === next.selected
+  && prev.onSelect === next.onSelect
+  && sameVisual(prev.visual, next.visual));
 
 /**
  * Status is a reserved palette and always ships with a label, never colour

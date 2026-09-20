@@ -5,6 +5,7 @@ import {
   expandReading, parseServerMessage,
   type AlertWithContext, type SimulationSummary, type Topic,
 } from '@dtwin/types';
+import { newer, type LiveReading } from './live.ts';
 
 export interface SimRunState {
   progressPct: number;
@@ -14,8 +15,16 @@ export interface SimRunState {
 }
 
 export interface LiveState {
-  /** Latest value per sensor id. */
-  values: Map<string, number>;
+  /**
+   * Latest reading per sensor id — value, timestamp and quality, not the value
+   * alone. Whether a reading may still be drawn is decided in `lib/live.ts`.
+   */
+  readings: Map<string, LiveReading>;
+  /**
+   * When the current subscription was accepted, epoch ms; null while there is
+   * none. Silence before this moment is not evidence that a point is down.
+   */
+  listeningSince: number | null;
   alerts: AlertWithContext[];
   /** Simulation runs the worker has reported on, keyed by run id. */
   simRuns: Map<string, SimRunState>;
@@ -34,7 +43,8 @@ export interface LiveState {
  * type-level assertion with nothing behind it.
  */
 export function useLiveData(url: string, topics: Topic[]): LiveState {
-  const [values, setValues] = useState<Map<string, number>>(new Map());
+  const [readings, setReadings] = useState<Map<string, LiveReading>>(new Map());
+  const [listeningSince, setListeningSince] = useState<number | null>(null);
   const [alerts, setAlerts] = useState<AlertWithContext[]>([]);
   const [simRuns, setSimRuns] = useState<Map<string, SimRunState>>(new Map());
   const [connected, setConnected] = useState(false);
@@ -87,6 +97,7 @@ export function useLiveData(url: string, topics: Topic[]): LiveState {
           // sent from here rather than from `onopen`.
           case 'authenticated':
             setConnected(true);
+            setListeningSince(Date.now());
             if (topics.length > 0) {
               socket.send(JSON.stringify({ type: 'subscribe', topics }));
             }
@@ -96,11 +107,14 @@ export function useLiveData(url: string, topics: Topic[]): LiveState {
             // One state update per frame, not per reading: the server already
             // coalesced a tick's readings into this batch, and re-rendering per
             // reading would undo that saving on the client.
-            setValues((prev) => {
+            setReadings((prev) => {
               const next = new Map(prev);
+              const receivedAt = Date.now();
               for (const tuple of message.readings) {
                 const r = expandReading(tuple);
-                next.set(r.sensorId, r.value);
+                next.set(r.sensorId, newer(prev.get(r.sensorId), {
+                  value: r.value, ts: r.ts, quality: r.quality, receivedAt,
+                }));
               }
               return next;
             });
@@ -147,6 +161,7 @@ export function useLiveData(url: string, topics: Topic[]): LiveState {
 
       socket.onclose = () => {
         setConnected(false);
+        setListeningSince(null);
         // The ingest service restarts on deploy; a dashboard left open should
         // recover on its own rather than silently going stale.
         if (!closed) retry = setTimeout(connect, 2000);
@@ -163,5 +178,5 @@ export function useLiveData(url: string, topics: Topic[]): LiveState {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, topicKey]);
 
-  return { values, alerts, simRuns, connected };
+  return { readings, listeningSince, alerts, simRuns, connected };
 }

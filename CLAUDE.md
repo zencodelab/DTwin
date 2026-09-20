@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **233 checks, all passing** (`db` 60, `ingest` 99, `sim` 54,
-`web` 20), plus **165 unit tests** (115 vitest, 50 pytest). CI runs types,
+Suites total **253 checks, all passing** (`db` 64, `ingest` 112, `sim` 54,
+`web` 23), plus **207 unit tests** (157 vitest, 50 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -93,6 +93,17 @@ Do not "optimise" it back to COPY.
   tree THROWS, because there is no honest subset of a floor plan; the registry
   keeps its previous copy; a request over its ceiling is refused before any row
   exists. Never clamp a query parameter silently — refuse and name the limit.
+- **Rate limits are per resource, keyed by whoever can exhaust it**
+  (`docs/decisions.md` §54). Readings are rationed per TENANT because the write
+  buffer sheds oldest without asking whose rows they are — it is a fairness
+  mechanism, not a throttle. Authentication and sign-in charge only FAILURES,
+  and check BEFORE the expensive step. Never read the first entry of
+  `X-Forwarded-For`; use `clientAddress`, which counts back from the right by
+  the number of proxies we operate, and ignores the header when that is zero.
+  Every 429 carries `Retry-After`.
+- **Never hold a database connection across a password hash.** `login()` is
+  three steps for this reason; scrypt also shares libuv's four threads with
+  hostname resolution, which is why the sign-in ceiling is three, not four.
 - **Do not make the registry refresh incremental on `updated_at`.** The writer
   stamps `last_seen_at` every flush, which fires the trigger, so every
   reporting sensor has always "changed". It needs a column the writer does not
@@ -191,6 +202,15 @@ service.
   `NODE_ENV`.** Compose runs production over plain HTTP; a `Secure` cookie there
   is dropped by every host except localhost.
 
+- **The live map judges a reading before it draws one** (`docs/decisions.md`
+  §55, `lib/live.ts`). Only `Good`, fresh readings enter a zone's mean — the
+  alert engine's rule, so the map and the alert list cannot disagree. Silence
+  only counts while we were listening: out-of-scope floors are HELD, not
+  judged, or focusing a floor greys the rest of the building three minutes
+  later. The baseline is for first paint only. Staleness is driven by a clock,
+  not by frames — a dead gateway sends no frame to re-render on.
+- **`ZoneMesh`'s memo compares the visual's contents**, not its reference: the
+  dashboard builds a fresh visual per zone per recompute.
 - **The 3D view is generated from the stored PostGIS geometry.** Do not
   introduce a GLB into the render path; it would be a second source of truth.
 - **One scene rotation** (−90° about X) reconciles the +Z-up CRS with three.js.
