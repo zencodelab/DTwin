@@ -83,6 +83,40 @@ async function appliedVersions(): Promise<Map<string, string>> {
   return new Map(rows.map((r) => [r.version, r.checksum]));
 }
 
+/**
+ * Errors worth retrying rather than failing the chain on.
+ *
+ * `tuple concurrently deleted/updated` is PostgreSQL saying two sessions
+ * touched the same catalogue row. Here the other session is TimescaleDB's own
+ * background scheduler: 002 registers continuous-aggregate refresh policies,
+ * the worker can fire one seconds later, and 008 then drops and rebuilds those
+ * same aggregates. On a long-lived database the two are hours apart and it
+ * never happens; on a fresh one — a new deployment, or CI — they are seconds
+ * apart, and `DROP MATERIALIZED VIEW telemetry_1h` loses the race.
+ *
+ * Retrying is safe because the statement did not take effect: the error is
+ * raised precisely because the catalogue tuple was not the one the DDL locked.
+ * Only `@no-transaction` files need this — everything else rolls back and the
+ * whole file is re-runnable.
+ *
+ * This is a retry, not a fix. The fix is for the rebuild to suspend the jobs
+ * first, and that belongs in the migration; 008 is applied and append-only, so
+ * it stays as it is and the next aggregate rebuild should do it properly.
+ */
+const TRANSIENT = [
+  'tuple concurrently deleted',
+  'tuple concurrently updated',
+  'deadlock detected',
+  'could not serialize access',
+];
+
+function isTransient(err: unknown): boolean {
+  const message = (err as Error)?.message ?? '';
+  return TRANSIENT.some((t) => message.includes(t));
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function applyOne(m: Migration): Promise<void> {
   const pool = getOwnerPool();
 
@@ -90,7 +124,20 @@ async function applyOne(m: Migration): Promise<void> {
     const statements = splitStatements(m.sql);
     for (const [idx, stmt] of statements.entries()) {
       try {
-        await pool.query(stmt);
+        for (let attempt = 1; ; attempt++) {
+          try {
+            await pool.query(stmt);
+            break;
+          } catch (err) {
+            if (attempt >= 4 || !isTransient(err)) throw err;
+            console.warn(
+              `\n[migrate] ${m.version}: statement ${idx + 1} hit ` +
+                `"${(err as Error).message.split('\n')[0]}", retrying ` +
+                `(${attempt}/3)`,
+            );
+            await sleep(attempt * 500);
+          }
+        }
       } catch (err) {
         const preview = stmt.replace(/\s+/g, ' ').slice(0, 160);
         throw new Error(
