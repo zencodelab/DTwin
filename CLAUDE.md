@@ -123,6 +123,14 @@ service.
   results depend on the integration step (`docs/decisions.md` §22).
 - **Solar gain uses real sun geometry.** Vertical-facade irradiance dips at solar
   noon at this latitude — that is correct, not a bug.
+- **Latent load is a load on the COIL, not on the zone** (`docs/decisions.md`
+  §48). Never put it in `q_net`: drying air does not change its temperature,
+  and a building that cooled itself by dehumidifying would be the result. It is
+  met only while the coil is running, the plant is sized for the total load,
+  and `latentKwh` is a **subset** of `hvacKwh`, not an addition. It is 39% of
+  cooling for the seeded building in June.
+- **`occupancy_heat_gain_w_person` is a TOTAL**, not a sensible gain. The engine
+  splits it; do not use the column whole.
 - **Plant is auto-sized per zone** from its design load, so unmet hours mean the
   plant is insufficient rather than the default being wrong.
 - **`observed` weather fails loudly** when no rows exist. Never silently fall back

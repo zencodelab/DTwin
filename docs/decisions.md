@@ -863,3 +863,66 @@ at which run ownership needs a lease rather than an assumption.
 409; a third concurrent request is refused 429 with the first two accepted, and
 leaves no `queued` row; a row planted at `running` is `failed` with that message
 within seconds of a worker start.
+
+## 48. Latent load is a load on the coil, not on the zone
+
+The model was sensible-heat only, and `interview/08` listed that first among
+the things most likely to be caught overclaiming: *"Understates HVAC energy in a
+humid coastal climate, where dehumidification is a substantial share."* It was
+not an approximation. A sensible balance has **no term** for moisture, so the
+question could not be asked of it at all.
+
+It is now asked, and the answer for Corniche Tower over three days in June is
+**3,155 kWh of 8,043 kWh — 39% of cooling energy**. Whole-building HVAC went
+from about 5,000 kWh to about 8,000. That reversed a comparison the smoke suite
+had been asserting since it was written: plug load used to exceed HVAC, because
+a 200 m² server room at 450 W/m² is 90 kW continuous. It no longer does. In a
+Gulf June, drying the ventilation air costs more than the data hall's plugs.
+
+**The modelling decision that matters is where the term goes.** Drying air does
+not change its temperature, so latent load is kept out of the sensible balance
+that decides where the zone floats to. It is a load on the **coil**. Putting it
+into `q_net` would have been easy and would have produced a building that
+cooled itself by dehumidifying — moisture appearing as degrees.
+
+Three consequences of that placement:
+
+- It is only met **while the coil is running**. With no cooling call nothing is
+  dehumidifying the space, and charging for moisture removal that did not happen
+  would invent energy. The space drifts damp, which is what an unconditioned
+  building here does.
+- The **plant is sized for the total coil load**, sensible plus latent, as a real
+  chiller is — at the peak hour's own humidity, not a nominal one. Sizing on
+  sensible alone would leave it short on exactly the days that matter, and the
+  shortfall would surface as unmet hours describing the sizing rule rather than
+  the building.
+- `latent_load_kwh` is reported as a **subset** of `hvac_load_kwh`, not an
+  addition. "Why is this building expensive?" has a different answer in Abu
+  Dhabi than in Munich, and one HVAC number cannot give it.
+
+**A second correction came with it.**
+`thermal_profiles.occupancy_heat_gain_w_person` defaults to 120 W, which is a
+seated adult's *total* output; ASHRAE puts roughly 75 W of it into the air as
+heat and the rest as water. The engine treated all 120 W as sensible,
+overstating the temperature-raising gain by about 70% while having nowhere to
+put the moisture. It is now split, so the column keeps meaning what it says.
+
+**Indoor humidity is a target, not a state.** The space is held at 50% RH at
+setpoint — the middle of the ASHRAE 55 envelope and what a Gulf building is
+designed for. Simulating the room's own moisture balance needs a second
+capacitance and a second integration, and the quantity that matters here is set
+by the outdoor air brought in, not by how the room's humidity swings between
+coil cycles. The day that question matters — a humidifier, a tight archive, a
+lab — this becomes a state and the note in `psychro.py` is where to start.
+
+`psychro.py` implements three functions rather than taking a dependency:
+Hyland-Wexler saturation pressure, humidity ratio, and the latent power of an
+air stream. *Verified against ASHRAE Fundamentals tables:* 25.2 g/kg at 35 °C
+and 70% RH against a tabulated 25.0, 9.3 against 9.3 at 24 °C and 50%, and
+saturation pressure at 100 °C within 0.1% of one atmosphere.
+
+**Still not modelled**, and worth saying before anyone asks: there is no
+humidifier, so the model never adds moisture; no latent capacity limit separate
+from sensible, so a coil cannot run out of dehumidification while still having
+cooling left; and no sensible heat ratio on the equipment, so the split between
+the two is the load's, not the machine's.

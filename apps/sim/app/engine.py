@@ -33,7 +33,7 @@ from uuid import UUID
 
 import numpy as np
 
-from . import repository
+from . import psychro, repository
 from . import weather as weather_mod
 from .config import settings
 from .models import SimulationRequest
@@ -55,6 +55,25 @@ MIN_LIGHTING_FRACTION = 0.05
 PLUG_STANDBY_FRACTION = 0.3
 
 DAY_TYPE_COUNT = 4
+
+# How much of a person's heat gain is sensible rather than latent.
+#
+# `thermal_profiles.occupancy_heat_gain_w_person` is a TOTAL — its default of
+# 120 W is the whole output of a seated adult, and ASHRAE Fundamentals puts
+# roughly 75 W of that into the air as heat and the rest into it as water.
+# Treating all 120 W as sensible, which is what this model did, overstates the
+# temperature-raising gain by about 70% and has no term at all for the moisture.
+OCCUPANT_SENSIBLE_FRACTION = 0.62
+
+# The humidity the conditioned space is held at, as relative humidity at the
+# zone setpoint.
+#
+# A target rather than a simulated state: modelling the moisture balance of the
+# room needs a second capacitance and a second integration, and the answer that
+# matters here is the coil load, which is set by the outdoor air brought in.
+# 50% is the middle of the ASHRAE 55 comfort envelope and what a Gulf building
+# is designed to hold.
+INDOOR_TARGET_RH_PCT = 50.0
 
 
 class ZoneArrays:
@@ -97,7 +116,11 @@ class ZoneArrays:
         self.equipment_w = f("equipment_power_density_w_m2") * self.area * (
             params.equipmentScale or 1.0
         )
-        self.occupancy_gain_w = f("occupancy_heat_gain_w_person")
+        # Split, not used whole. See OCCUPANT_SENSIBLE_FRACTION: the column is
+        # a person's total output and only part of it warms the air.
+        occupancy_total_w = f("occupancy_heat_gain_w_person")
+        self.occupancy_gain_w = occupancy_total_w * OCCUPANT_SENSIBLE_FRACTION
+        self.occupancy_latent_w = occupancy_total_w * (1.0 - OCCUPANT_SENSIBLE_FRACTION)
         self.ventilation_m3_s_person = f("ventilation_l_s_person") / 1000.0
 
         self.setpoint = f("setpoint_temp_c") + (params.setpointDeltaK or 0.0)
@@ -107,7 +130,9 @@ class ZoneArrays:
         self.occupancy_scale = params.occupancyScale or 1.0
         self.capacity_w = np.zeros(n)  # sized once weather is known
 
-    def size_plant(self, design_outdoor_c: float) -> None:
+    def size_plant(
+        self, design_outdoor_c: float, design_outdoor_rh_pct: float = 55.0
+    ) -> None:
         """Auto-size cooling capacity from each zone's design load.
 
         A flat W/m2 rule would cripple the server room, whose equipment density
@@ -122,11 +147,28 @@ class ZoneArrays:
         )
         delta_t = np.maximum(design_outdoor_c - self.setpoint, 0.0)
 
+        # The plant is sized for the TOTAL coil load, sensible plus latent, as
+        # a real chiller is. Sizing on sensible alone would leave it short by
+        # the dehumidification duty on exactly the days that matter here, and
+        # the shortfall would surface as unmet hours describing the sizing rule
+        # rather than the building.
+        design_outdoor_w = psychro.humidity_ratio(
+            np.array([design_outdoor_c]), np.array([design_outdoor_rh_pct])
+        )[0]
+        design_indoor_w = psychro.humidity_ratio(
+            self.setpoint, np.full_like(self.setpoint, INDOOR_TARGET_RH_PCT)
+        )
+        design_latent = psychro.latent_power_w(
+            (ventilation_ua + self.ua_infiltration) / AIR_CP_J_KGK,
+            design_outdoor_w, design_indoor_w,
+        ) + self.design_occupancy * self.occupancy_latent_w
+
         design_load = (
             self.lighting_w
             + self.equipment_w
             + self.design_occupancy * self.occupancy_gain_w
             + self.window_area * self.shgc * DESIGN_SOLAR_W_M2
+            + design_latent
             + (self.ua_envelope + self.ua_infiltration + ventilation_ua) * delta_t
         )
         self.capacity_w = settings.capacity_safety_factor * np.maximum(design_load, 1000.0)
@@ -184,8 +226,13 @@ def run(
         raise ValueError("simulation period is shorter than one interval")
 
     series = weather_mod.build(request, building, step_stamps, settings.ground_reflectance)
-    arrays.size_plant(float(np.max(series.dry_bulb_c)) if series.dry_bulb_c.size
-                      else DESIGN_OUTDOOR_FALLBACK_C)
+    if series.dry_bulb_c.size:
+        peak_i = int(np.argmax(series.dry_bulb_c))
+        arrays.size_plant(
+            float(series.dry_bulb_c[peak_i]), float(series.rh_pct[peak_i])
+        )
+    else:
+        arrays.size_plant(DESIGN_OUTDOOR_FALLBACK_C)
 
     carbon_factor = (
         request.params.gridCarbonKgPerKwh
@@ -195,6 +242,14 @@ def run(
 
     # Start at setpoint: the alternative is a cold start whose first day is
     # dominated by charging the thermal mass rather than by the building.
+    # The indoor humidity ratio the coil is holding the space at. Constant for
+    # the run: the setpoint does not move, and this is a target rather than a
+    # simulated state (see INDOOR_TARGET_RH_PCT).
+    indoor_humidity = psychro.humidity_ratio(
+        arrays.setpoint, np.full_like(arrays.setpoint, INDOOR_TARGET_RH_PCT)
+    )
+    outdoor_humidity_series = psychro.humidity_ratio(series.dry_bulb_c, series.rh_pct)
+
     temperature = arrays.setpoint.copy()
     interval_hours = request.intervalS / 3600.0
     dt = float(substep_s)
@@ -209,7 +264,8 @@ def run(
         acc = {
             key: np.zeros(len(zones))
             for key in ("hvac", "light", "plug", "solar", "internal",
-                        "envelope", "ventilation", "unmet", "occupants", "temp")
+                        "envelope", "ventilation", "unmet", "occupants", "temp",
+                        "latent")
         }
         steps_done = 0
 
@@ -248,6 +304,23 @@ def run(
                 + q_envelope + q_infiltration + q_ventilation
             )
 
+            # Latent load, kept OUT of q_net on purpose.
+            #
+            # Drying air does not change its temperature, so moisture has no
+            # place in the sensible balance that decides where the zone floats
+            # to. It is a load on the COIL, not on the node — which is exactly
+            # why a sensible-only model does not approximate this term, it has
+            # no term for it. See docs/decisions.md §48.
+            #
+            # Two sources: outdoor air brought in for ventilation and leaking
+            # in through the envelope, and the people themselves.
+            outdoor_air_kg_s = (
+                (ua_ventilation + arrays.ua_infiltration) / AIR_CP_J_KGK
+            )
+            q_latent = psychro.latent_power_w(
+                outdoor_air_kg_s, outdoor_humidity_series[step_index], indoor_humidity
+            ) + occupants * arrays.occupancy_latent_w
+
             # Ideal-loads control, as EnergyPlus calls it: predict where the
             # node would float to with no HVAC, then apply exactly the power
             # needed to land on the nearest setpoint boundary, bounded by
@@ -280,7 +353,16 @@ def run(
             temperature = free_float + q_hvac * dt / arrays.thermal_capacity_j_k
 
             kwh = dt / J_PER_KWH
-            acc["hvac"] += (cooling + heating) / arrays.cop * kwh
+
+            # Latent load is only met while the coil is running. With no
+            # cooling call there is nothing dehumidifying the space, and
+            # charging for moisture removal that did not happen would invent
+            # energy — the space simply drifts damp, which is what an
+            # unconditioned building in this climate does.
+            latent_met = np.where(cooling > 0.0, q_latent, 0.0)
+
+            acc["hvac"] += (cooling + heating + latent_met) / arrays.cop * kwh
+            acc["latent"] += latent_met / arrays.cop * kwh
             acc["light"] += q_light * kwh
             acc["plug"] += q_equip * kwh
             acc["solar"] += q_solar * kwh
@@ -316,6 +398,7 @@ def run(
                 float(acc["solar"][z]), float(acc["internal"][z]),
                 float(acc["envelope"][z]), float(acc["ventilation"][z]),
                 float(mean_occupants[z]), float(acc["unmet"][z]),
+                float(acc["latent"][z]),
             ))
 
         # Flush periodically so a long run's memory stays flat, and so progress

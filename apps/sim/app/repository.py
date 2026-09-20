@@ -256,11 +256,12 @@ RESULT_COLUMNS = (
     "peak_demand_kw", "indoor_temp_c",
     "solar_gain_kwh", "internal_gain_kwh", "envelope_loss_kwh",
     "ventilation_loss_kwh", "occupancy_count", "unmet_hours",
+    "latent_load_kwh",
 )
 
 
-# Rows per INSERT. PostgreSQL caps a statement at 65535 parameters; at 16
-# columns this is ~16k, comfortably inside it while keeping round trips rare.
+# Rows per INSERT. PostgreSQL caps a statement at 65535 parameters; at 17
+# columns this is ~15k, comfortably inside it while keeping round trips rare.
 RESULT_CHUNK_ROWS = 1000
 
 
@@ -342,6 +343,7 @@ def summarize(run_id: UUID) -> tuple[dict[str, Any] | None, list[dict[str, Any]]
                GROUP BY interval_start
             )
             SELECT sum(r.hvac_load_kwh) AS "hvacKwh",
+                   sum(r.latent_load_kwh) AS "latentKwh",
                    sum(r.lighting_kwh)  AS "lightingKwh",
                    sum(r.plug_kwh)      AS "plugKwh",
                    sum(r.total_kwh)     AS "totalKwh",
@@ -367,6 +369,7 @@ def summarize(run_id: UUID) -> tuple[dict[str, Any] | None, list[dict[str, Any]]
             """
             SELECT r.zone_id AS "zoneId", z.name AS "zoneName",
                    sum(r.hvac_load_kwh) AS "hvacKwh",
+                   sum(r.latent_load_kwh) AS "latentKwh",
                    sum(r.lighting_kwh)  AS "lightingKwh",
                    sum(r.plug_kwh)      AS "plugKwh",
                    sum(r.total_kwh)     AS "totalKwh",

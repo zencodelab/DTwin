@@ -211,19 +211,40 @@ try:
         ok("carbon follows the grid factor",
            abs(b["co2Kg"] - b["totalKwh"] * 0.42) < 1e-3,
            f"{b['co2Kg']:.1f} kg for {b['totalKwh']:.1f} kWh")
-        # Whole-building plug load exceeds HVAC here because one 200 m2 server
-        # room at 450 W/m2 is ~90 kW continuous, which is most of the building's
-        # electricity. Checking a normal office zone is the meaningful test of
-        # "cooling dominates".
+        # One 200 m2 server room at 450 W/m2 is ~90 kW continuous, which is
+        # most of the building's plug load. Checking a normal office zone is
+        # the meaningful test of "cooling dominates"; the whole-building
+        # comparison is made separately below, and latent load changed its
+        # answer.
         office_zone = next(z for z in base["byZone"] if z["zoneName"].startswith("OFF"))
         ok("cooling dominates an office zone's energy",
            office_zone["hvacKwh"] > office_zone["lightingKwh"]
            and office_zone["hvacKwh"] > office_zone["plugKwh"],
            f"hvac={office_zone['hvacKwh']:.0f} light={office_zone['lightingKwh']:.0f} "
            f"plug={office_zone['plugKwh']:.0f}")
+        # The server room still dominates plug load — a 90 kW data hall against
+        # 23 offices — so plug remains the largest NON-HVAC end use.
+        server_zone = next(z for z in base["byZone"] if z["zoneName"].startswith("SER"))
         ok("the server room dominates whole-building plug load",
-           b["plugKwh"] > b["hvacKwh"],
-           f"plug={b['plugKwh']:.0f} > hvac={b['hvacKwh']:.0f} kWh, as a 90 kW data hall implies")
+           server_zone["plugKwh"] > 0.5 * b["plugKwh"]
+           and b["plugKwh"] > b["lightingKwh"],
+           f"server={server_zone['plugKwh']:.0f} of {b['plugKwh']:.0f} kWh plug, "
+           f"vs {b['lightingKwh']:.0f} lighting")
+
+        # This comparison used to be `plugKwh > hvacKwh`, and it was true while
+        # the model was sensible-only. Adding the latent load moved building
+        # HVAC from about 5,000 kWh to about 8,000 and reversed it — which is
+        # the point of §48 stated as a number: in a Gulf June, drying the
+        # ventilation air costs more than the data hall's plugs.
+        ok("cooling now outweighs plug load, as latent load implies",
+           b["hvacKwh"] > b["plugKwh"],
+           f"hvac={b['hvacKwh']:.0f} > plug={b['plugKwh']:.0f} kWh")
+        ok("latent is a material share of cooling, and a subset of it",
+           b["latentKwh"] is not None
+           and 0.15 < b["latentKwh"] / b["hvacKwh"] < 0.65
+           and b["latentKwh"] < b["hvacKwh"],
+           f"latent={b['latentKwh']:.0f} of hvac={b['hvacKwh']:.0f} kWh "
+           f"({100 * b['latentKwh'] / b['hvacKwh']:.0f}%)")
 
         # 3 days of a Gulf office: a plausible annual EUI of 150-400 kWh/m2
         # scales to roughly 1.2-3.3 kWh/m2 over this period.

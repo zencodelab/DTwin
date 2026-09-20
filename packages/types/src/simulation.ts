@@ -127,6 +127,16 @@ export type SimulationResult = z.infer<typeof SimulationResult>;
 /** Whole-run rollup, which is what the dashboard headline actually shows. */
 export const EnergyBreakdown = z.object({
   hvacKwh: z.number().nonnegative(),
+  /**
+   * The dehumidification share of `hvacKwh` — a SUBSET of it, not an addition.
+   *
+   * Reported separately because "why is this building expensive?" has a
+   * different answer in Abu Dhabi than in Munich, and one HVAC number cannot
+   * give it. Nullable: a run made before the latent model existed has none to
+   * report, and zero would claim it looked and found none. See
+   * docs/decisions.md §48.
+   */
+  latentKwh: z.number().nonnegative().nullable(),
   lightingKwh: z.number().nonnegative(),
   plugKwh: z.number().nonnegative(),
   totalKwh: z.number().nonnegative(),
