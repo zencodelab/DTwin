@@ -1,0 +1,36 @@
+# Tooling config only — the worker is run as `uvicorn app.main:app`, not
+# installed as a package, so there is no [project] table to keep in sync.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".venv", "__pycache__"]
+
+[tool.ruff.lint]
+# E/F are pyflakes + pycodestyle; I sorts imports; B is bugbear, which catches
+# the mutable-default and loop-variable-capture classes that numpy-heavy code
+# is prone to; UP keeps the syntax current with the 3.12 the container runs.
+# BLE001 is here because the code already carries two `# noqa: BLE001`
+# directives, written for a lint config that did not exist. They were
+# describing an intention; enabling the rule makes them mean something, and
+# makes the next blind `except Exception` have to justify itself.
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "BLE"]
+ignore = [
+  # Long docstrings in solar.py and engine.py carry the physics derivations.
+  # Wrapping them to satisfy a linter would make them harder to read than the
+  # equations they explain.
+  "E501",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's whole parameter API is function calls in argument defaults —
+# `limit: int = Query(...)`. B008 exists for mutable defaults; these are not.
+extend-immutable-calls = [
+  "fastapi.Query", "fastapi.Path", "fastapi.Body",
+  "fastapi.Header", "fastapi.Depends",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `from app import solar` resolves from apps/sim, matching how uvicorn loads it.
+pythonpath = ["."]

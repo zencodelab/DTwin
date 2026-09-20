@@ -33,7 +33,8 @@ from uuid import UUID
 
 import numpy as np
 
-from . import repository, weather as weather_mod
+from . import repository
+from . import weather as weather_mod
 from .config import settings
 from .models import SimulationRequest
 

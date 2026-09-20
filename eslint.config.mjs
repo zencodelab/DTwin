@@ -1,0 +1,75 @@
+import js from '@eslint/js';
+import tseslint from 'typescript-eslint';
+import reactHooks from 'eslint-plugin-react-hooks';
+
+/**
+ * One flat config for the whole workspace.
+ *
+ * Type-aware linting is deliberately NOT enabled. `tsc --noEmit` already runs
+ * over every package in `npm run typecheck`, so the type-checked rules would
+ * re-derive the same program a second time for a much smaller marginal catch.
+ * What is left is the class of thing the compiler does not look at: unused
+ * bindings, floating promises spelled as bare calls, hook dependency arrays.
+ *
+ * Note the repository already carried `eslint-disable` and `noqa` comments for
+ * linters that were not installed. Those directives were describing an
+ * intention; this makes them do something.
+ */
+export default tseslint.config(
+  {
+    ignores: [
+      '**/node_modules/**', '**/.next/**', '**/dist/**', '**/.venv/**',
+      '.claude/**', '**/*.d.ts',
+    ],
+  },
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  {
+    rules: {
+      // The codebase uses `void promise.catch(...)` as an explicit
+      // fire-and-forget marker; an unadorned `any` is the thing to catch.
+      '@typescript-eslint/no-explicit-any': 'error',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
+      ],
+      // `!` is load-bearing here: rows[0]! after a LIMIT 1, ring[0]! after a
+      // min(1) Zod schema. The database's shape is known to the author and not
+      // to the compiler.
+      '@typescript-eslint/no-non-null-assertion': 'off',
+      eqeqeq: ['error', 'always', { null: 'ignore' }],
+      'no-console': 'off', // services log to stdout by design
+    },
+  },
+  {
+    // React only in the web app.
+    files: ['apps/web/**/*.{ts,tsx}'],
+    plugins: { 'react-hooks': reactHooks },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+    },
+    languageOptions: {
+      globals: {
+        window: 'readonly', document: 'readonly', fetch: 'readonly',
+        console: 'readonly', process: 'readonly', WebSocket: 'readonly',
+        setTimeout: 'readonly', clearTimeout: 'readonly',
+        setInterval: 'readonly', clearInterval: 'readonly',
+        HTMLElement: 'readonly', MouseEvent: 'readonly', Node: 'readonly',
+      },
+    },
+  },
+  {
+    files: ['{apps,packages}/**/*.ts'],
+    languageOptions: {
+      globals: {
+        process: 'readonly', console: 'readonly', Buffer: 'readonly',
+        setTimeout: 'readonly', clearTimeout: 'readonly',
+        setInterval: 'readonly', clearInterval: 'readonly',
+        fetch: 'readonly', URL: 'readonly', WebSocket: 'readonly',
+        AbortController: 'readonly', TextEncoder: 'readonly',
+        TextDecoder: 'readonly', structuredClone: 'readonly',
+        performance: 'readonly', crypto: 'readonly',
+      },
+    },
+  },
+);

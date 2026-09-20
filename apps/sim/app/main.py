@@ -20,8 +20,12 @@ from . import engine, notify, repository, weather
 from .config import settings
 from .db import close_pool, connection, connection_unscoped, tenant_scope
 from .models import (
-    EnergyBreakdown, SimulationRequest, SimulationRun, SimulationSummary,
-    WeatherGenerateRequest, ZoneBreakdown,
+    EnergyBreakdown,
+    SimulationRequest,
+    SimulationRun,
+    SimulationSummary,
+    WeatherGenerateRequest,
+    ZoneBreakdown,
 )
 
 logging.basicConfig(level=logging.INFO, format="[sim] %(message)s")
@@ -94,7 +98,11 @@ def _execute(run_id: UUID, request: SimulationRequest, tenant: str) -> None:
             summary = _build_summary(run_id)
             if summary is not None:
                 notify.complete(run_id, request.buildingId, summary)
-        except Exception as exc:  # noqa: BLE001 - the run row is the error channel
+        # Catching broadly on purpose: the run row is the error channel. A
+        # background task has no caller left to raise to, so an escaped
+        # exception would strand the run at `running` forever with nothing
+        # recorded — the exact state the reaper would later have to clean up.
+        except Exception as exc:
             log.exception("run %s failed", run_id)
             message = f"{type(exc).__name__}: {exc}"
             repository.mark_failed(run_id, message)
@@ -132,6 +140,10 @@ def healthz() -> JSONResponse:
         # database, not about any tenant, and a probe has no session to scope to.
         with connection_unscoped() as conn:
             conn.execute("SELECT 1").fetchone()
+    # The suppression below is load-bearing, unlike at _execute: ruff treats a
+    # logged exception as handled, and this one is reported to the prober
+    # instead. Any failure to reach the database is a degraded answer here,
+    # whatever kind of failure it was.
     except Exception as exc:  # noqa: BLE001
         # The worker is useless without the database: it reads the model from it
         # and writes every result back. Reporting healthy would be a lie.

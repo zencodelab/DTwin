@@ -238,7 +238,9 @@ export class AlertEngine {
     }
   }
 
-  async #open(target: RuleTarget, value: number | null, now: number): Promise<void> {
+  // `_now` is unused: an alert's opened_at comes from the database's clock,
+  // not the engine's. Kept so #open and #close share one shape.
+  async #open(target: RuleTarget, value: number | null, _now: number): Promise<void> {
     const { rule, sensor, key } = target;
     if (this.#inFlight.has(key)) return;
     this.#inFlight.add(key);

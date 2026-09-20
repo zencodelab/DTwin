@@ -277,8 +277,8 @@ try:
         # are different things that Pydantic writes identically. This is the
         # boundary the two-language split actually costs something at, so it is
         # asserted rather than assumed.
-        from app.notify import summary_payload
         from app.models import SimulationSummary as PySummary
+        from app.notify import summary_payload
 
         # `base` is the summary JSON with runId bolted on by the helper; the
         # Pydantic models forbid extra keys, so drop it before validating.

@@ -1,0 +1,181 @@
+name: CI
+
+# Nothing ran these suites automatically until now. 196 checks existed and their
+# only trigger was somebody remembering, which is also how docs/cto-assessment.md
+# ends up with a stale finding in it: the claim that the db smoke suite does not
+# set a failing exit code was true once and has not been for a while.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  # Everything that needs no database, so a typo fails in about a minute
+  # instead of after a Postgres boot and four integration suites.
+  checks:
+    name: Types, lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint (TypeScript)
+        run: npm run lint
+
+      - name: Unit tests (vitest)
+        run: npm run test
+
+      - uses: astral-sh/setup-uv@v5
+      - name: Install the worker's environment
+        run: |
+          cd apps/sim
+          uv venv --python ${{ env.PYTHON_VERSION }}
+          uv pip install --python .venv/bin/python -r requirements-dev.txt
+
+      - name: Lint (Python)
+        run: npm run lint:py
+
+      - name: Unit tests (pytest)
+        run: npm run test:py
+
+      # `next build` catches what tsc does not, and it is how the Compose
+      # image is built, so a break here is a break there. No AUTH_SECRET is
+      # needed: every page is force-dynamic, so nothing is prerendered.
+      - name: Production build
+        run: npm run build
+
+  integration:
+    name: Smoke suites against a real database
+    runs-on: ubuntu-latest
+    needs: checks
+
+    services:
+      db:
+        # The -ha variant is required: TimescaleDB, PostGIS and Toolkit in one
+        # image. The plain timescaledb image has no PostGIS and this schema
+        # needs both extensions in the same database.
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_DB: dtwin
+          POSTGRES_USER: dtwin
+          POSTGRES_PASSWORD: dtwin_ci_pwd
+        ports:
+          - 5432:5432
+        # -h 127.0.0.1 forces TCP on purpose. During first-boot init this image
+        # runs a temporary server on the unix socket only, so a socket-based
+        # pg_isready reports ready before the real server is listening.
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U dtwin -d dtwin"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 30
+          --health-start-period 30s
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: dtwin
+      POSTGRES_USER: dtwin
+      POSTGRES_PASSWORD: dtwin_ci_pwd
+      # The app role and its password are created by 007_tenancy.sql, so this
+      # URL must match what the migration set. POSTGRES_APP_PASSWORD is
+      # deliberately not set: DATABASE_URL takes precedence, and naming a
+      # different password in both places would be a lie in one of them.
+      DATABASE_URL: postgres://dtwin_app:dtwin_app_dev_pwd@localhost:5432/dtwin
+      DATABASE_URL_OWNER: postgres://dtwin:dtwin_ci_pwd@localhost:5432/dtwin
+      INGEST_PORT: '8787'
+      SIM_PORT: '8000'
+      SIM_BASE_URL: http://localhost:8000
+      INGEST_BASE_URL: http://localhost:8787
+      NEXT_PUBLIC_WS_URL: ws://localhost:8787/ws
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      - uses: astral-sh/setup-uv@v5
+      - name: Install the worker's environment
+        run: |
+          cd apps/sim
+          uv venv --python ${{ env.PYTHON_VERSION }}
+          uv pip install --python .venv/bin/python -r requirements-dev.txt
+
+      # No development fallback exists for this, by design, so CI has to make
+      # one. It only has to be consistent between the web and ingest services.
+      - name: Generate AUTH_SECRET
+        run: echo "AUTH_SECRET=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
+
+      - name: Migrate, with the demonstration building
+        run: npm run db:seed
+
+      # The guard has two states and only one of them is exercised above, so
+      # assert the seed really was applied rather than skipped.
+      - name: Confirm the seed guard is a real switch
+        run: |
+          npm run --silent migrate:status -w @dtwin/db | tee /tmp/status.txt
+          grep -qE '005_seed +applied' /tmp/status.txt
+
+      # --rotate so the key is always emitted: without it a re-run reports the
+      # existing key as already present and prints nothing to parse.
+      - name: Provision the first user and API keys
+        run: npm run --silent bootstrap -- --env --rotate >> "$GITHUB_ENV"
+
+      - name: Smoke — database
+        run: npm run smoke -w @dtwin/db
+
+      # Spawns its own server, and refuses to run if one is already listening
+      # on 8787 — its device simulator writes the same meters. So it goes
+      # before anything long-running is started.
+      - name: Smoke — ingest
+        run: npm run smoke -w @dtwin/ingest
+
+      # Spawns its own uvicorn, with INGEST_BASE_URL deliberately pointed at a
+      # dead port to prove a run completes with ingest unreachable.
+      - name: Smoke — simulation worker
+        run: npm run smoke:sim
+
+      - name: Start the stack for the web suite
+        run: |
+          npm run dev:ingest > /tmp/ingest.log 2>&1 &
+          npm run dev:sim    > /tmp/sim.log    2>&1 &
+          npm run dev:web    > /tmp/web.log    2>&1 &
+          for url in http://localhost:8787/healthz http://localhost:8000/healthz http://localhost:3000/; do
+            for i in $(seq 1 60); do
+              curl -fsS -o /dev/null "$url" && break
+              [ "$i" = 60 ] && { echo "timed out waiting for $url"; exit 1; }
+              sleep 2
+            done
+            echo "up: $url"
+          done
+
+      - name: Smoke — web
+        run: npm run smoke -w @dtwin/web
+
+      - name: Service logs on failure
+        if: failure()
+        run: |
+          for f in /tmp/ingest.log /tmp/sim.log /tmp/web.log; do
+            echo "::group::$f"; tail -100 "$f" 2>/dev/null || true; echo "::endgroup::"
+          done

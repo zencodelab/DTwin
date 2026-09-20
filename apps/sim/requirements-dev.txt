@@ -1,0 +1,5 @@
+# Test-only dependencies, kept out of requirements.txt so the container image
+# does not ship a test runner.
+-r requirements.txt
+pytest==8.3.4
+ruff==0.8.6

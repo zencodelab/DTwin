@@ -16,14 +16,14 @@
  * not something to point at production. Run with:
  *   npm run smoke -w @dtwin/db
  */
-import { getOwnerPool, closePool, withTenant, type Db } from './client.ts';
+import { getOwnerPool, closePool, withTenant } from './client.ts';
 import {
   getSpatialTree, findZoneAtPoint, insertReadings,
   getLatestReadingsForZone, getSensorHistory, getZoneHeatmap,
   createTenant, listBuildings, getTenant,
 } from './queries/index.ts';
 import {
-  ServerMessage, ClientMessage, TelemetryBatch, parseServerMessage,
+  ClientMessage, TelemetryBatch, parseServerMessage,
   expandReading, compactReading, uuidv7, Building, SpatialTree,
   METRIC_UNITS, CUMULATIVE_METRICS, topics,
 } from '@dtwin/types';

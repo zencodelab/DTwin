@@ -2,7 +2,7 @@
   "name": "dtwin",
   "version": "0.1.0",
   "private": true,
-  "description": "Digital Twin platform for a single commercial building \u2014 spatial hierarchy, IoT telemetry, energy simulation, 3D dashboard",
+  "description": "Digital Twin platform for a single commercial building — spatial hierarchy, IoT telemetry, energy simulation, 3D dashboard",
   "workspaces": [
     "apps/*",
     "packages/*"
@@ -14,6 +14,11 @@
     "db:seed": "DTWIN_SEED_DEMO=true npm run migrate -w @dtwin/db",
     "bootstrap": "npm run bootstrap -w @dtwin/db --",
     "db:psql": "docker compose exec db psql -U dtwin -d dtwin",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "lint:py": "cd apps/sim && .venv/bin/python -m ruff check .",
+    "test:py": "cd apps/sim && .venv/bin/python -m pytest -q",
+    "test:watch": "vitest",
     "typecheck": "npm run typecheck -w @dtwin/types && npm run typecheck -w @dtwin/db && npm run typecheck -w @dtwin/ingest && npm run typecheck -w @dtwin/web",
     "dev:ingest": "npm run dev -w @dtwin/ingest",
     "smoke": "npm run smoke -w @dtwin/db && npm run smoke -w @dtwin/ingest && npm run smoke:sim && npm run smoke -w @dtwin/web",
@@ -27,9 +32,14 @@
     "node": ">=20"
   },
   "devDependencies": {
-    "typescript": "^5.7.2",
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.10.2",
-    "tsx": "^4.19.2"
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^3.2.7"
   },
   "overrides": {
     "postcss": "^8.5.23"

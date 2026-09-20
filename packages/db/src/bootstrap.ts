@@ -73,6 +73,13 @@ async function main(): Promise<void> {
   const email = arg('email') ?? 'admin@dtwin.local';
   const name = arg('name') ?? 'DTwin Admin';
   const rotate = process.argv.includes('--rotate');
+  // Machine-readable: KEY=value lines only, nothing else on stdout, so the
+  // output can be appended to .env or read by CI. Progress still goes to
+  // stderr, which keeps a failed run legible.
+  const envOnly = process.argv.includes('--env');
+  const say = envOnly
+    ? (msg: string) => console.error(msg)
+    : (msg: string) => console.log(msg);
 
   const supplied = arg('password') ?? process.env.DTWIN_BOOTSTRAP_PASSWORD;
   const password = supplied ?? generatedPassword();
@@ -83,9 +90,9 @@ async function main(): Promise<void> {
   if (!tenant) {
     const id = await createTenant(slug, arg('tenant-name') ?? slug);
     tenant = { id, slug };
-    console.log(`[bootstrap] created tenant ${slug}`);
+    say(`[bootstrap] created tenant ${slug}`);
   } else {
-    console.log(`[bootstrap] using existing tenant ${slug}`);
+    say(`[bootstrap] using existing tenant ${slug}`);
   }
 
   // ------------------------------------------------------------------ user
@@ -95,14 +102,14 @@ async function main(): Promise<void> {
 
   if (existing) {
     userId = existing.id;
-    console.log(`[bootstrap] using existing user ${email} (password unchanged)`);
+    say(`[bootstrap] using existing user ${email} (password unchanged)`);
     if (!existing.isActive) {
       console.warn('[bootstrap] WARNING: that user is inactive and cannot sign in.');
     }
   } else {
     userId = await createUser(email, name, password);
     passwordToShow = password;
-    console.log(`[bootstrap] created user ${email}`);
+    say(`[bootstrap] created user ${email}`);
   }
   // Already an upsert on (tenant_id, user_id), so safe to repeat.
   await addMember(tenant.id, userId, 'owner');
@@ -114,7 +121,7 @@ async function main(): Promise<void> {
   for (const spec of KEYS) {
     const live = present.find((k) => k.name === spec.name && k.revokedAt === null);
     if (live && !rotate) {
-      console.log(
+      say(
         `[bootstrap] api key ${spec.name} already exists (${live.prefix}…) — ` +
           're-run with --rotate to replace it',
       );
@@ -124,10 +131,17 @@ async function main(): Promise<void> {
       ? await rotateApiKey(tenant.id, spec.kind, spec.name, [...spec.scopes])
       : await createApiKey(tenant.id, spec.kind, spec.name, [...spec.scopes]);
     issued.push({ env: spec.env, key: created.key, note: spec.note });
-    console.log(`[bootstrap] ${live ? 'rotated' : 'created'} api key ${spec.name}`);
+    say(`[bootstrap] ${live ? 'rotated' : 'created'} api key ${spec.name}`);
   }
 
   // ----------------------------------------------------------------- report
+  if (envOnly) {
+    console.log(`DTWIN_DEMO_TENANT_ID=${tenant.id}`);
+    for (const { env, key } of issued) if (env) console.log(`${env}=${key}`);
+    if (passwordToShow) console.log(`DTWIN_BOOTSTRAP_PASSWORD=${passwordToShow}`);
+    return;
+  }
+
   console.log('\n--- shown once; only hashes are stored ---\n');
   console.log('# .env');
   console.log(`DTWIN_DEMO_TENANT_ID=${tenant.id}`);
