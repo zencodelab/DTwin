@@ -108,7 +108,9 @@ interface Health {
   status: string; sensors: number;
   simulator: { enabled: boolean; emitted?: number; tracking?: number };
 }
-interface IngestResponse { accepted: number; flagged: number; unknownIds: string[] }
+interface IngestResponse {
+  accepted: number; flagged: number; unknownIds: string[]; futureDated: number;
+}
 interface AlertsResponse { alerts: AlertWithContext[] }
 
 /** Create a rule scoped to one sensor, tagged so cleanup can find it. */
@@ -294,6 +296,45 @@ try {
   ok('valid batch returns 202 Accepted', accept.status === 202, String(accept.status));
   ok('one reading accepted', accepted.accepted === 1);
   ok('nothing flagged for an in-range value', accepted.flagged === 0);
+
+  // A timestamp far ahead of this clock is refused outright rather than stored
+  // with a quality flag. One such row leaves the continuous aggregates'
+  // watermark ahead of now, and from then until a later refresh every reading
+  // from every tenant on that hypertable is invisible in the rollups
+  // (docs/decisions.md §46). This is the guard that keeps it out.
+  const future = (await (await postJson(`${BASE}/ingest`, {
+    readings: [{ externalId: probe.externalId, ts: ts + 3_600_000, value: 22.0 }],
+  })).json()) as IngestResponse;
+  ok('a reading dated an hour ahead is refused, not stored',
+     future.accepted === 0 && future.futureDated === 1,
+     `accepted=${future.accepted} futureDated=${future.futureDated}`);
+
+  // ...while a few seconds of clock skew is normal and must still be accepted.
+  const skewed = (await (await postJson(`${BASE}/ingest`, {
+    readings: [{ externalId: probe.externalId, ts: ts + 5_000, value: 22.1 }],
+  })).json()) as IngestResponse;
+  ok('a few seconds of clock skew is tolerated',
+     skewed.accepted === 1 && skewed.futureDated === 0,
+     `accepted=${skewed.accepted} futureDated=${skewed.futureDated}`);
+
+  const malformedJson = await fetch(`${BASE}/ingest`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${deviceKey}` },
+    body: '{ not json',
+  });
+  ok('a malformed JSON body is a 400, not a 500',
+     malformedJson.status === 400, String(malformedJson.status));
+
+  const nullBody = await fetch(`${BASE}/alerts/ack`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${deviceKey}`,
+      'x-acting-user': ACTING_USER,
+    },
+    body: 'null',
+  });
+  ok('a null body is a 400, not a TypeError', nullBody.status === 400, String(nullBody.status));
 
   const unknown = (await (await postJson(`${BASE}/ingest`, {
     readings: [{ externalId: 'BAC:NOPE:XX', value: 1 },

@@ -20,7 +20,17 @@ import {
  * (`SIM_SPEEDUP`), so charts keep an honest time axis.
  */
 
-export type FaultKind = 'drift' | 'flatline' | 'spike' | 'offline';
+/**
+ * As a const array rather than a bare union, following the convention in
+ * `@dtwin/types`: the union alone exists only at compile time, so the fault
+ * route had nothing to validate against and accepted any string as a `kind`.
+ */
+export const FAULT_KINDS = ['drift', 'flatline', 'spike', 'offline'] as const;
+export type FaultKind = (typeof FAULT_KINDS)[number];
+
+export function isFaultKind(value: unknown): value is FaultKind {
+  return typeof value === 'string' && (FAULT_KINDS as readonly string[]).includes(value);
+}
 
 export interface Fault {
   kind: FaultKind;

@@ -9,7 +9,7 @@ import { listAlerts } from './rules/store.ts';
 import { authenticate } from './auth.ts';
 import { loadConfig } from './config.ts';
 import { Pipeline } from './pipeline.ts';
-import { DeviceSimulator, type FaultKind } from './simulator/index.ts';
+import { DeviceSimulator, FAULT_KINDS, isFaultKind } from './simulator/index.ts';
 
 /**
  * Ingest service.
@@ -36,17 +36,55 @@ const simulator = new DeviceSimulator(config, pipeline.registry, (readings) => {
 
 // ---------------------------------------------------------------------- HTTP
 
-async function readJson(req: IncomingMessage, limitBytes = 8 * 1024 * 1024): Promise<unknown> {
+/**
+ * Read and parse a JSON body, reporting a bad one as a bad request.
+ *
+ * Returns a result rather than throwing, in the same shape `authenticate` uses,
+ * because throwing sent every malformed body to the generic 500 handler —
+ * straight past the careful Zod 400 each route builds below. A caller sending
+ * `{` learned that the server had an internal error, which is both wrong and
+ * the kind of wrong that gets retried.
+ *
+ * An oversized body is 413 for the same reason: the size is the caller's to
+ * fix, and 500 invites a retry of exactly the payload that caused it.
+ */
+type JsonResult =
+  | { ok: true; value: unknown }
+  | { ok: false; status: number; error: string };
+
+async function readJson(
+  req: IncomingMessage,
+  limitBytes = config.INGEST_MAX_BODY_BYTES,
+): Promise<JsonResult> {
   const chunks: Buffer[] = [];
   let size = 0;
-  for await (const chunk of req) {
-    size += (chunk as Buffer).length;
-    // Bound before buffering, not after: an unbounded body is a trivial way to
-    // exhaust memory on an endpoint that accepts batches by design.
-    if (size > limitBytes) throw new Error('payload too large');
-    chunks.push(chunk as Buffer);
+  try {
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      // Bound before buffering, not after: an unbounded body is a trivial way
+      // to exhaust memory on an endpoint that accepts batches by design.
+      if (size > limitBytes) {
+        return { ok: false, status: 413, error: `body exceeds ${limitBytes} bytes` };
+      }
+      chunks.push(chunk as Buffer);
+    }
+  } catch {
+    // A connection that dies mid-body is the client's problem, not a fault.
+    return { ok: false, status: 400, error: 'request body could not be read' };
   }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+
+  try {
+    return { ok: true, value: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
+  } catch (err) {
+    return { ok: false, status: 400, error: `invalid JSON: ${(err as Error).message}` };
+  }
+}
+
+/** A JSON object, or nothing. Guards the `as { … }` casts the routes make. */
+function asObject(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -60,7 +98,15 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 
 const httpServer = createServer((req, res) => {
   void handle(req, res).catch((err: unknown) => {
-    send(res, 500, { error: (err as Error).message });
+    // Log the detail, return none of it. The message can name a table, a
+    // constraint or a connection string, and a caller that could not be
+    // trusted with the request cannot be trusted with the post-mortem.
+    console.error('[ingest] unhandled error', err);
+    // Writing a second time throws inside this catch, which is how a response
+    // that had already started became an unhandled rejection rather than a
+    // logged fault.
+    if (res.headersSent) return res.destroy();
+    send(res, 500, { error: 'internal error' });
   });
 });
 
@@ -91,7 +137,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
       // Authenticate BEFORE parsing. Parsing an 8 MB body for a caller with no
       // valid key is work an unauthenticated stranger gets to make us do.
-      const parsed = RawTelemetryBatch.safeParse(await readJson(req));
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+
+      const parsed = RawTelemetryBatch.safeParse(json.value);
       if (!parsed.success) {
         return send(res, 400, {
           error: 'invalid batch',
@@ -108,7 +157,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const auth = await authenticate(req, 'sim:notify');
       if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
 
-      const parsed = SimEvent.safeParse(await readJson(req));
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+
+      const parsed = SimEvent.safeParse(json.value);
       if (!parsed.success) {
         return send(res, 400, {
           error: 'invalid sim event',
@@ -160,13 +212,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       // from its own session, and the column is a foreign key to `users`, so a
       // fabricated id fails rather than being recorded.
       const actingUser = req.headers['x-acting-user'];
-      const body = (await readJson(req)) as { alertId?: string };
-      if (!body.alertId || typeof actingUser !== 'string') {
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+
+      // `asObject` rather than a cast: a body of `null` or `"nope"` used to
+      // make `body.alertId` throw a TypeError into the 500 handler, three
+      // lines above a 400 written for exactly this.
+      const body = asObject(json.value);
+      const alertId = typeof body?.alertId === 'string' ? body.alertId : null;
+      if (!alertId || typeof actingUser !== 'string') {
         return send(res, 400, { error: 'alertId and an acting user are required' });
       }
 
       const alert = await pipeline.alerts.acknowledge(
-        auth.principal.tenantId, body.alertId, actingUser);
+        auth.principal.tenantId, alertId, actingUser);
       // 409, not 404: the alert exists but is no longer open, which is a
       // different thing for a caller to handle than a bad id. An alert in
       // ANOTHER tenant also lands here rather than 404 — deliberately, since
@@ -180,21 +239,31 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const auth = await authenticate(req, 'ingest:write');
       if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
 
-      const body = (await readJson(req)) as {
-        sensorId?: string; externalId?: string; kind?: FaultKind; magnitude?: number;
-      };
-      const found = body.sensorId
-        ? pipeline.registry.byId(body.sensorId)
-        : body.externalId
-          ? pipeline.registry.lookup(auth.principal.tenantId, body.externalId)
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+      const body = asObject(json.value);
+      if (!body) return send(res, 400, { error: 'body must be a JSON object' });
+
+      const sensorIdArg = typeof body.sensorId === 'string' ? body.sensorId : null;
+      const externalIdArg = typeof body.externalId === 'string' ? body.externalId : null;
+      const found = sensorIdArg
+        ? pipeline.registry.byId(sensorIdArg)
+        : externalIdArg
+          ? pipeline.registry.lookup(auth.principal.tenantId, externalIdArg)
           : undefined;
       // A sensor id from another tenant reads as unknown, not forbidden: this
       // route must not become a way to probe which ids exist elsewhere.
       const sensor = found?.tenantId === auth.principal.tenantId ? found : undefined;
       if (!sensor) return send(res, 404, { error: 'unknown sensor' });
-      if (!body.kind) return send(res, 400, { error: 'kind is required' });
 
-      simulator.injectFault(sensor.id, body.kind, body.magnitude ?? 1);
+      if (!isFaultKind(body.kind)) {
+        return send(res, 400, { error: `kind must be one of ${FAULT_KINDS.join(', ')}` });
+      }
+      const magnitude = typeof body.magnitude === 'number' && Number.isFinite(body.magnitude)
+        ? body.magnitude
+        : 1;
+
+      simulator.injectFault(sensor.id, body.kind, magnitude);
       return send(res, 200, { sensorId: sensor.id, kind: body.kind });
     }
 
@@ -235,7 +304,7 @@ const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
  * opening connections and never authenticating is a free way to hold server
  * memory — the one thing a socket lets a stranger do before proving anything.
  */
-const AUTH_GRACE_MS = 10_000;
+const AUTH_GRACE_MS = config.INGEST_AUTH_GRACE_MS;
 
 wss.on('connection', (socket: WebSocket) => {
   const id = randomUUID();

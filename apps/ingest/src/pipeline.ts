@@ -18,6 +18,12 @@ export interface IngestResult {
   accepted: number;
   unknownIds: string[];
   flagged: number;
+  /**
+   * Readings refused because their timestamp was too far ahead of this
+   * server's clock. Reported rather than silently dropped, so a gateway with a
+   * skewed clock is visible to whoever sent it.
+   */
+  futureDated: number;
 }
 
 export class Pipeline {
@@ -81,6 +87,7 @@ export class Pipeline {
     const readings: OwnedReading[] = [];
     const sensors: RegisteredSensor[] = [];
     let flagged = 0;
+    let futureDated = 0;
 
     for (const raw of batch.readings) {
       const sensor = this.registry.lookup(tenantId, raw.externalId);
@@ -88,11 +95,27 @@ export class Pipeline {
         unknown.add(raw.externalId);
         continue;
       }
+
+      // Refused, not flagged. Every other bad reading is stored with a quality
+      // code, because "the sensor reported -273 for six hours" is itself a
+      // diagnosis — but a future timestamp is not a fact about the sensor, it
+      // is damage to the database. One such row leaves the continuous
+      // aggregates' watermark ahead of now when the refresh policy next runs,
+      // and from then until a later refresh every reading written by every
+      // tenant on that hypertable is invisible in the rollups. A quality flag
+      // would not prevent that; only not writing the row does.
+      // See docs/decisions.md §46.
+      const ts = raw.ts ?? now;
+      if (ts > now + this.config.INGEST_MAX_CLOCK_SKEW_MS) {
+        futureDated++;
+        continue;
+      }
+
       const quality = assessQuality(sensor, raw.value, raw.quality as QualityCode | undefined);
       if (quality !== 0) flagged++;
       readings.push({
         sensorId: sensor.id as Reading['sensorId'],
-        ts: raw.ts ?? now,
+        ts,
         value: raw.value,
         quality,
         tenantId: sensor.tenantId,
@@ -108,10 +131,24 @@ export class Pipeline {
     const retry = [...unknown].filter(
       (id) => this.registry.shouldRetryUnknown(tenantId, id, now));
     if (retry.length > 0) {
-      void this.registry.refresh().catch(() => {});
+      // Logged, not swallowed. Its sibling on the interval timer logs; this one
+      // discarded the error entirely, so a registry that could not reach the
+      // database looked exactly like one with nothing new to load — while every
+      // reading from a newly provisioned point was reported as an unknown id.
+      void this.registry.refresh().catch((err: unknown) => {
+        console.error('[ingest] out-of-band registry refresh failed', err);
+      });
     }
 
-    return { accepted: readings.length, unknownIds: [...unknown], flagged };
+    if (futureDated > 0) {
+      console.warn(
+        `[ingest] refused ${futureDated} reading(s) dated more than ` +
+          `${this.config.INGEST_MAX_CLOCK_SKEW_MS}ms ahead of this clock ` +
+          `(tenant ${tenantId}) — check the gateway's time`,
+      );
+    }
+
+    return { accepted: readings.length, unknownIds: [...unknown], flagged, futureDated };
   }
 
   /** In-process entry point for the simulator; the sensor is already resolved. */

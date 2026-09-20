@@ -31,6 +31,33 @@ const Env = z.object({
 
   /** Registry refresh, so newly provisioned points appear without a restart. */
   INGEST_REGISTRY_REFRESH_MS: z.coerce.number().int().positive().default(60_000),
+  /** How long a missing external id is remembered before it is looked up again. */
+  INGEST_UNKNOWN_RETRY_MS: z.coerce.number().int().positive().default(30_000),
+
+  /** Largest accepted request body. A batch endpoint needs a stated ceiling. */
+  INGEST_MAX_BODY_BYTES: z.coerce.number().int().positive().default(8 * 1024 * 1024),
+  /**
+   * How long a socket may stay open before presenting a ticket. Long enough for
+   * a browser to fetch one, short enough that an unauthenticated connection is
+   * not a free file descriptor.
+   */
+  INGEST_AUTH_GRACE_MS: z.coerce.number().int().positive().default(10_000),
+
+  /**
+   * How far ahead of this server's clock a reading's timestamp may be.
+   *
+   * Not a plausibility nicety. A row dated ahead of now leaves the continuous
+   * aggregates' materialisation watermark ahead of now when the refresh policy
+   * next runs, and real-time aggregation only covers buckets at or after it —
+   * so every subsequent reading is in the hypertable and invisible in the
+   * rollups, for EVERY tenant sharing them, until a later refresh heals it.
+   * One gateway with a skewed clock can blank the dashboard's history for
+   * everyone. See docs/decisions.md §46.
+   *
+   * A tolerance rather than zero, because a device clock that is a few seconds
+   * fast is normal and rejecting it would be its own outage.
+   */
+  INGEST_MAX_CLOCK_SKEW_MS: z.coerce.number().int().positive().default(60_000),
 
   ALERT_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
   /**

@@ -53,7 +53,7 @@ Source: [ingest server](../apps/ingest/src/server.ts).
 | Method and path | Auth scope | Input | Current response |
 |---|---|---|---|
 | `GET /healthz` | none | — | 200 or 503; registry, writer, fan-out, alert/notification, simulator statistics. Reports process-level counters only, deliberately, so it can stay open with no key |
-| `POST /ingest` | `ingest:write` | `RawTelemetryBatch` | 202 `{accepted, unknownIds, flagged}`; schema violations return 400. `unknownIds` also covers a real external id that belongs to **another tenant** — the key's own tenant genuinely does not have that point |
+| `POST /ingest` | `ingest:write` | `RawTelemetryBatch` | 202 `{accepted, unknownIds, flagged, futureDated}`; a malformed JSON body is 400 and an oversized one 413. `unknownIds` also covers a real external id that belongs to **another tenant** — the key's own tenant genuinely does not have that point. `futureDated` counts readings refused for a timestamp more than `INGEST_MAX_CLOCK_SKEW_MS` (default 60 s) ahead of the server clock: unlike every other bad reading, those are not stored with a quality flag, because one of them blinds the rollups for every tenant ([§46](decisions.md#46-a-future-dated-reading-blinds-the-5-minute-view-for-everyone)) |
 | `GET /alerts` | `ingest:write` | Optional `state=live` or `state=resolved` | `{alerts: [...]}` for the key's own tenant; missing/unrecognized filter means all states |
 | `POST /alerts/ack` | `ingest:write` | `{alertId}` plus header `x-acting-user: <userId>` | 200 `{alert}`; missing fields 400; alert not open **or belonging to another tenant** 409 — the two cases are deliberately indistinguishable, so a caller cannot use this route to learn that an id exists elsewhere |
 | `POST /simulator/fault` | `ingest:write` | `{sensorId}` or `{externalId}`, plus `kind`, optional `magnitude` | 200 with sensor/kind; missing sensor, or a sensor id belonging to another tenant, 404; missing kind 400 |
@@ -97,7 +97,7 @@ Expected response when the ID exists for that key's tenant and the value is
 plausible:
 
 ```json
-{"accepted":1,"unknownIds":[],"flagged":0}
+{"accepted":1,"unknownIds":[],"flagged":0,"futureDated":0}
 ```
 
 Omitting `ts` stamps arrival time. For retries, supply and preserve the original
