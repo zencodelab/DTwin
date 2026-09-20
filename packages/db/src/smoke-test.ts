@@ -173,8 +173,24 @@ for (let i = 360; i >= 0; i--) {
 }
 await withTenant(A, (db) => insertReadings(db, meterReadings));
 
-await owner.query(`CALL refresh_continuous_aggregate('telemetry_1h', NULL, NULL)`);
-await owner.query(`CALL refresh_continuous_aggregate('telemetry_5m', NULL, NULL)`);
+// Refresh to an END IN THE PAST, never NULL.
+//
+// A NULL end materialises through the bucket containing now() and leaves the
+// watermark at that bucket's END — ahead of the clock. Real-time aggregation
+// only covers buckets at or after the watermark, so from then until a policy
+// refresh, every newly written row is in the hypertable and invisible in the
+// rollup. This suite's two lines did that to the whole database, and the web
+// suite three steps later reported an empty history for a sensor that had
+// readings. See docs/decisions.md §46.
+//
+// Ten minutes back is comfortably older than this suite's fixtures, which span
+// hours, and it leaves the recent tail to real-time aggregation — which is
+// what covers it correctly.
+const refreshTo = new Date(now - 10 * 60_000).toISOString();
+await owner.query(
+  `CALL refresh_continuous_aggregate('telemetry_1h', NULL, $1::timestamptz)`, [refreshTo]);
+await owner.query(
+  `CALL refresh_continuous_aggregate('telemetry_5m', NULL, $1::timestamptz)`, [refreshTo]);
 
 const from = new Date(now - 6 * 3600_000);
 const to = new Date(now + 3600_000);

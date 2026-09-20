@@ -782,6 +782,28 @@ Two consequences, and the second is the one that matters.
 below the watermark and already materialised, and any check that counts rows
 should read the hypertable rather than the rollup anyway.
 
+**Never call `refresh_continuous_aggregate` with a NULL end.** Found the same
+day, by the same failing check, with a different cause. A NULL end materialises
+through the bucket containing `now()` and leaves the watermark at that bucket's
+**end** — ahead of the clock. The database suite did exactly that, and the web
+suite three steps later reported an empty history for a sensor that plainly had
+readings: the watermark sat at 14:20 while the newest row was 14:16:51, so
+real-time aggregation covered nothing and the materialised copy predated every
+row written since.
+
+It is invisible on a long-running database, because the five-minute policy
+heals it within one bucket. It is very visible on a fresh one, where everything
+happens inside that window — a new deployment's dashboard shows no 5-minute
+history for up to five minutes, and no hourly history for up to an hour.
+
+So a manual refresh names an end in the past and leaves the tail to real-time
+aggregation, which is what the policies' own `end_offset` does and what the
+comment above them says it is for. `008_tenancy_timeseries.sql` still calls
+`NULL, NULL`; that is harmless on the empty table a fresh install gives it
+(the watermark stays at `-infinity`), and it would have this effect on an
+upgrade of a database that already holds history. Worth knowing before the next
+aggregate rebuild.
+
 **For production: the watermark is a property of the hypertable, not of a
 tenant.** One gateway with a clock skewed into the future would blank the
 history view for *every tenant sharing that hypertable*, silently, with no
