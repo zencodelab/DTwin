@@ -16,10 +16,11 @@ venv/
 .DS_Store
 *.log
 
-# Large 3D assets — keep the tracked sample only
+# Large 3D assets. There is no tracked sample — this used to negate
+# `models/sample-building.glb`, which has never existed. See models/README.md:
+# nothing in the render path reads a model file, by decision §27.
 models/*.glb
 models/*.gltf
-!models/sample-building.glb
 
 # The interview pack lives beside this repo, not in it: it is rehearsal
 # material about talking to interviewers, and this repository is public.
