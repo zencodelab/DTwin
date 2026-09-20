@@ -15,7 +15,7 @@ from uuid import UUID
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from .db import connection, current_tenant
+from .db import connection, connection_unscoped, current_tenant, tenant_scope
 
 ZONE_SQL = """
   SELECT z.id, z.name,
@@ -183,6 +183,60 @@ def mark_completed(run_id: UUID) -> None:
             (run_id,),
         )
         conn.commit()
+
+
+def mark_cancelled(run_id: UUID) -> bool:
+    """Cancel a run that has not finished. Returns False if it already had.
+
+    The status is part of the WHERE clause rather than checked first, so a run
+    that completes between the check and the update is not overwritten with
+    `cancelled` — the same reason switchTenant puts its membership test in the
+    UPDATE.
+    """
+    with connection() as conn:
+        cur = conn.execute(
+            """UPDATE simulation_runs
+                  SET status='cancelled', completed_at=now()
+                WHERE id=%s AND status IN ('queued', 'running')""",
+            (run_id,),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def reap_orphaned_runs() -> int:
+    """Fail runs a previous process left mid-flight.
+
+    Runs execute in a FastAPI BackgroundTask, which dies with the process. A
+    restart therefore leaves rows at `queued` or `running` that nothing will
+    ever advance, and a caller polling one cannot tell it apart from a run that
+    is merely slow. This closes them with an error that says what happened.
+
+    Iterates tenants rather than running unscoped: `simulation_runs` is under
+    row-level security, so an unscoped connection would see — and update —
+    nothing at all. `tenants` itself carries no policy, which is what makes the
+    list readable before a tenant is chosen.
+    """
+    reaped = 0
+    with connection_unscoped() as conn:
+        tenants = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM tenants WHERE status = 'active'"
+            ).fetchall()
+        ]
+
+    for tenant in tenants:
+        with tenant_scope(str(tenant)), connection() as conn:
+            cur = conn.execute(
+                """UPDATE simulation_runs
+                      SET status='failed', completed_at=now(),
+                          error='worker restarted while this run was in flight'
+                    WHERE status IN ('queued', 'running')""",
+            )
+            conn.commit()
+            reaped += cur.rowcount
+    return reaped
 
 
 def mark_failed(run_id: UUID, error: str) -> None:

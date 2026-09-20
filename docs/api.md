@@ -158,8 +158,9 @@ Interactive worker documentation is available at
 | Method and path | Input | Current response |
 |---|---|---|
 | `GET /healthz` | None | 200 `{status, substepS}` or 503 on database failure |
-| `POST /simulate` | `SimulationRequest` | 202 `{runId, status: "queued", zonesWithoutProfile}`; unknown building 404 |
-| `GET /runs/{id}` | Run UUID | Run lifecycle and progress; unknown run 404 |
+| `POST /simulate` | `SimulationRequest` | 202 `{runId, status: "queued", zonesWithoutProfile}`; unknown building 404; **429** when `SIM_MAX_CONCURRENT_RUNS` are already executing — admission happens before the row is created, so a refusal strands nothing ([§47](decisions.md#47-a-run-is-admitted-cancellable-and-reaped--but-still-not-queued)) |
+| `POST /runs/{id}/cancel` | Run UUID | 200 `{runId, status: "cancelled"}`; 404 unknown; **409** if it has already finished. The loop notices at its next progress step (every 2%), so cancellation is prompt rather than instant |
+| `GET /runs/{id}` | Run UUID | Run lifecycle and progress; unknown run 404. A run left in flight by a restarted worker reads `failed` with `worker restarted while this run was in flight` |
 | `GET /runs/{id}/summary` | Run UUID | `{run, building, byZone}`; 404 unknown, 409 unfinished/no results |
 | `GET /runs/{id}/results` | Optional `zoneId`, `limit` (default 500; maximum 10,000) | `{results}` ordered by interval and zone; no pagination cursor |
 | `POST /weather/generate` | Building, period, interval, synthetic-weather parameters | `{written}`; generated rows retain `source='synthetic'` |

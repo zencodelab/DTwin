@@ -813,3 +813,53 @@ gate checks that a value is plausible; nothing checks that a timestamp is.
 ahead of the server's clock, the same way it rejects a temperature of -273.
 That is not built — this decision records the hazard and the reason, and the
 fix belongs on the ingest path where the timestamp arrives.
+
+## 47. A run is admitted, cancellable and reaped — but still not queued
+
+`apps/sim` ran simulations in a FastAPI `BackgroundTask`: no cap, no way to
+stop one, and no memory of one that did not finish. Three consequences, each
+closed differently, and the shape of the fix is as much the decision as the fix.
+
+**Admission, not a queue.** A run is CPU-bound numpy in FastAPI's thread pool,
+so the thing worth protecting is this process. Past `SIM_MAX_CONCURRENT_RUNS`
+(two by default — enough to compare a baseline against a scenario) `/simulate`
+answers **429** rather than accepting the work. A 202 meaning "queued behind an
+unbounded number of others" is a promise the worker cannot keep, and the caller
+can retry knowing what it was told. A durable queue is the right answer at the
+point where runs must survive the process, and it brings a broker with it; this
+does not pretend to be one.
+
+Admission happens **before** the row is created. Creating it first and then
+refusing would leave a `queued` row nothing will ever pick up — precisely the
+orphan the reaper below had to be written for.
+
+**Cancellation at the progress hook.** `cancelled` had been in the status enum
+since 004 with nothing able to set it. The row is updated first, with the status
+test inside the UPDATE's WHERE clause so a run that finishes between check and
+write is not overwritten; the in-process flag is second. The integration loop
+notices at its next progress step, which is every 2%, so a cancelled run stops
+within a fraction of its remaining work rather than instantly. Interrupting
+numpy mid-array is the alternative and it would leave results half written.
+
+The flag is in-process on purpose. A run belonging to another worker is that
+worker's to stop, and one belonging to a dead worker is the reaper's — so a
+shared cancellation channel would be machinery for a case the next two
+mechanisms already cover.
+
+**Reaping at startup.** A `BackgroundTask` dies with its process, so a restart
+left rows at `queued` or `running` that nothing would ever advance — and a
+caller polling one cannot tell it from a run that is merely slow. Startup now
+fails them with `worker restarted while this run was in flight`.
+
+It iterates tenants rather than running unscoped: `simulation_runs` is under
+row-level security, so an unscoped connection would see, and update, nothing at
+all. `tenants` carries no policy, which is what makes that list readable before
+a tenant is chosen. `SIM_REAP_ORPHANS=false` turns it off for a deployment
+running several workers against one database, where another process's live run
+is not this one's orphan — the honest limit of a startup reaper, and the point
+at which run ownership needs a lease rather than an assumption.
+
+*Verified:* a run cancelled mid-flight ends `cancelled` and a second cancel is
+409; a third concurrent request is refused 429 with the first two accepted, and
+leaves no `queued` row; a row planted at `running` is `failed` with that message
+within seconds of a worker start.

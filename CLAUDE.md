@@ -127,6 +127,12 @@ service.
   lives — see `docs/decisions.md` §36.
 - **Broadcasting progress is best-effort.** A run must complete with ingest
   unreachable.
+- **Runs are admitted, cancellable and reaped, not queued** (`docs/decisions.md`
+  §47). Past `SIM_MAX_CONCURRENT_RUNS` the answer is 429, and admission happens
+  **before** the row is created so a refusal cannot strand a `queued` row.
+  Cancellation is noticed at the progress hook. Startup fails runs a previous
+  process left in flight, iterating tenants because `simulation_runs` is under
+  RLS and an unscoped connection would update nothing.
 - Its venv is `apps/sim/.venv` (Python 3.12 via uv), matching the container.
 
 ## Web — `apps/web`

@@ -9,6 +9,7 @@ id; the caller polls, and `simulation_runs.progress_pct` carries progress.
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
@@ -32,8 +33,34 @@ logging.basicConfig(level=logging.INFO, format="[sim] %(message)s")
 log = logging.getLogger("sim")
 
 
+# Runs this process is executing, and runs a caller has asked to stop.
+#
+# Both are in-process on purpose. The concurrency cap protects THIS machine's
+# thread pool, and a cancellation only has to reach the loop that is running
+# here — a run belonging to another process is that process's to stop, and a
+# run belonging to a dead one is the reaper's.
+_slots = threading.BoundedSemaphore(settings.max_concurrent_runs)
+_cancelled: set[UUID] = set()
+_cancelled_lock = threading.Lock()
+
+
+class RunCancelled(Exception):
+    """Raised inside the integration loop to unwind a cancelled run."""
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if settings.reap_orphans_on_start:
+        try:
+            reaped = repository.reap_orphaned_runs()
+            if reaped:
+                log.warning(
+                    "failed %d run(s) left in flight by a previous process", reaped
+                )
+        except Exception:
+            # A worker that cannot reap is still a worker that can simulate.
+            # /healthz reports the database separately.
+            log.exception("could not reap orphaned runs at startup")
     yield
     close_pool()
 
@@ -78,6 +105,12 @@ def _run_model(row: dict[str, Any]) -> SimulationRun:
     )
 
 
+def _check_cancelled(run_id: UUID) -> None:
+    with _cancelled_lock:
+        if run_id in _cancelled:
+            raise RunCancelled
+
+
 def _execute(run_id: UUID, request: SimulationRequest, tenant: str) -> None:
     """Background entry point. Any failure is recorded on the run, not swallowed.
 
@@ -85,19 +118,28 @@ def _execute(run_id: UUID, request: SimulationRequest, tenant: str) -> None:
     has been sent, in its own context, so the scope the request bound is already
     gone by the time the physics starts.
     """
+    def on_progress(pct: float) -> None:
+        # The progress hook is the only place the engine yields control, so it
+        # is also where a cancellation can be noticed without threading a flag
+        # through the integration loop.
+        _check_cancelled(run_id)
+        notify.progress(run_id, request.buildingId, pct)
+
     with tenant_scope(tenant):
         try:
             repository.mark_running(run_id)
-            engine.run(
-                run_id, request,
-                on_progress=lambda pct: notify.progress(run_id, request.buildingId, pct),
-            )
+            engine.run(run_id, request, on_progress=on_progress)
             repository.mark_completed(run_id)
             log.info("run %s completed", run_id)
 
             summary = _build_summary(run_id)
             if summary is not None:
                 notify.complete(run_id, request.buildingId, summary)
+        except RunCancelled:
+            # mark_cancelled already ran, in the request that asked for it, so
+            # the row is correct whether or not the loop noticed in time.
+            log.info("run %s cancelled", run_id)
+            notify.failed(run_id, request.buildingId, "cancelled")
         # Catching broadly on purpose: the run row is the error channel. A
         # background task has no caller left to raise to, so an escaped
         # exception would strand the run at `running` forever with nothing
@@ -107,6 +149,10 @@ def _execute(run_id: UUID, request: SimulationRequest, tenant: str) -> None:
             message = f"{type(exc).__name__}: {exc}"
             repository.mark_failed(run_id, message)
             notify.failed(run_id, request.buildingId, message)
+        finally:
+            with _cancelled_lock:
+                _cancelled.discard(run_id)
+            _slots.release()
 
 
 def _build_summary(run_id: UUID) -> SimulationSummary | None:
@@ -168,7 +214,27 @@ def simulate(
             raise HTTPException(status_code=404, detail="unknown building")
 
         skipped = repository.count_zones_without_profile(request.buildingId)
-        run_id = repository.create_run(request)
+
+        # Admission BEFORE the row exists. Creating the run first and then
+        # refusing would leave a `queued` row nothing will ever pick up, which
+        # is exactly the orphan the reaper had to be written for.
+        if not _slots.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"{settings.max_concurrent_runs} simulation(s) already running; "
+                    "retry when one finishes"
+                ),
+            )
+        try:
+            run_id = repository.create_run(request)
+        except Exception:
+            _slots.release()
+            raise
+
+    # The slot is released in _execute's finally, which always runs because the
+    # task catches everything. If add_task itself could not schedule, nothing
+    # would release it — so it is the last thing that happens here.
     background.add_task(_execute, run_id, request, tenant)
 
     return {
@@ -178,6 +244,33 @@ def simulate(
         # from the results, and a caller comparing totals deserves to know why.
         "zonesWithoutProfile": skipped,
     }
+
+
+@app.post("/runs/{run_id}/cancel", status_code=200)
+def cancel_run(run_id: UUID, tenant: str = Depends(tenant_id)) -> dict[str, Any]:
+    """Stop a queued or running simulation.
+
+    `cancelled` has been in the status enum since 004 with nothing able to set
+    it. The row is updated first and the in-process flag second, so the
+    durable record is correct even if this process is not the one executing
+    the run — that run is another process's to notice, or the reaper's.
+
+    The loop sees the flag at its next progress step, which is every 2%, so a
+    cancelled run stops within a fraction of its remaining work rather than
+    immediately. Interrupting numpy mid-array would be the alternative, and it
+    would leave results half-written.
+    """
+    with tenant_scope(tenant):
+        if repository.get_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        stopped = repository.mark_cancelled(run_id)
+
+    if not stopped:
+        raise HTTPException(status_code=409, detail="run has already finished")
+
+    with _cancelled_lock:
+        _cancelled.add(run_id)
+    return {"runId": str(run_id), "status": "cancelled"}
 
 
 @app.get("/runs/{run_id}")

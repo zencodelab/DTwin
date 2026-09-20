@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
@@ -312,6 +313,62 @@ try:
            "progress broadcast is best-effort, not on the critical path")
         ok("an unreachable ingest leaves no error on the run",
            base["run"]["error"] is None)
+
+        # -- durability: admission, cancellation, and orphan reaping ---------
+        #
+        # `cancelled` has been in the status enum since 004 with nothing able
+        # to set it, and a BackgroundTask dies with its process, so a restart
+        # left rows at `running` that nothing would ever advance.
+
+        body = {
+            "buildingId": BUILDING_ID, "scenarioName": "cancel me",
+            "periodStart": PERIOD_START, "periodEnd": PERIOD_END,
+            "intervalS": 3600,
+            "weather": {"mode": "synthetic", "peakDryBulbC": 42.0,
+                        "minDryBulbC": 30.0, "peakGhiW_m2": 950.0},
+        }
+        started = client.post(f"{BASE}/simulate", json=body)
+        ok("a run is accepted while a slot is free", started.status_code == 202,
+           str(started.status_code))
+        cancel_id = started.json()["runId"]
+
+        cancelled = client.post(f"{BASE}/runs/{cancel_id}/cancel")
+        ok("cancelling a live run is accepted", cancelled.status_code == 200,
+           str(cancelled.status_code))
+
+        final = run_until_done(client, cancel_id)
+        ok("a cancelled run ends cancelled, not completed",
+           final["status"] == "cancelled", final["status"])
+
+        again = client.post(f"{BASE}/runs/{cancel_id}/cancel")
+        ok("cancelling a finished run is a 409, not a silent success",
+           again.status_code == 409, str(again.status_code))
+
+        ok("cancelling an unknown run is a 404",
+           client.post(f"{BASE}/runs/{uuid4()}/cancel").status_code == 404)
+
+        # Fill every slot, then check the next request is refused rather than
+        # queued behind work the worker has not promised to reach.
+        held = [client.post(f"{BASE}/simulate", json=body) for _ in range(3)]
+        codes = [r.status_code for r in held]
+        ok("admission refuses past the concurrency cap with 429",
+           429 in codes, f"got {codes}")
+        for r in held:
+            if r.status_code == 202:
+                run_until_done(client, r.json()["runId"])
+
+        # A refused run must leave no row behind: admission happens before the
+        # insert, so a 429 cannot create the `queued` orphan the reaper exists
+        # to clean up.
+        with psycopg.connect(dsn) as check:
+            check.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT_ID,))
+            stranded = check.execute(
+                "SELECT count(*) FROM simulation_runs"
+                " WHERE scenario_name = %s AND status = 'queued'",
+                ("cancel me",),
+            ).fetchone()[0]
+        ok("a refused run leaves no queued row behind", stranded == 0,
+           f"{stranded} stranded")
 
         # ------------------------------------------------------ determinism
         print("\n[7] Determinism and weather modes")
