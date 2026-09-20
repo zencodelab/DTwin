@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useRef } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { Html, OrbitControls } from '@react-three/drei';
 import * as THREE from 'three';
@@ -96,19 +96,12 @@ export function BuildingCanvas({
           />
         ))}
 
-        {showEquipment &&
-          tree.equipment
-            .filter((e) => e.position !== null)
-            .filter((e) => focusedFloorId === null || e.floorId === focusedFloorId)
-            .map((e) => (
-              <EquipmentMarker
-                key={e.id}
-                position={[e.position!.x, e.position!.y, e.position!.z]}
-                status={e.status}
-                tag={e.tag}
-                showLabel={focusedFloorId !== null}
-              />
-            ))}
+        {showEquipment && (
+          <EquipmentMarkers
+            equipment={tree.equipment}
+            focusedFloorId={focusedFloorId}
+          />
+        )}
 
         <Grid bounds={bounds} isDark={isDark} />
       </group>
@@ -137,6 +130,14 @@ function FloorGroup({
 }) {
   const height = (floor.floorHeightM ?? 4) * 0.82; // leave a slab gap between floors
 
+  // One callback for every zone on this floor, stable across renders. An
+  // inline closure per zone would be a new prop each time and would defeat
+  // ZoneMesh's memo entirely.
+  const select = useCallback((floorId: string, zoneId: string) => {
+    onSelectFloor(floorId);
+    onSelectZone(zoneId);
+  }, [onSelectFloor, onSelectZone]);
+
   return (
     <group>
       {floor.zones.map((zone) => (
@@ -148,17 +149,30 @@ function FloorGroup({
           dimmed={dimmed}
           showLabel={focused}
           selected={selectedZoneId === zone.id}
-          onSelect={() => {
-            onSelectFloor(floor.id);
-            onSelectZone(zone.id);
-          }}
+          onSelect={select}
         />
       ))}
     </group>
   );
 }
 
-function ZoneMesh({
+/**
+ * How many meshes currently think the pointer is over them.
+ *
+ * `onPointerOut` on one mesh can fire after `onPointerOver` on the next when
+ * the pointer crosses a shared edge, and the naive version — set `pointer` on
+ * over, `auto` on out — then leaves the cursor as an arrow while it is still
+ * over a zone, or as a pointer after it has left the building entirely. A
+ * count is the only thing that survives the ordering.
+ */
+let hoverCount = 0;
+
+function setHovered(hovered: boolean): void {
+  hoverCount = Math.max(0, hoverCount + (hovered ? 1 : -1));
+  document.body.style.cursor = hoverCount > 0 ? 'pointer' : 'auto';
+}
+
+const ZoneMesh = memo(function ZoneMesh({
   zone, height, visual, dimmed, showLabel, selected, onSelect,
 }: {
   zone: Zone;
@@ -167,7 +181,14 @@ function ZoneMesh({
   dimmed: boolean;
   showLabel: boolean;
   selected: boolean;
-  onSelect: () => void;
+  /**
+   * Takes the zone id rather than closing over it, so the parent can pass one
+   * callback for every zone. An inline `() => onSelect(zone.id)` in the parent
+   * is a new function on each render, which defeats the memo above — the
+   * component would re-render all 24 zones on every telemetry frame regardless
+   * of whether any of their values changed.
+   */
+  onSelect: (floorId: string, zoneId: string) => void;
 }) {
   const mesh = useRef<THREE.Mesh>(null);
 
@@ -175,6 +196,11 @@ function ZoneMesh({
     () => (zone.boundary ? extrudeZone(zone.boundary, height) : null),
     [zone.boundary, height],
   );
+
+  // Extruded geometry is allocated on the GPU and is not garbage-collected
+  // with the React element. Without this, changing floor height or navigating
+  // away leaks a buffer per zone.
+  useEffect(() => () => geometry?.dispose(), [geometry]);
   const centroid = useMemo(
     () => (zone.boundary ? polygonCentroid(zone.boundary) : null),
     [zone.boundary],
@@ -195,15 +221,13 @@ function ZoneMesh({
           // Without this the click passes through to every zone behind it and
           // the last one wins — which is never the one under the cursor.
           event.stopPropagation();
-          onSelect();
+          onSelect(zone.floorId, zone.id);
         }}
         onPointerOver={(event) => {
           event.stopPropagation();
-          document.body.style.cursor = 'pointer';
+          setHovered(true);
         }}
-        onPointerOut={() => {
-          document.body.style.cursor = 'auto';
-        }}
+        onPointerOut={() => setHovered(false)}
       >
         <meshStandardMaterial
           color={color}
@@ -244,40 +268,114 @@ function ZoneMesh({
       )}
     </group>
   );
-}
+});
 
-function EquipmentMarker({
-  position, status, tag, showLabel,
-}: {
-  position: [number, number, number];
-  status: string;
-  tag: string;
-  showLabel: boolean;
-}) {
-  // Status is a reserved palette and always ships with a label, never colour
-  // alone — a red dot on its own is not readable as "fault".
-  const color =
-    status === 'fault' ? STATUS.critical
+/**
+ * Status is a reserved palette and always ships with a label, never colour
+ * alone — a red dot on its own is not readable as "fault".
+ */
+function statusColor(status: string): string {
+  return status === 'fault' ? STATUS.critical
     : status === 'maintenance' ? STATUS.warning
     : status === 'degraded' ? STATUS.serious
     : status === 'offline' ? '#898781'
     : STATUS.good;
+}
+
+const MARKER_DUMMY = new THREE.Object3D();
+const MARKER_COLOR = new THREE.Color();
+
+/**
+ * Every equipment marker in one draw call.
+ *
+ * These were forty separate meshes, each with its own sphere geometry and its
+ * own material — forty draw calls and forty materials for forty identical
+ * spheres that differ only in position and colour. An InstancedMesh uploads
+ * the geometry once and the per-instance transform and colour as buffers, so
+ * the cost stops scaling with the asset count. It matters at 40 and it decides
+ * whether this works at 400.
+ *
+ * The labels stay as separate DOM overlays: they are only rendered when a
+ * floor is focused, which is at most ten of them, and text cannot be
+ * instanced anyway.
+ */
+function EquipmentMarkers({
+  equipment, focusedFloorId,
+}: {
+  equipment: SpatialTree['equipment'];
+  focusedFloorId: string | null;
+}) {
+  const ref = useRef<THREE.InstancedMesh>(null);
+
+  const visible = useMemo(
+    () => equipment.filter(
+      (e) => e.position !== null
+        && (focusedFloorId === null || e.floorId === focusedFloorId),
+    ),
+    [equipment, focusedFloorId],
+  );
+
+  // Positions and colours are written into the instance buffers rather than
+  // into React elements, so a status change costs a buffer update instead of
+  // forty reconciliations.
+  useEffect(() => {
+    const mesh = ref.current;
+    if (!mesh) return;
+
+    visible.forEach((e, i) => {
+      MARKER_DUMMY.position.set(e.position!.x, e.position!.y, e.position!.z);
+      MARKER_DUMMY.updateMatrix();
+      mesh.setMatrixAt(i, MARKER_DUMMY.matrix);
+      mesh.setColorAt(i, MARKER_COLOR.set(statusColor(e.status)));
+    });
+    mesh.count = visible.length;
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  }, [visible]);
+
+  if (visible.length === 0) return null;
 
   return (
-    <group position={position}>
-      <mesh>
+    <>
+      {/* `key` on the length: an InstancedMesh cannot grow past the count it
+          was allocated with, so a floor with more equipment than the last one
+          needs a new buffer rather than a resized one. */}
+      <instancedMesh
+        key={visible.length}
+        ref={ref}
+        args={[undefined, undefined, visible.length]}
+      >
         <sphereGeometry args={[0.55, 16, 16]} />
-        <meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.5} />
-      </mesh>
-      {showLabel && (
-        <Html center distanceFactor={45} style={{ pointerEvents: 'none' }}>
+        {/*
+          Unlit, and that is a correction rather than a compromise. These were
+          lit spheres with an emissive tint, so a marker on the shaded side of
+          the building rendered darker than the same status on the lit side —
+          a status indicator whose colour depends on where it happens to sit is
+          not a status indicator. `toneMapped={false}` keeps the palette's
+          exact value rather than the renderer's interpretation of it.
+
+          It is also what makes per-instance colour work: `setColorAt` writes
+          the base colour, and a standard material's `emissive` is a uniform
+          shared by every instance, so the glow could not have varied anyway.
+        */}
+        <meshBasicMaterial toneMapped={false} />
+      </instancedMesh>
+
+      {focusedFloorId !== null && visible.map((e) => (
+        <Html
+          key={e.id}
+          center
+          distanceFactor={45}
+          position={[e.position!.x, e.position!.y, e.position!.z]}
+          style={{ pointerEvents: 'none' }}
+        >
           <div className="whitespace-nowrap rounded px-1 text-[10px]"
                style={{ background: 'rgba(13,13,13,0.8)', color: '#fff', transform: 'translateY(-14px)' }}>
-            {tag}
+            {e.tag}
           </div>
         </Html>
-      )}
-    </group>
+      ))}
+    </>
   );
 }
 
