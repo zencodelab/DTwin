@@ -888,23 +888,45 @@ try {
 
   // --------------------------------------------------------------- shutdown
   console.log('\n[10] Graceful shutdown');
-  const { rows: [before] } = await pool.query(`SELECT count(*) AS n FROM telemetry`);
+  // Put known rows in the buffer and signal before they can be flushed on the
+  // interval, so the shutdown path is what carries them.
+  //
+  // Counting all of `telemetry` either side of the signal does not work. `>=`
+  // passes on a server that ignored SIGTERM and dropped its whole buffer — that
+  // is how CI reported `18192 -> 18192` as a success. `>` then fails whenever
+  // the periodic flush happens to have just run and left the buffer empty,
+  // which is how CI reported `19311 -> 19311` as a failure. The quantity the
+  // check is about is these specific readings, so it asks about these specific
+  // readings.
+  const shutdownTs = Date.now() + 86_400_000; // future, so nothing else writes here
+  const shutdownBatch = Array.from({ length: 5 }, (_, i) => ({
+    externalId: probe.externalId, ts: shutdownTs + i, value: 21.5 + i / 100,
+  }));
+  const queued = await postJson(`${BASE}/ingest`, {
+    readings: shutdownBatch, source: 'smoke-shutdown',
+  });
+  ok('the shutdown batch was accepted into the buffer',
+     queued.status === 202, String(queued.status));
+
   ws.close();
   server.kill('SIGTERM');
   const exitCode = await new Promise<number | null>(
     (r) => server!.once('exit', (code) => r(code)),
   );
   await sleep(300);
-  const { rows: [after] } = await pool.query(`SELECT count(*) AS n FROM telemetry`);
 
-  // The simulator is writing continuously at SIM_TICK_MS, so a clean shutdown
-  // must land MORE rows than were committed before the signal. `>=` would pass
-  // on a server that ignored SIGTERM entirely and lost its whole buffer, which
-  // is exactly what CI was doing while this check reported success.
+  const { rows: [landed] } = await pool.query<{ n: number }>(
+    `SELECT count(*) AS n FROM telemetry WHERE sensor_id = $1 AND "time" >= $2`,
+    [probe.id, new Date(shutdownTs)],
+  );
   ok('buffered readings were flushed on SIGTERM, not lost',
-     Number(after.n) > Number(before.n), `${before.n} -> ${after.n}`);
+     Number(landed?.n) === shutdownBatch.length,
+     `${landed?.n ?? 0}/${shutdownBatch.length} rows landed`);
   ok('the server exited on SIGTERM rather than being left running',
      exitCode === 0, `exit code ${exitCode}`);
+
+  await pool.query('DELETE FROM telemetry WHERE sensor_id = $1 AND "time" >= $2',
+                   [probe.id, new Date(shutdownTs)]);
   ok('port released', await waitForPortFree(PORT));
 
 } finally {
