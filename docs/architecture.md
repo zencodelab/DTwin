@@ -109,8 +109,10 @@ Raw telemetry uses one-day chunks, compression after seven days, and two-year
 retention. The 5-minute/hourly/daily continuous aggregates derive directly from
 raw readings. Hourly and daily summaries hold reset-aware counters; cumulative
 consumption must use `delta(counter)`, not averages. Counter deltas at 5-minute
-resolution are null. All aggregate value calculations currently include flagged
-samples, with a separate bad-quality count.
+resolution are null. Every statistic — mean, min, max, last, and the counter — is
+computed over `quality = 0` only, and is null for a bucket with no good sample;
+`sample_count` counts everything and `bad_quality_count` the flagged, so
+coverage stays computable ([§57](decisions.md#57-a-flagged-sample-is-counted-in-the-rollup-and-kept-out-of-its-statistics)).
 
 Dashboard history and heatmaps use aggregates. **Implementation exception:**
 `getLatestReadingsForZone` reads raw telemetry over the last 24 hours and marks a

@@ -30,7 +30,7 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **253 checks, all passing** (`db` 64, `ingest` 112, `sim` 54,
+Suites total **257 checks, all passing** (`db` 68, `ingest` 112, `sim` 54,
 `web` 23), plus **223 unit tests** (173 vitest, 50 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
@@ -78,6 +78,13 @@ Do not "optimise" it back to COPY.
   Name an end in the past and leave the tail to real-time aggregation.
   `docs/decisions.md` §46; both instances were found by CI blanking an
   unrelated suite's history.
+- **A flagged sample is counted in a rollup and kept out of its statistics**
+  (migration 016, `docs/decisions.md` §57). avg/min/max/last AND `counter_agg`
+  carry `FILTER (WHERE quality = 0)`; a bucket with no good sample is NULL.
+  Never add an unfiltered aggregate to these views, and never "fix" a NULL
+  bucket by falling back to the flagged values. Changing a continuous
+  aggregate means dropping and rebuilding it: remove its policy FIRST (008
+  raced the scheduler), and backfill to an end in the past (§46).
 - **Never average a cumulative meter.** `sensors.is_cumulative` marks them; use
   `delta(counter_agg)` from the hourly/daily aggregates.
 - **Parse at the boundary, never cast.** Everything arriving over HTTP or a

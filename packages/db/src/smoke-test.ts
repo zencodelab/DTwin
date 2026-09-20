@@ -145,13 +145,19 @@ await owner.query('DELETE FROM telemetry WHERE sensor_id = $1 AND time >= $2',
 
 const readings: Reading[] = [];
 // 6 hours of 1-minute temperature data with a diurnal swing.
+//
+// Forty of them are a failed probe: -273 C, flagged OutOfRange, which is what
+// the quality gate stores rather than drops. Thirty in one stretch, so an
+// hourly mean has something to be dragged by; ten in another, long enough that
+// at least one wall-clock-aligned 5-minute bucket holds nothing else.
+const probeFailed = (i: number) => (i >= 200 && i < 230) || (i >= 295 && i < 305);
 for (let i = 360; i >= 0; i--) {
   const ts = now - i * 60_000;
   readings.push({
     sensorId: tempSensor.id as Reading['sensorId'],
     ts,
-    value: 23 + 2 * Math.sin((ts / 3_600_000) * Math.PI / 6),
-    quality: 0,
+    value: probeFailed(i) ? -273 : 23 + 2 * Math.sin((ts / 3_600_000) * Math.PI / 6),
+    quality: probeFailed(i) ? 2 : 0,
   });
 }
 const written = await withTenant(A, (db) => insertReadings(db, readings));
@@ -183,9 +189,13 @@ for (let i = 360; i >= 0; i--) {
   acc += 3; // 3 kWh per minute
   // Simulate a meter rollover two hours ago — the case that makes max-min lie.
   if (i === 120) acc = 0;
+  // And one flagged spike an hour ago. To a reset-aware counter an absurd
+  // value followed by a sane one IS a reset, so unless the rollup leaves it
+  // out, `delta` reports nine billion kWh that nobody used.
+  const spiked = i === 60;
   meterReadings.push({
     sensorId: meter.id as Reading['sensorId'],
-    ts: now - i * 60_000, value: acc, quality: 0,
+    ts: now - i * 60_000, value: spiked ? 9e9 : acc, quality: spiked ? 2 : 0,
   });
 }
 await withTenant(A, (db) => insertReadings(db, meterReadings));
@@ -215,7 +225,14 @@ const meterHist = await withTenant(A, (db) => getSensorHistory(db, meter.id, '1h
 const totalDelta = meterHist.reduce((s, b) => s + (b.deltaValue ?? 0), 0);
 ok('counter_agg delta is positive despite the reset', totalDelta > 0,
    `sum(delta) = ${totalDelta.toFixed(1)} kWh`);
-const naive = Math.max(...meterReadings.map(r => r.value)) - Math.min(...meterReadings.map(r => r.value));
+// 361 readings at 3 kWh a minute is 1,080 kWh. The sum sits under that: the
+// hour bucket containing `from` starts before it and is excluded (up to 180),
+// and a per-bucket delta does not span the boundary between buckets (3 each).
+// What matters is the order of magnitude — unfiltered, this is ~9,000,000,000.
+ok('a flagged spike on a meter does not become energy',
+   totalDelta > 800 && totalDelta < 1_100, `sum(delta) = ${totalDelta.toFixed(1)} kWh`);
+const good = meterReadings.filter((r) => r.quality === 0);
+const naive = Math.max(...good.map(r => r.value)) - Math.min(...good.map(r => r.value));
 ok('naive max-min would have been wrong', Math.abs(naive - totalDelta) > 1000,
    `naive = ${naive.toFixed(0)} vs counter_agg = ${totalDelta.toFixed(0)}`);
 
@@ -224,6 +241,24 @@ ok('gauge sensor history has buckets', tempHist.length > 0, `${tempHist.length} 
 ok('gauge delta is null (not a counter)', tempHist[0]?.deltaValue === null);
 ok('gauge avg is in range', (tempHist[0]?.avgValue ?? 0) > 20 && (tempHist[0]?.avgValue ?? 0) < 26,
    `avg = ${tempHist[0]?.avgValue?.toFixed(2)}`);
+
+// Flagged samples are counted, and kept out of every statistic (migration 016).
+// Before it they were counted AND averaged: thirty minutes at -273 C pulled an
+// hourly mean down by ~150 degrees, with a count beside it that could not be
+// used to repair it — you cannot subtract a sample from a mean you were not
+// given the sum of.
+const flaggedTotal = tempHist.reduce((n, b) => n + b.badQualityCount, 0);
+ok('flagged samples are still counted', flaggedTotal === 40, `bad_quality_count = ${flaggedTotal}`);
+ok('and kept out of min, max and mean',
+   tempHist.every((b) => b.avgValue === null
+     || (b.minValue! > 20 && b.maxValue! < 26 && b.avgValue > 20 && b.avgValue < 26)),
+   `lowest hourly min = ${Math.min(...tempHist.map((b) => b.minValue ?? Infinity)).toFixed(2)}`);
+
+const fiveMin = await withTenant(A, (db) => getSensorHistory(db, tempSensor.id, '5m', from, to));
+const allBad = fiveMin.filter((b) => b.sampleCount > 0 && b.badQualityCount === b.sampleCount);
+ok('a bucket holding only flagged samples has no mean at all, rather than a wrong one',
+   allBad.length >= 1 && allBad.every((b) => b.avgValue === null && b.minValue === null),
+   `${allBad.length} such 5-minute bucket(s)`);
 
 // ------------------------------------------------------------------ heatmap
 console.log('\n[5] Heatmap overlay');

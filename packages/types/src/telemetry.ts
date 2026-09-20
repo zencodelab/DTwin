@@ -91,7 +91,14 @@ export const RawTelemetryBatch = z.object({
 });
 export type RawTelemetryBatch = z.infer<typeof RawTelemetryBatch>;
 
-/** One bucket from telemetry_5m / _1h / _1d. */
+/**
+ * One bucket from telemetry_5m / _1h / _1d.
+ *
+ * avg / min / max / last are over GOOD samples only (migration 016), and null
+ * when the bucket holds none — nullable for that reason and not only because a
+ * bucket can be empty. `sampleCount` counts every sample, `badQualityCount` the
+ * flagged ones, so `sampleCount - badQualityCount` is what the mean rests on.
+ */
 export const AggregateBucket = z.object({
   bucket: z.coerce.date(),
   sensorId: SensorId,

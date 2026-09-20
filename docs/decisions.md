@@ -1422,3 +1422,62 @@ light over a connection silently dropping frames was the alternative.
 
 Still not addressed: the alert list is capped at 100 by the route, and an alert
 beyond that is invisible to this reconciliation as to everything else.
+
+---
+
+## 57. A flagged sample is counted in the rollup and kept out of its statistics
+
+The quality gate stores a bad reading with a flag instead of dropping it: "the sensor reported −273 for six hours" is a diagnosis, and
+discarding it turns a visible fault into an unexplained gap. The continuous
+aggregates then counted those samples in `bad_quality_count` — **and also
+averaged them.**
+
+So a consumer was handed a contaminated mean with a count beside it that it
+could not use to repair it, because you cannot subtract a sample from a mean
+you were not given the sum of. Measured on the suite's own fixture, an hour of
+one-minute readings around 22 °C with thirty minutes of a failed probe:
+
+| | Unfiltered | `quality = 0` only |
+|---|---|---|
+| Hourly mean, 30 of 60 samples flagged | **−125.68 °C** | 21.64 °C |
+| Hourly mean, 10 of 60 flagged | −26.82 °C | 22.42 °C |
+| Six hours of a meter at 3 kWh/min, one flagged spike | **9,000,001,056 kWh** | 1,056 kWh |
+
+The meter is the worse of the two. To a reset-aware counter an absurd value
+followed by a sane one *is* a reset, so `counter_agg` — adopted in §10 precisely
+so that a rollover would not corrupt consumption — faithfully reported nine
+billion kilowatt-hours that nobody used.
+
+This was the third place a flagged reading could act as a real one, and the one
+the other two fall back on. The alert engine has refused them since §17; the
+live map since §55; but the map's first paint is a mean from `telemetry_5m`.
+
+**avg, min, max, last and `counter_agg` now carry `FILTER (WHERE quality = 0)`.**
+A bucket with no good sample is NULL there, which is the truth and which every
+reader already handled — the columns were always nullable, because a bucket can
+be empty. `sample_count` still counts everything, so coverage is computable as
+before, and nothing is hidden: the flagged rows remain in `telemetry`.
+
+**The column names are kept.** A second set — `good_avg_value` beside
+`avg_value` — would have left the wrong number in place under the obvious name,
+for the next query to reach for.
+
+**It costs a rebuild.** A continuous aggregate's query cannot be altered, so
+migration 016 drops and recreates all three, and re-materialises from
+`telemetry`. Rollup rows older than raw retention (two years) cannot be
+reconstructed; no such deployment exists, and the migration says so in capitals
+for the day one does. The rebuild was also the chance not to repeat two things
+008 got wrong: it removes the refresh policies **before** dropping the views,
+rather than racing the scheduler into `tuple concurrently deleted`; and it
+backfills to an end in the past, which repairs §46's watermark for any database
+still carrying 008's `NULL, NULL` refresh.
+
+*Verified:* `FILTER` inside a continuous aggregate, including on `last()` and
+the toolkit's `counter_agg`, was proven on a scratch view against this
+TimescaleDB (2.30.1) before the migration was written. After it, no watermark
+is ahead of `now()`, all three policies exist, and the application role holds
+`SELECT` on the recreated barrier views and nothing else. A sensor that had
+carried a `spike` fault earlier the same day — 51 flagged readings peaking at
+247 °C — shows an hourly max of 24.76 °C. The db suite writes both fixtures
+above and asserts the flagged samples are counted, excluded, and that a
+5-minute bucket holding nothing else has no mean at all rather than a wrong one.
