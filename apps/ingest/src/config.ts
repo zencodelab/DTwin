@@ -77,6 +77,19 @@ const Env = z.object({
   ALERT_NOTIFY_ENABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
   ALERT_NOTIFY_RETRY_MS: z.coerce.number().int().positive().default(60_000),
   ALERT_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+
+  /**
+   * SMTP transport for the email channel, as a URL:
+   * `smtp://user:pass@host:587` or `smtps://…` for implicit TLS.
+   *
+   * Absent, email destinations continue to record `failed` with "no email
+   * transport configured" — which is the honest answer to "was anyone told?",
+   * and better than a channel that looks wired and is not.
+   */
+  ALERT_SMTP_URL: z.string().url().optional(),
+  /** Envelope sender. Required once ALERT_SMTP_URL is set; most relays reject a missing From. */
+  ALERT_EMAIL_FROM: z.string().optional(),
+  ALERT_EMAIL_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   ALERT_WEBHOOK_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
   /**
    * Webhook destinations that resolve to private or loopback addresses are

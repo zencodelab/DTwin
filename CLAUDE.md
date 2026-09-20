@@ -45,9 +45,11 @@ relay checks `buildingId` against the key's tenant but nothing ties `runId` to
 `buildingId`. Every event still carries `runId`; a client following one run
 filters on it.
 
-**Open item, pre-existing:** an email transport. The channel is wired and
-audited in `alert_notifications`; only the sender is missing, so email
-destinations record `failed` with "no email transport configured".
+**Email is delivered** when `ALERT_SMTP_URL` and `ALERT_EMAIL_FROM` are set,
+and still records `failed` with "no email transport configured" when they are
+not — a channel that looks wired and is not would be worse than one that says
+so. The body is plain text on purpose: an alert is read on a phone at an odd
+hour by someone deciding whether to drive to a building.
 
 ⚠️ **`COPY FROM` is not available on any table with row-level security.**
 PostgreSQL refuses it outright. `apps/sim` writes results with chunked

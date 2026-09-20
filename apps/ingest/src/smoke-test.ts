@@ -9,6 +9,7 @@
  * Requires a migrated, seeded database. Run with:  npm run smoke -w @dtwin/ingest
  */
 import { createServer, type Server } from 'node:http';
+import { createServer as netCreateServer, type Server as NetServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -249,6 +250,8 @@ try {
       // default. Opened deliberately here; the guard itself is tested directly.
       ALERT_WEBHOOK_ALLOW_PRIVATE: 'true',
       ALERT_NOTIFY_RETRY_MS: '1000',
+      ALERT_SMTP_URL: 'smtp://127.0.0.1:9712',
+      ALERT_EMAIL_FROM: 'dtwin-alerts@example.invalid',
       AUTH_SECRET,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -738,6 +741,44 @@ try {
   });
   await new Promise<void>((r) => receiver.listen(9711, '127.0.0.1', () => r()));
 
+  // A real SMTP sink, not a mock transport.
+  //
+  // The email channel recorded `failed` with "no email transport configured"
+  // for as long as it existed. Proving it now works means speaking enough SMTP
+  // to accept a message: nodemailer will not send into a stub, and a test that
+  // asserted against nodemailer's own jsonTransport would be testing
+  // nodemailer. Sixty lines of protocol is the price of knowing.
+  const mailbox: string[] = [];
+  const smtp: NetServer = netCreateServer((sock) => {
+    let inData = false;
+    let message = '';
+    sock.write('220 dtwin-smoke ESMTP\r\n');
+    sock.on('data', (chunk: Buffer) => {
+      for (const line of chunk.toString('utf8').split(/\r?\n/)) {
+        if (inData) {
+          if (line === '.') {
+            inData = false;
+            mailbox.push(message);
+            message = '';
+            sock.write('250 2.0.0 Ok: queued\r\n');
+          } else {
+            message += `${line}\n`;
+          }
+          continue;
+        }
+        const verb = line.slice(0, 4).toUpperCase();
+        if (verb === 'EHLO' || verb === 'HELO') sock.write('250-dtwin-smoke\r\n250 8BITMIME\r\n');
+        else if (verb === 'MAIL' || verb === 'RCPT') sock.write('250 2.1.0 Ok\r\n');
+        else if (verb === 'DATA') { inData = true; sock.write('354 End data with <CR><LF>.<CR><LF>\r\n'); }
+        else if (verb === 'QUIT') { sock.write('221 2.0.0 Bye\r\n'); sock.end(); }
+        else if (verb === 'RSET' || verb === 'NOOP') sock.write('250 2.0.0 Ok\r\n');
+        else if (line.length > 0) sock.write('502 5.5.2 Not implemented\r\n');
+      }
+    });
+    sock.on('error', () => { /* a client hanging up is not a test failure */ });
+  });
+  await new Promise<void>((r) => smtp.listen(9712, '127.0.0.1', () => r()));
+
   const notifyRule = await createRule({
     name: 'notified breach', sensorId: probe.id,
     condition: 'threshold_above', threshold: 27, consecutive: 2, severity: 'critical',
@@ -783,9 +824,14 @@ try {
      delivery.map((r) => r.channel).join(', '));
   ok('the webhook is recorded delivered', webhookRow?.status === 'delivered');
   ok('the log channel is recorded delivered', logRow?.status === 'delivered');
-  ok('email records WHY it was not sent rather than vanishing',
-     emailRow?.status === 'failed' && String(emailRow.last_error).includes('transport'),
-     String(emailRow?.last_error));
+  ok('email is actually delivered, not recorded as unconfigured',
+     emailRow?.status === 'delivered', `${emailRow?.status}: ${emailRow?.last_error ?? '-'}`);
+  ok('the message reached the SMTP server with a usable subject',
+     mailbox.some((m) => /^Subject:.*\S/m.test(m) && m.includes('fm@example.com')),
+     mailbox.length ? (/^Subject: (.*)$/m.exec(mailbox[0]!)?.[1] ?? '?') : 'no message received');
+  ok('the body carries the alert, not just a link',
+     mailbox.some((m) => m.includes('Alert id:')),
+     `${mailbox.length} message(s)`);
 
   const deliveredSoFar = received.length;
   await sleep(1500);
@@ -795,6 +841,9 @@ try {
 
   await del(`${BASE}/simulator/fault?sensorId=${probe.id}`);
   await new Promise<void>((r) => receiver.close(() => r()));
+  // Drop any lingering SMTP session so close() can actually complete.
+  (smtp as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+  await new Promise<void>((r) => smtp.close(() => r()));
 
   // ------------------------------------------------- simulation broadcast
   console.log('\n[8] Simulation event relay');

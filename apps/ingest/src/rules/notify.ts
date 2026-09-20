@@ -1,4 +1,5 @@
 import { lookup } from 'node:dns/promises';
+import { createTransport, type Transporter } from 'nodemailer';
 import { withTenant } from '@dtwin/db';
 import { activeTenants } from '../tenants.ts';
 import type { AlertWithContext } from '@dtwin/types';
@@ -114,6 +115,49 @@ export class Notifier {
   #stats: NotifyStats = { delivered: 0, failed: 0, blocked: 0, skipped: 0 };
   #retryTimer: NodeJS.Timeout | null = null;
 
+  /**
+   * One transporter, built on first use and kept.
+   *
+   * nodemailer pools connections, so rebuilding it per alert would open a new
+   * SMTP session each time — and an alert storm is exactly when that costs.
+   * Built lazily rather than in the constructor so a service with no email
+   * destination never opens one at all.
+   */
+  #mailer: Transporter | null = null;
+
+  #transport(): Transporter | null {
+    const url = this.config.ALERT_SMTP_URL;
+    if (!url) return null;
+
+    // The URL is parsed here rather than handed to nodemailer as a string,
+    // because createTransport's second argument is message DEFAULTS, not
+    // transport options — the timeouts below would have been silently
+    // interpreted as headers on every message.
+    const parsed = new URL(url);
+    const secure = parsed.protocol === 'smtps:';
+
+    this.#mailer ??= createTransport({
+      host: parsed.hostname,
+      port: Number(parsed.port) || (secure ? 465 : 587),
+      secure,
+      auth: parsed.username
+        ? {
+          user: decodeURIComponent(parsed.username),
+          pass: decodeURIComponent(parsed.password),
+        }
+        : undefined,
+      // An alert is dispatched off the alert path, but it is still a queue that
+      // a hanging relay would fill.
+      connectionTimeout: this.config.ALERT_EMAIL_TIMEOUT_MS,
+      greetingTimeout: this.config.ALERT_EMAIL_TIMEOUT_MS,
+      socketTimeout: this.config.ALERT_EMAIL_TIMEOUT_MS,
+      // A relay on the same host, reached over plain SMTP, is the normal shape
+      // for this; requiring a valid certificate there would refuse it.
+      tls: { rejectUnauthorized: secure },
+    });
+    return this.#mailer;
+  }
+
   constructor(private readonly config: Config) {}
 
   start(): void {
@@ -169,15 +213,70 @@ export class Notifier {
     }
 
     if (target.channel === 'email') {
-      // No transport is wired. Recording the failure with the reason is the
-      // honest answer to "was anyone told?" — silently dropping it would leave
-      // the audit trail claiming nothing was ever configured.
-      await this.#markFailed(tenantId, id, 'no email transport configured');
-      this.#stats.failed++;
+      await this.#deliverEmail(tenantId, id, alert, target.target);
       return;
     }
 
     await this.#deliverWebhook(tenantId, id, alert, target.target);
+  }
+
+  /**
+   * Send one alert as mail.
+   *
+   * With no `ALERT_SMTP_URL` this records `failed` with the reason, exactly as
+   * before — the honest answer to "was anyone told?", and better than a channel
+   * that looks wired and is not. What changed is that configuring it now does
+   * something.
+   *
+   * The body is deliberately plain text. An alert is read on a phone at an odd
+   * hour by someone deciding whether to drive to a building; HTML mail buys
+   * nothing there and costs a rendering surface.
+   */
+  async #deliverEmail(
+    tenantId: string,
+    id: string,
+    alert: AlertWithContext,
+    address: string,
+  ): Promise<void> {
+    const mailer = this.#transport();
+    if (!mailer) {
+      await this.#markFailed(tenantId, id, 'no email transport configured');
+      this.#stats.failed++;
+      return;
+    }
+    if (!this.config.ALERT_EMAIL_FROM) {
+      await this.#markFailed(tenantId, id, 'ALERT_EMAIL_FROM is not set');
+      this.#stats.failed++;
+      return;
+    }
+
+    const where = [alert.zoneName, alert.floorName, alert.equipmentTag]
+      .filter(Boolean).join(' · ');
+
+    try {
+      await mailer.sendMail({
+        from: this.config.ALERT_EMAIL_FROM,
+        to: address,
+        subject: `[${alert.severity}] ${alert.ruleName}${where ? ` — ${where}` : ''}`,
+        text: [
+          alert.message,
+          '',
+          where && `Location: ${where}`,
+          alert.sensorName && `Point: ${alert.sensorName}`,
+          alert.triggerValue !== null && `Reading: ${alert.triggerValue}`,
+          alert.threshold !== null && `Threshold: ${alert.threshold}`,
+          `Opened: ${new Date(alert.openedAt).toISOString()}`,
+          `Alert id: ${alert.id}`,
+        ].filter(Boolean).join('\n'),
+      });
+      await this.#markDelivered(tenantId, id);
+      this.#stats.delivered++;
+    } catch (err) {
+      // Recorded, not thrown: the retry sweep owns whether to try again, and
+      // an alert that could not be mailed must not take the engine with it.
+      await this.#markFailed(tenantId, id, (err as Error).message);
+      this.#stats.failed++;
+    }
   }
 
   async #deliverWebhook(
