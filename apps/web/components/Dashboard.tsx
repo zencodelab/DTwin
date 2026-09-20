@@ -71,6 +71,7 @@ export function Dashboard({
   const [showEquipment, setShowEquipment] = useState(true);
   const [baseline, setBaseline] = useState<Map<string, ZoneProfile>>(new Map());
   const [standingAlerts, setStandingAlerts] = useState<AlertWithContext[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const isDark = useIsDark();
 
   // Subscribe to the floor in frame, not the whole building: the server fans
@@ -103,19 +104,42 @@ export function Dashboard({
   // arrive, but they only cover points that have reported since the page
   // opened — without this the building renders grey for the first seconds.
   useEffect(() => {
+    // Guarded like ZonePanel's, which had one while this did not: switching
+    // overlay quickly let a slower earlier response land after a newer one and
+    // colour the building by the metric that is no longer selected.
+    let cancelled = false;
+
     fetch(`/api/heatmap?buildingId=${tree.building.id}&metric=${overlay}&hours=1`)
-      .then((r) => r.json())
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`heatmap ${r.status}`))))
       .then((d: { zones: Array<ZoneProfile & { zoneId: string }> }) => {
+        if (cancelled) return;
         setBaseline(new Map(d.zones.map((z) => [z.zoneId, z])));
+        setLoadError(null);
       })
-      .catch(() => undefined);
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        // Was `.catch(() => undefined)`. A 401 or a 500 then produced an
+        // uncoloured building with nothing on screen saying why, which reads
+        // as "this building has no data" rather than "this request failed".
+        setLoadError(`Overlay data unavailable: ${(err as Error).message}`);
+      });
+
+    return () => { cancelled = true; };
   }, [tree.building.id, overlay]);
 
   useEffect(() => {
+    let cancelled = false;
     fetch('/api/alerts')
-      .then((r) => r.json())
-      .then((d: { alerts: AlertWithContext[] }) => setStandingAlerts(d.alerts))
-      .catch(() => undefined);
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`alerts ${r.status}`))))
+      .then((d: { alerts: AlertWithContext[] }) => {
+        if (!cancelled) setStandingAlerts(d.alerts);
+      })
+      .catch((err: unknown) => {
+        // An empty alert list and a failed request look identical on screen,
+        // and one of them means "nothing is wrong with the building".
+        if (!cancelled) setLoadError(`Alert list unavailable: ${(err as Error).message}`);
+      });
+    return () => { cancelled = true; };
   }, []);
 
   // Alerts raised since load are merged over the list fetched at open, so the
@@ -239,6 +263,16 @@ export function Dashboard({
             />
             {connected ? 'live' : 'reconnecting'}
           </span>
+          {loadError && (
+            <span
+              role="status"
+              title={loadError}
+              className="max-w-xs truncate rounded px-2 py-1"
+              style={{ background: 'rgba(209,67,67,0.15)', color: STATUS.critical }}
+            >
+              {loadError}
+            </span>
+          )}
           <ViewerMenu viewer={viewer} tenantName={tenantName} />
         </div>
       </header>

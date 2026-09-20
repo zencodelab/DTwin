@@ -48,13 +48,28 @@ export async function GET(request: Request) {
   const headers = { 'x-tenant-id': ctx.tenantId };
 
   try {
-    const run = await (await fetch(`${SIM_BASE}/runs/${runId}`, { headers })).json();
+    // `.ok` is checked before `.json()`. Without it a worker 404 or 500 parsed
+    // into an object with no `status`, the client saw a run that was not
+    // finished, and it polled for the full sixty seconds before reporting "run
+    // did not finish in time" — describing a timeout that had not happened.
+    const runRes = await fetch(`${SIM_BASE}/runs/${runId}`, { headers });
+    if (!runRes.ok) {
+      return NextResponse.json(
+        { error: `simulation worker returned ${runRes.status} for this run` },
+        { status: runRes.status === 404 ? 404 : 502 },
+      );
+    }
+    const run = await runRes.json();
     if (run.status !== 'completed') return NextResponse.json({ run });
 
-    const summary = await (
-      await fetch(`${SIM_BASE}/runs/${runId}/summary`, { headers })
-    ).json();
-    return NextResponse.json(summary);
+    const summaryRes = await fetch(`${SIM_BASE}/runs/${runId}/summary`, { headers });
+    if (!summaryRes.ok) {
+      return NextResponse.json(
+        { error: `summary unavailable (${summaryRes.status})`, run },
+        { status: 502 },
+      );
+    }
+    return NextResponse.json(await summaryRes.json());
   } catch (err) {
     return NextResponse.json(
       { error: `simulation worker unreachable: ${(err as Error).message}` },

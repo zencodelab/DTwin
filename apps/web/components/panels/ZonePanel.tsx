@@ -45,24 +45,32 @@ export function ZonePanel({
   const [detail, setDetail] = useState<ZoneDetail | null>(null);
   const [history, setHistory] = useState<Point[]>([]);
   const [selectedSensor, setSelectedSensor] = useState<Reading | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setDetail(null);
     setSelectedSensor(null);
     setHistory([]);
+    setError(null);
 
     fetch(`/api/zones/${zoneId}`)
-      .then((r) => r.json())
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`zone ${r.status}`))))
       .then((d: ZoneDetail) => {
         if (cancelled) return;
+        setError(null);
         setDetail(d);
         // Default to temperature: it is what a facility manager checks first.
         setSelectedSensor(
           d.readings.find((r) => r.metric === 'temperature_c') ?? d.readings[0] ?? null,
         );
       })
-      .catch(() => undefined);
+      .catch((err: unknown) => {
+        // Was swallowed, and `detail` stays null on failure — so the panel sat
+        // on "Loading zone…" for as long as anyone left it open, describing a
+        // request that had already finished.
+        if (!cancelled) setError((err as Error).message);
+      });
 
     return () => { cancelled = true; };
   }, [zoneId]);
@@ -72,7 +80,7 @@ export function ZonePanel({
     let cancelled = false;
 
     fetch(`/api/sensors/${selectedSensor.sensorId}/history?resolution=5m&hours=6`)
-      .then((r) => r.json())
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`history ${r.status}`))))
       .then((d: { buckets: Array<{ bucket: string; avgValue: number | null }> }) => {
         if (cancelled) return;
         setHistory(
@@ -81,10 +89,22 @@ export function ZonePanel({
             .map((b) => ({ t: new Date(b.bucket).getTime(), v: b.avgValue! })),
         );
       })
-      .catch(() => undefined);
+      .catch(() => {
+        // The sparkline is secondary: an empty one next to live readings is a
+        // reasonable degraded state, so this does not take over the panel.
+        if (!cancelled) setHistory([]);
+      });
 
     return () => { cancelled = true; };
   }, [selectedSensor]);
+
+  if (error) {
+    return (
+      <div className="p-4 text-sm" style={{ color: '#d14343' }}>
+        Could not load this zone — {error}
+      </div>
+    );
+  }
 
   if (!detail) {
     return <div className="p-4 text-sm" style={{ color: 'var(--text-muted)' }}>Loading zone…</div>;
