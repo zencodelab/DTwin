@@ -170,6 +170,24 @@ jobs:
             echo "up: $url"
           done
 
+          # "The process is listening" is not the precondition the web suite
+          # has. It reads the 5-minute rollup over a six-hour window, so it
+          # needs telemetry committed recently — and on a database minutes old,
+          # the only rows inside that window are the ones this simulator is
+          # writing right now. Waiting on /healthz alone let the suite start
+          # before the first flush, which is how it failed with 0 buckets while
+          # every other check passed.
+          #
+          # Several flushes, so every seeded sensor has landed at least once:
+          # one tick is ~190 rows across all of them.
+          for i in $(seq 1 60); do
+            written=$(curl -fsS http://localhost:8787/healthz | python3 -c \
+              'import json,sys; h=json.load(sys.stdin)["writer"]; print(h["written"] if h["flushes"] >= 3 else 0)')
+            [ "${written:-0}" -ge 500 ] && { echo "telemetry flowing: $written rows"; break; }
+            [ "$i" = 60 ] && { echo "timed out waiting for telemetry"; exit 1; }
+            sleep 2
+          done
+
       - name: Smoke — web
         run: npm run smoke -w @dtwin/web
 
