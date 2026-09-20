@@ -149,6 +149,23 @@ export class AlertEngine {
     }
     this.#bySensor = bySensor;
     this.#needHistory = needHistory;
+
+    // Drop debounce state for targets that no longer exist.
+    //
+    // #targetState is keyed per (rule, sensor) and only ever grew: a deleted
+    // rule, a deactivated sensor or a rule whose scope narrowed left its
+    // counters behind forever. Small per entry, unbounded over a long-running
+    // process with any rule churn — and `live` counts it, so the health
+    // endpoint would keep reporting alerts for targets that had gone.
+    //
+    // An entry with an open alert is kept regardless: the alert is still in the
+    // database, and forgetting its key here would mean never resolving it.
+    const current = new Set(this.#targets.map((t) => t.key));
+    for (const [key, state] of this.#targetState) {
+      if (!current.has(key) && state.openAlertId === null) {
+        this.#targetState.delete(key);
+      }
+    }
   }
 
   /** Hot path: record the reading, then evaluate the instantaneous rules. */

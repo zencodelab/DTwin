@@ -310,7 +310,16 @@ wss.on('connection', (socket: WebSocket) => {
   const id = randomUUID();
   pipeline.fanout.add({ id, socket, topics: new Set(), tenantId: null });
 
-  const reply = (message: ServerMessage) => socket.send(JSON.stringify(message));
+  // Guarded: a socket that closed between the handler starting and this line
+  // throws from inside an event handler, where there is no caller to catch it.
+  const reply = (message: ServerMessage) => {
+    if (socket.readyState !== socket.OPEN) return;
+    try {
+      socket.send(JSON.stringify(message));
+    } catch (err) {
+      console.error('[ingest] failed to reply on socket', err);
+    }
+  };
 
   let tenantId: string | null = null;
   const authDeadline = setTimeout(() => {

@@ -114,7 +114,7 @@ export class SensorRegistry {
       // that builds it does not.
       for (const tenant of await activeTenants()) {
         const { rows } = await withTenant({ tenantId: tenant.id }, (db) =>
-          db.query<RegisteredSensor>(REGISTRY_SQL).then((r) => r));
+          db.query<RegisteredSensor>(REGISTRY_SQL));
 
         for (const r of rows) {
           byExternalId.set(SensorRegistry.key(r.tenantId, r.externalId), r);

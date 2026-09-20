@@ -106,6 +106,30 @@ export async function getLatestReadingsForZone(
  * comes from counter_agg, which is reset-aware, so a meter rollover produces a
  * correct interval rather than a negative spike or a fictional megawatt.
  */
+/**
+ * Most buckets one request may return, per resolution.
+ *
+ * The span was unbounded: two years at `5m` is about 210,000 rows, serialised
+ * into a JSON response and handed to a sparkline that can draw a few hundred
+ * points. Nothing in the query or the route stopped it, so a caller could ask
+ * for it by accident — `?hours=17520` is a typo away from `?hours=1752`.
+ *
+ * The cap is a LIMIT rather than a rejection, and it takes the MOST RECENT
+ * buckets: a chart asking for more history than this should show the newest
+ * window it can rather than an error, and a caller that needs the older end
+ * asks for it by moving `to`.
+ *
+ * The response does not say it was truncated, which is a real limitation — a
+ * caller cannot tell a capped series from one that simply ends. Adding a flag
+ * means changing the return shape and the route's contract; worth doing when
+ * something needs to page, and not worth pretending is already there.
+ */
+const MAX_BUCKETS: Record<AggregateResolution, number> = {
+  '5m': 2_016,  // one week
+  '1h': 2_190,  // three months
+  '1d': 1_830,  // five years
+};
+
 export async function getSensorHistory(
   db: Db,
   sensorId: string,
@@ -126,9 +150,13 @@ export async function getSensorHistory(
        FROM ${view} a
        JOIN sensors s ON s.id = a.sensor_id
       WHERE a.sensor_id = $1 AND a.bucket >= $2 AND a.bucket < $3
-      ORDER BY bucket`,
-    [sensorId, from, to],
+      ORDER BY bucket DESC
+      LIMIT $4`,
+    [sensorId, from, to, MAX_BUCKETS[resolution]],
   );
+  // Selected newest-first so the LIMIT keeps the recent end, returned
+  // oldest-first because that is the order a chart draws.
+  rows.reverse();
   return rows as AggregateBucket[];
 }
 
