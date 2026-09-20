@@ -108,10 +108,28 @@ async function main(): Promise<void> {
 
     console.log('\n[4] Sensor history');
     const sensorId = detail.readings.find((r) => r.metric === 'temperature_c')!.sensorId;
-    const history = await getJson<{ buckets: Array<{ bucket: string; avgValue: number | null }> }>(
+    type History = { buckets: Array<{ bucket: string; avgValue: number | null }> };
+    const history = await getJson<History>(
       `/api/sensors/${sensorId}/history?resolution=5m&hours=6`,
     );
-    ok('history returns buckets', history.buckets.length > 0, `${history.buckets.length}`);
+
+    // When this comes back empty, "no buckets" is not a diagnosis. Widening the
+    // window and dropping to hourly separates the three things it could mean:
+    // the sensor has no data at all, the data is older than the window, or the
+    // 5-minute rollup is not covering the recent end of it.
+    let detailMsg = `${history.buckets.length}`;
+    if (history.buckets.length === 0) {
+      const [wide, hourly] = await Promise.all([
+        getJson<History>(`/api/sensors/${sensorId}/history?resolution=5m&hours=720`),
+        getJson<History>(`/api/sensors/${sensorId}/history?resolution=1h&hours=720`),
+      ]);
+      detailMsg = `0 in 6h; 5m/30d=${wide.buckets.length}`
+        + `${wide.buckets.length ? ` (latest ${wide.buckets.at(-1)!.bucket})` : ''}`
+        + `; 1h/30d=${hourly.buckets.length}`
+        + `${hourly.buckets.length ? ` (latest ${hourly.buckets.at(-1)!.bucket})` : ''}`
+        + `; sensor ${sensorId}; now ${new Date().toISOString()}`;
+    }
+    ok('history returns buckets', history.buckets.length > 0, detailMsg);
     ok('an invalid resolution is rejected',
        (await fetch(`${BASE}/api/sensors/${sensorId}/history?resolution=7m`)).status === 400);
 
