@@ -465,6 +465,12 @@ try {
 
   // ------------------------------------------------------- fault injection
   console.log('\n[5] Fault injection');
+  // Anchor on the last reading written BEFORE the fault, so the check can wait
+  // for readings that are unambiguously after it.
+  const { rows: [beforeFault] } = await pool.query<{ ts: Date | null }>(
+    'SELECT max("time") AS ts FROM telemetry WHERE sensor_id = $1', [probe.id]);
+  const faultAnchor = beforeFault?.ts ?? new Date(0);
+
   const faultRes = await postJson(`${BASE}/simulator/fault`,
     { sensorId: probe.id, kind: 'flatline' });
   ok('fault accepted', faultRes.status === 200);
@@ -472,23 +478,30 @@ try {
      (await postJson(`${BASE}/simulator/fault`,
        { externalId: 'nope', kind: 'flatline' })).status === 404);
 
-  await sleep(1500);
-  // The most recent readings, not "readings in the last second".
+  // Readings written strictly AFTER the fault, waited for rather than slept at.
   //
-  // A time window compares the reading's timestamp, which comes from the
-  // ingest process's clock, against now(), which is the database's. Under load
-  // those two skew, and the window then reaches back far enough to include a
-  // sample from before the fault took effect — which is how CI reported "2
-  // distinct across 4 readings" for a simulator that had flatlined correctly.
-  // The question is whether the latest samples stopped changing, so the query
-  // asks exactly that and no clock is involved.
-  const { rows: [flat] } = await pool.query(
-    `SELECT count(DISTINCT value) AS distinct_values, count(*) AS n
-       FROM (SELECT value FROM telemetry WHERE sensor_id = $1
-              ORDER BY time DESC LIMIT 4) recent`, [probe.id]);
+  // Two earlier versions of this check were timing assumptions wearing
+  // assertions. "Readings in the last second" compared the ingest process's
+  // clock against the database's, which skew under load. "The last four rows"
+  // removed the clocks but not the lag: readings are buffered and flushed on
+  // an interval, so the newest rows in the database trail the newest emitted,
+  // and a fixed sleep can leave a pre-fault sample among them. Both reported
+  // "2 distinct" for a simulator that had flatlined correctly.
+  //
+  // The question is whether the sensor stopped changing once faulted, so the
+  // query asks only about readings after the fault, and waits until there are
+  // enough of them to mean anything.
+  const flat = await until(
+    () => pool.query<{ distinctValues: number; n: number }>(
+      `SELECT count(DISTINCT value)::int AS "distinctValues", count(*)::int AS n
+         FROM telemetry WHERE sensor_id = $1 AND "time" > $2`,
+      [probe.id, faultAnchor],
+    ).then((r) => r.rows[0]!),
+    (r) => r.n >= 4,
+  );
   ok('flatlined sensor stops changing',
-     Number(flat.n) === 0 || Number(flat.distinct_values) <= 1,
-     `${flat.distinct_values} distinct across the last ${flat.n} readings`);
+     flat.distinctValues <= 1,
+     `${flat.distinctValues} distinct across ${flat.n} post-fault readings`);
   await del(`${BASE}/simulator/fault`);
 
   // ----------------------------------------------------------------- alerts
@@ -729,12 +742,20 @@ try {
      received[0]?.event === 'alert.raised' && !!received[0]?.alert?.message,
      received[0]?.alert?.message?.slice(0, 50));
 
+  // Wait for the rows to REACH a verdict, not merely to exist.
+  //
+  // The predicate used to be `rows.length >= 3`, which is satisfied the moment
+  // the notifier records its intent — before it has tried anything. The three
+  // status checks below then read `pending` and failed. They passed only
+  // because an unrelated fixed sleep earlier in the suite happened to give the
+  // dispatcher a head start; removing that sleep removed the margin, which is
+  // the kind of coupling a fixed sleep always hides.
   const delivery = await until(
     async () => (await pool.query(
       `SELECT channel, status, attempts, last_error FROM alert_notifications n
          JOIN alerts a ON a.id = n.alert_id WHERE a.rule_id = $1 ORDER BY channel`,
       [notifyRule])).rows,
-    (rows) => rows.length >= 3,
+    (rows) => rows.length >= 3 && rows.every((r) => r.status !== 'pending'),
   );
   const webhookRow = delivery.find((r) => r.channel === 'webhook');
   const emailRow = delivery.find((r) => r.channel === 'email');
