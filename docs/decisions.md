@@ -1043,6 +1043,11 @@ the chiller→AHU→VAV tree that the schema already holds in
 `equipment_zone_service`. That is the next piece of air-side work, and it wants
 its own decision rather than being smuggled in here.
 
+> **Superseded in part by [§59](#59-the-fan-turns-down-runs-for-ventilation-and-heats-the-air-it-moves).**
+> Fan heat and the part-load curve are now modelled; duct losses and the
+> distribution tree are not. The paragraph below is kept as written, including
+> its estimate of "a few percent" for fan heat, which turned out to be ten.
+
 **Also still not modelled:** fan heat into the supply air, which is a real gain
 of a few percent and introduces a feedback loop (more cooling, more air, more
 fan heat) that wants care rather than a line; duct leakage and thermal losses;
@@ -1529,3 +1534,77 @@ figures belong behind authentication, from the database.
 **Not done:** structured JSON logging with a correlation id from gateway to
 database. The services still log lines of text. And neither the worker nor the
 web service exposes metrics.
+
+---
+
+## 59. The fan turns down, runs for ventilation, and heats the air it moves
+
+§50 took fan power from the asset register and closed by listing what it still
+got wrong. Three of those are fixed here. They pull in different directions,
+which is the interesting part: **the old total looked plausible because its
+errors partly cancelled.** The same three-day Gulf June, one correction at a
+time:
+
+| | Fan kWh | HVAC kWh |
+|---|---|---|
+| As §50 left it: power linear in flow, fan on only with the coil, no fan heat | 3,147 | 11,150 |
+| + variable-speed part-load curve | 1,830 | 9,832 |
+| + runs whenever people are present, never below the VAV minimum | 2,783 | 10,785 |
+| + fan heat lands on the coil | 2,908 | 11,920 |
+
+The first row reproduces the previous release to the kilowatt-hour, which is
+what says the decomposition is measuring the changes and nothing else.
+
+**Power was linear in flow.** The register's 3.0 W per l/s is a *design-point*
+figure — 15 kW at 18,000 m³/h. Multiplying it by a part-load airflow says a fan
+moving half the air draws half the power. Shaft power goes near the cube of
+flow; with a duct static-pressure setpoint a real system lands between square
+and cube, about 30% at half flow. And §14 applies: the register lists 24 VAV
+terminals on 4 AHUs, each with an airflow and a damper-position point.
+Constant-volume fans contradicted the equipment list. **−42% fan energy.**
+
+**The fan only ran while the coil did.** But the zone balance has charged for
+ventilation air whenever people are present since the first version of the
+engine, and something moves that air. A fan that is off during occupied hours
+in the deadband, while outdoor air arrives anyway, is air moved for free. It now
+runs for ventilation or a coil call, and never below 30% of design flow — a VAV
+box does not close. **+52%.**
+
+**Fan heat went nowhere.** The motor and wheel sit in the airstream, so every
+watt drawn becomes heat in the supply air and the coil takes it out again. §50
+guessed "a few percent"; it is **+10.5% on HVAC**, because at 3.0 W per l/s
+against ~13 W per l/s of cooling carried, the system puts about a fifth on top
+of its own load.
+
+**§50 also warned that fan heat "introduces a feedback loop … that wants care
+rather than a line."** The care taken: the fan's *minimum* draw is known before
+the control decision — it depends only on whether anyone is present — so that
+much goes into the zone balance like any other gain, and the coil or the heating
+it offsets accounts for it with no special case. The part above the minimum
+depends on the cooling the balance decides; iterating on that would make the
+result depend on the integration step, which §22 exists to prevent. So it is
+charged where it lands instead: on the coil while cooling, and as heating the
+coil did not have to supply while heating. Nothing is solved in a circle, and
+end uses still sum to the total.
+
+**The curve is from the literature, and that is a disclosed break with §14.**
+The register gives the design point and says nothing about turn-down, so the
+curve is ASHRAE 90.1 Appendix G's part-load equation for a variable-speed fan
+with static-pressure reset — what a baseline building must be modelled with. It
+is an assumption about a fan nobody has measured. `HEAT_TO_AIRSTREAM_FRACTION`
+is 1.0, a motor in the airstream, which is how a packaged AHU is built.
+
+*Verified:* eight unit tests on the curve and turn-down with no database — full
+flow is design power, half flow is 30% and not 50%, a running fan holds the VAV
+minimum, a stopped one moves no air rather than its minimum. End to end, a mild
+week against the Gulf June: the coil has far less to do, the people are the
+same, and the fan's share of HVAC rises from 24% to 30%. Under the old rule that
+share was identical in every climate, because fan energy was cooling energy
+times a constant. Unmet hours stay at zero, so the extra load did not outrun the
+auto-sized plant.
+
+**Still not modelled:** duct leakage and thermal losses; the chiller→AHU→VAV
+tree, so airflow is still per zone rather than per air handler — four AHUs each
+see the *sum* of their zones, and a sum turns down less than its parts, so
+per-zone turn-down overstates the saving; and no economiser, which in a mild
+week is most of what a real plant would be doing.

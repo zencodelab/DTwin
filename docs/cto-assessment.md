@@ -100,9 +100,15 @@ measured requirement rather than precede the first dependable pilot.
 > ([§49](decisions.md#49-facade-orientation-is-derived-from-the-geometry-not-stored-beside-it)),
 > separate heating and cooling COPs and supply-fan energy
 > ([§50](decisions.md#50-the-air-side-comes-from-the-asset-register-and-the-register-is-ambiguous))
-> are all modelled now. Whole-building HVAC went from about 5,000 kWh to about
-> 11,000 over the same three days as a result, which is a fair measure of how
-> much a sensible-only, orientation-blind, fanless model was leaving out.
+> are all modelled now, and the fan turns down along a variable-speed curve,
+> runs for ventilation, and heats the air it moves
+> ([§59](decisions.md#59-the-fan-turns-down-runs-for-ventilation-and-heats-the-air-it-moves)).
+> Whole-building HVAC went from about 5,000 kWh to about 11,900 over the same
+> three days as a result, which is a fair measure of how much a sensible-only,
+> orientation-blind, fanless model was leaving out. §59 is also a caution about
+> reading that number: its three corrections moved HVAC by −12%, +10% and +11%
+> in turn, so the earlier total had looked plausible partly because its errors
+> cancelled.
 >
 > What has NOT changed is the section's conclusion: still no calibration
 > against a reference tool, still no measured baseline, and the run still does

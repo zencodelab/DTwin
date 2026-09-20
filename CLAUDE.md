@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **260 checks, all passing** (`db` 68, `ingest` 115, `sim` 54,
-`web` 23), plus **232 unit tests** (182 vitest, 50 pytest). CI runs types,
+Suites total **261 checks, all passing** (`db` 68, `ingest` 115, `sim` 55,
+`web` 23), plus **240 unit tests** (182 vitest, 58 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -191,6 +191,14 @@ service.
 - **Fan power and heating COP come from the register**, not from literature.
   Fan energy and latent energy are both **subsets** of `hvacKwh`, never
   additions to it.
+- **The register's specific fan power is a DESIGN-POINT figure** (`fans.py`,
+  `docs/decisions.md` §59). Never multiply it by a part-load airflow: apply it
+  at design flow and turn down along the variable-speed curve. The fan runs
+  whenever people are present (something moves the ventilation air the balance
+  charges for), never below the VAV minimum while running, and at zero — not
+  the minimum — while off. Its heat is a load: the minimum draw goes in
+  `q_net` because it is known before the control decision; the rest is charged
+  to the coil, NOT iterated on, or results would depend on the step (§22).
 - **`observed` weather fails loudly** when no rows exist. Never silently fall back
   to a synthetic day.
 - **Optional and nullable are different, and Pydantic writes both as null.**

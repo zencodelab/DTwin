@@ -255,6 +255,24 @@ try:
            f"fan={b['fanKwh']:.0f} of hvac={b['hvacKwh']:.0f} kWh "
            f"({100 * b['fanKwh'] / b['hvacKwh']:.0f}%, at 3.0 W per l/s)")
 
+        # The fan moves the ventilation air the balance has always charged for,
+        # so it runs when people are present whether or not the coil does
+        # (§59). A mild week shows it: the coil has far less to do, the people
+        # are the same, and the fan's share of HVAC must therefore RISE. Under
+        # the old rule — fan on only with the coil, power linear in flow — the
+        # share was the same in every climate, because fan energy was just
+        # cooling energy times a constant.
+        mild = simulate(client, scenarioName="smoke-mild", weather={
+            "mode": "synthetic", "peakDryBulbC": 24.0, "minDryBulbC": 15.0, "peakGhiW_m2": 600.0,
+        })["building"]
+        summer_share = b["fanKwh"] / b["hvacKwh"]
+        mild_share = mild["fanKwh"] / mild["hvacKwh"]
+        ok("the fan keeps moving ventilation air when the coil has little to do",
+           mild["fanKwh"] > 0 and mild["hvacKwh"] < b["hvacKwh"] and mild_share > summer_share * 1.15,
+           f"fan share of HVAC {100 * summer_share:.0f}% in a Gulf June, "
+           f"{100 * mild_share:.0f}% in a mild week "
+           f"(fan {mild['fanKwh']:.0f} of {mild['hvacKwh']:.0f} kWh)")
+
         ok("latent is a material share of cooling, and a subset of it",
            b["latentKwh"] is not None
            and 0.15 < b["latentKwh"] / b["hvacKwh"] < 0.65

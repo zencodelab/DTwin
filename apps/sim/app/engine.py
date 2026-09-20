@@ -33,7 +33,7 @@ from uuid import UUID
 
 import numpy as np
 
-from . import facade, psychro, repository, solar
+from . import facade, fans, psychro, repository, solar
 from . import weather as weather_mod
 from .config import settings
 from .models import SimulationRequest
@@ -332,6 +332,18 @@ def run(
     # rather than to invent a plausible number.
     sfp_w_per_l_s = repository.specific_fan_power_w_per_l_s(request.buildingId)
 
+    # The register's figure is a DESIGN-point figure, so it is applied at the
+    # design point: the airflow that carries each zone's installed cooling
+    # capacity. What the fan draws below that is `fans.py`'s business — it is
+    # emphatically not this number times a part-load airflow (§59).
+    if sfp_w_per_l_s is None:
+        design_fan_w = np.zeros(len(zones))
+    else:
+        design_airflow_l_s = (
+            arrays.capacity_w / (AIR_CP_J_KGK * SUPPLY_AIR_DELTA_T_K * AIR_DENSITY_KG_M3)
+        ) * 1000.0
+        design_fan_w = design_airflow_l_s * sfp_w_per_l_s
+
     temperature = arrays.setpoint.copy()
     interval_hours = request.intervalS / 3600.0
     dt = float(substep_s)
@@ -381,9 +393,21 @@ def run(
             )
             q_ventilation = ua_ventilation * delta_t
 
+            # The fan moves the ventilation air this balance has always charged
+            # for, so it runs whenever anyone is present, at the VAV minimum at
+            # least. That much is known before the control decision, and every
+            # watt of it ends up as heat in the airstream serving the zone — so
+            # it belongs in the balance, where the coil (or the heating it
+            # offsets) then accounts for it without a special case.
+            ventilating = occupants > 0.0
+            fan_floor_w = fans.fan_power_w(
+                np.where(ventilating, fans.MIN_FLOW_FRACTION, 0.0), design_fan_w
+            )
+
             q_net = (
                 q_solar + q_light + q_equip + q_people
                 + q_envelope + q_infiltration + q_ventilation
+                + fans.HEAT_TO_AIRSTREAM_FRACTION * fan_floor_w
             )
 
             # Latent load, kept OUT of q_net on purpose.
@@ -443,29 +467,31 @@ def run(
             # unconditioned building in this climate does.
             latent_met = np.where(cooling > 0.0, q_latent, 0.0)
 
-            # Air-side energy. HVAC was thermal load divided by COP, with no
-            # term for moving the air — and moving air is not free: the supply
-            # fan runs whenever the coil does, and at 3 W per l/s it is a
-            # visible share of the total rather than a rounding error.
-            #
-            # Airflow follows the SENSIBLE load, because that is what a
-            # temperature rise across the coil carries. Latent load rides on
-            # the same air and does not call for more of it.
-            if sfp_w_per_l_s is None:
-                fan_w = np.zeros_like(cooling)
-            else:
-                airflow_l_s = (
-                    cooling / (AIR_CP_J_KGK * SUPPLY_AIR_DELTA_T_K * AIR_DENSITY_KG_M3)
-                ) * 1000.0
-                fan_w = airflow_l_s * sfp_w_per_l_s
+            # Air-side energy (§50, §59). The fan runs for ventilation or for a
+            # coil call, turns down with the sensible load to the VAV minimum,
+            # and draws power along a variable-speed curve rather than in
+            # proportion to flow.
+            running = ventilating | (cooling > 0.0) | (heating > 0.0)
+            fan_w = fans.fan_power_w(
+                fans.flow_fraction(cooling, arrays.capacity_w, running), design_fan_w
+            )
 
-            # Not divided by COP: this is already electricity, not a thermal
-            # load a machine has to move.
+            # Fan heat above the floor already in q_net. It could not go into
+            # the balance: it depends on the cooling the balance decides, and
+            # solving that circle would make the result depend on the step. So
+            # it is charged where it lands — on the coil while cooling, and as
+            # heating the coil did not have to supply while heating.
+            fan_heat_extra = fans.HEAT_TO_AIRSTREAM_FRACTION * (fan_w - fan_floor_w)
+            coil_w = cooling + latent_met + np.where(cooling > 0.0, fan_heat_extra, 0.0)
+            heating_net = np.maximum(
+                heating - np.where(heating > 0.0, fan_heat_extra, 0.0), 0.0
+            )
+
+            # fan_w is not divided by COP: it is already electricity, not a
+            # thermal load a machine has to move.
             acc["fan"] += fan_w * kwh
             acc["hvac"] += (
-                (cooling + latent_met) / arrays.cop
-                + heating / arrays.heating_cop
-                + fan_w
+                coil_w / arrays.cop + heating_net / arrays.heating_cop + fan_w
             ) * kwh
             acc["latent"] += latent_met / arrays.cop * kwh
             acc["light"] += q_light * kwh
