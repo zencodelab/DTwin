@@ -263,10 +263,19 @@ try:
         # Two claims in one check, so the detail names both: a failure that
         # prints one number cannot say which half broke. CI hit this and the
         # message could not distinguish "COP did not help" from "plug load
-        # moved", which are very different bugs.
+        # moved", which are very different bugs. It was the second, and only
+        # beyond the sixth decimal place.
+        #
+        # Plug load is compared with a tolerance, like every other equality in
+        # this file — `==` was the one exception and it was an oversight, not
+        # strictness. `summarize()` sums float8 in SQL, float8 addition is not
+        # associative, and a parallel aggregate partitions the rows differently
+        # from run to run, so identical inputs can differ in the last bits. It
+        # passed on a two-core laptop that never chose a parallel plan and
+        # failed intermittently on CI, which is the signature of exactly that.
         ok("a better COP reduces HVAC electricity without changing the load",
            better_plant["building"]["hvacKwh"] < b["hvacKwh"]
-           and better_plant["building"]["plugKwh"] == b["plugKwh"],
+           and abs(better_plant["building"]["plugKwh"] - b["plugKwh"]) < 1e-6,
            f"hvac {better_plant['building']['hvacKwh']:.1f} vs {b['hvacKwh']:.1f} kWh"
            f" (margin {b['hvacKwh'] - better_plant['building']['hvacKwh']:+.3f});"
            f" plug {better_plant['building']['plugKwh']:.6f} vs {b['plugKwh']:.6f}")
