@@ -30,10 +30,10 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **197 checks, all passing** (`db` 58, `ingest` 84, `sim` 37,
-`web` 18), plus **83 unit tests** (vitest + pytest). CI runs types, lint and
-unit tests in one job and the four smoke suites against a real database in
-another.
+Suites total **199 checks, all passing** (`db` 58, `ingest` 86, `sim` 37,
+`web` 18), plus **83 unit tests** (57 vitest, 26 pytest). CI runs types,
+lint and unit tests in one job and the four smoke suites against a real
+timescaledb-ha:pg17 in another, and is green.
 
 **`sim:` topics are keyed by BUILDING, not by run** (`docs/decisions.md` §45).
 A run-keyed topic could never be authorised — the owner map is built from

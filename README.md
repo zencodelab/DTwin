@@ -1,5 +1,7 @@
 # DTwin
 
+[![CI](https://github.com/zencodelab/DTwin/actions/workflows/ci.yml/badge.svg)](https://github.com/zencodelab/DTwin/actions/workflows/ci.yml)
+
 A web-based Digital Twin platform for a single commercial building: stored
 spatial geometry, live IoT telemetry, thermal and energy simulation, and an
 interactive 3D dashboard for facility managers. The current model is seeded;
@@ -12,8 +14,9 @@ definitions and smoke suites. **All four packages are tenant-scoped** —
 tenant-scoped queries, row-level security, API-key and WebSocket-ticket
 authentication in `packages/db` and `apps/ingest`; session-resolved tenancy in
 `apps/web`; and a context-bound scope in the Python worker. The stack builds and
-runs end to end. The suites total **197 checks, all passing**, plus **83 unit
-tests**, and CI runs all of it.
+runs end to end. The suites total **199 checks, all passing**, plus
+**83 unit tests**, and [CI](.github/workflows/ci.yml) runs all of it on
+every push.
 
 The one defect the suite had been carrying is closed. `sim:<runId>` topics could
 never be subscribed to — the topic-owner map is keyed by spatial ids and has
