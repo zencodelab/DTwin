@@ -1228,3 +1228,80 @@ its own docstring already says why that is right for tens and wrong for
 thousands. The registry's spatial-id query is sized by zones rather than
 sensors and rides under the same practical ceiling. And none of this is rate
 limiting — a bound on one request says nothing about how many requests arrive.
+
+---
+
+## 54. Rate limits are per resource, keyed by whoever can exhaust it
+
+§53 bounded the size of one request and said in its last line that this is not
+rate limiting. A caller allowed 10,000 readings a request was allowed 10,000
+readings a thousand times a second.
+
+**One limiter keyed one way would have protected nothing well**, because the
+things worth protecting are exhausted by different parties:
+
+| Limit | Keyed by | Protects | Why that key |
+|---|---|---|---|
+| Failed authentication | calling address | the connection pool | the caller has no key to key on. Every key that does not resolve is still a query, on a ten-connection pool the telemetry writer shares — a stranger with nothing could slow ingest for every tenant |
+| Requests | API key | parse CPU | checked before the body is read |
+| Readings | **tenant** | the write buffer | see below |
+| WebSocket frames | connection | the owner-map walk a 64-topic `subscribe` costs | checked before the auth gate |
+| WebSocket connections | tenant | the fan-out loop | a ticket is signed, not stored, so it cannot be single-use |
+| Sign-in failures | email as typed, and address | scrypt | 100 ms and 32 MB each, by design |
+| Sign-in verifications in flight | — (a ceiling of 3) | memory, and libuv's thread pool | fifty at once are 1.6 GB however slowly they arrived. Three rather than four because scrypt shares libuv's four threads with hostname resolution, so four hashes leave none for opening a database connection |
+
+**The readings limit is a fairness mechanism, not a throttle.** The write
+buffer sheds its OLDEST rows on overflow (§12) and does not ask whose they are.
+So before this, one tenant's flood was every other tenant's data loss — the
+isolation that row-level security guarantees for reads did not exist for
+writes under load. It is per tenant rather than per key because a tenant can
+mint keys. A batch over budget is refused whole: a gateway can retry a batch
+but cannot know which half of one was kept.
+
+**Only failures are charged** on both authentication paths. The check comes
+before the expensive step — since that step is what is rationed — and the
+charge only when it fails, so a gateway with a good key and a person with the
+right password are never slowed by a limit that exists for callers with
+neither.
+
+**`X-Forwarded-For` is read from the right, or not at all.** Its first entry is
+whatever the caller typed; taking it lets a stranger choose the address their
+failures are charged to, which defeats the limit and spends someone else's. Only
+entries appended by proxies we operate are believed, and with none configured
+the header is ignored. The web service has no socket to fall back on — Next
+fills the header only when absent — so there the per-address limit is simply
+**off** until a trusted proxy is declared. A limit a caller can step around by
+changing a string is worse than none, because it reads as protection.
+
+**The 429 must not become an oracle.** `login()` goes to some length not to
+reveal whether an address exists. The sign-in limiter is keyed on the
+address as typed, never on whether it matched a user, so a 429 says nothing a
+401 did not.
+
+**The limiter's own memory is bounded**, since its keys are caller-supplied. At
+`maxKeys` it first drops buckets that have refilled completely — a full bucket
+and an absent one behave identically, so that loses nothing and needs no timer.
+If every key is mid-burst, which is what rotating keys looks like, newcomers
+**share one bucket**. Evicting an old key instead would hand its owner a fresh
+burst, making "fill the limiter" the way to defeat it; refusing new keys would
+let a stranger lock everyone out.
+
+**Costs.** State is per process, so N replicas admit N times the limit. That is
+tolerable because every resource above is per-process too; it would not be for
+a billing quota. The per-email limit lets anyone who knows an address slow its
+owner's sign-in by failing on purpose — it refills one attempt a minute, so the
+owner is delayed and never locked out, which is the difference between a rate
+limit and a denial-of-service feature. And every 429 carries `Retry-After`: a
+gateway told "no" without "until when" retries at once, and a limit that
+provokes a retry storm has made things worse.
+
+**Found on the way: `login()` held a database connection for the whole of the
+password hash.** One pooled connection, pinned for ~100 ms of CPU that needs no
+database at all, per attempt — ten concurrent sign-ins emptied the pool. The
+lookup, the verification and the session insert are now three steps, and only
+the first and last hold a connection. *Measured:* across 24 concurrent sign-ins
+the pool was fully idle in 0% of samples before and 98–99% after. The first
+version of that measurement read 54%, which is how the thread-pool contention
+in the table above was found: it was mostly watching connections being opened
+behind the hashes.
+

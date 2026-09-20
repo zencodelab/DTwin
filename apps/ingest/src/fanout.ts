@@ -86,6 +86,13 @@ export class Fanout {
     };
   }
 
+  /** Authenticated connections a tenant holds right now. */
+  connectionsFor(tenantId: string): number {
+    let count = 0;
+    for (const sub of this.#subscribers.values()) if (sub.tenantId === tenantId) count++;
+    return count;
+  }
+
   /** Bind an authenticated identity to a connection. */
   authenticate(subId: string, tenantId: string): boolean {
     const sub = this.#subscribers.get(subId);

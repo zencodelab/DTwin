@@ -192,6 +192,48 @@ async function main(): Promise<void> {
          (summary?.building?.totalKwh ?? 0) > 0,
          `${summary?.building?.totalKwh?.toFixed(0)} kWh`);
     }
+
+    console.log('\n[7] Sign-in limits');
+    // Addresses nobody has, fresh each run: the limiter is keyed on what was
+    // typed, so an invented address exercises it exactly as a real one would —
+    // which is the property that stops the 429 becoming an enumeration oracle.
+    const stamp = Date.now().toString(36);
+    const attempt = (email: string) => fetch(`${BASE}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email, password: 'not-the-password' }),
+    });
+
+    const target = `limit-${stamp}@example.invalid`;
+    const statuses: number[] = [];
+    let last: Response | null = null;
+    // Sequential, so the in-flight ceiling below is not what answers.
+    for (let i = 0; i < 12 && statuses.at(-1) !== 429; i += 1) {
+      last = await attempt(target);
+      statuses.push(last.status);
+    }
+    ok('repeated failures against one address are 401, then 429 with Retry-After',
+       statuses.length === 11
+         && statuses.slice(0, 10).every((c) => c === 401)
+         && statuses[10] === 429
+         && Number(last?.headers.get('retry-after')) > 0,
+       `${statuses.join(' ')} · retry-after ${last?.headers.get('retry-after')}s`);
+
+    const other = await attempt(`other-${stamp}@example.invalid`);
+    ok('a different address is unaffected — 401, not 429', other.status === 401, String(other.status));
+
+    // All at once, each to its own address so the per-email limit is not what
+    // answers. A verification is ~100 ms and 32 MB by design, so what matters
+    // is how many run TOGETHER, and a rate cannot express that.
+    const together = await Promise.all(
+      Array.from({ length: 16 }, (_, i) => attempt(`burst-${stamp}-${i}@example.invalid`)),
+    );
+    const ran = together.filter((r) => r.status === 401).length;
+    const turnedAway = together.filter((r) => r.status === 503).length;
+    ok('simultaneous verifications are capped, and the excess is 503 with Retry-After',
+       ran >= 1 && turnedAway >= 1 && ran + turnedAway === 16
+         && together.filter((r) => r.status === 503).every((r) => Number(r.headers.get('retry-after')) > 0),
+       `${ran} verified, ${turnedAway} turned away of 16`);
   } finally {
     await closePool();
   }

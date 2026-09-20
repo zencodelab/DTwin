@@ -154,6 +154,41 @@ const Env = z.object({
    * where a global secret cannot.
    */
 
+  /**
+   * Rate limits (docs/decisions.md §54, and `limits.ts` for what each protects).
+   *
+   * Defaults are sized from the seeded building, not from a guess: 190 points
+   * at speedup 10 is ~25 readings a second, so 20,000 a second is some 800
+   * buildings of that size behind one tenant before the limit is felt.
+   */
+  INGEST_RATE_REQUESTS_PER_S: z.coerce.number().positive().default(50),
+  INGEST_RATE_READINGS_PER_S: z.coerce.number().positive().default(20_000),
+  /**
+   * Must be at least the largest batch the schema admits (10,000), or a legal
+   * request could never be afforded — the limiter answers that with an
+   * infinite wait, and refusing to boot is kinder than that.
+   */
+  INGEST_RATE_READINGS_BURST: z.coerce.number().int().min(10_000,
+    'INGEST_RATE_READINGS_BURST must be at least the 10,000-reading batch ceiling').default(40_000),
+  INGEST_RATE_AUTH_FAILURES_PER_MIN: z.coerce.number().positive().default(30),
+  INGEST_RATE_AUTH_FAILURES_BURST: z.coerce.number().int().positive().default(20),
+  /** Most keys any one limiter tracks. Past it, new keys share a bucket. */
+  INGEST_RATE_MAX_KEYS: z.coerce.number().int().positive().default(10_000),
+  /**
+   * Reverse proxies WE operate between the internet and this service. Zero
+   * means `X-Forwarded-For` is ignored, which is the only safe reading of a
+   * header nobody trusted has written.
+   */
+  INGEST_TRUSTED_PROXY_HOPS: z.coerce.number().int().min(0).default(0),
+
+  WS_RATE_FRAMES_PER_S: z.coerce.number().positive().default(20),
+  /**
+   * A ticket is signed, not stored, so it cannot be made single-use: within
+   * its minute one ticket opens as many sockets as its holder likes. This is
+   * the bound on that.
+   */
+  WS_MAX_CONNECTIONS_PER_TENANT: z.coerce.number().int().positive().default(200),
+
   SIM_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
   SIM_TICK_MS: z.coerce.number().int().positive().default(1000),
   /**

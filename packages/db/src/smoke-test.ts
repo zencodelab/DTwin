@@ -16,11 +16,11 @@
  * not something to point at production. Run with:
  *   npm run smoke -w @dtwin/db
  */
-import { getOwnerPool, closePool, withTenant } from './client.ts';
+import { getOwnerPool, getPool, closePool, withTenant } from './client.ts';
 import {
   getSpatialTree, findZoneAtPoint, insertReadings, SPATIAL_LIMITS, SpatialTreeTooLargeError,
   getLatestReadingsForZone, getSensorHistory, getZoneHeatmap,
-  createTenant, listBuildings, getTenant,
+  createTenant, listBuildings, getTenant, createUser, addMember, login,
 } from './queries/index.ts';
 import {
   ClientMessage, TelemetryBatch, parseServerMessage,
@@ -416,6 +416,63 @@ const { rows: unscoped } = await owner.query<{ n: number }>(
 );
 ok('the owner pool still sees every building (it bypasses RLS, by design)',
    (unscoped[0]?.n ?? 0) >= 2, `got ${unscoped[0]?.n}`);
+
+console.log('\n[9] Sign-in');
+// `login()` had no coverage in any suite: the web smoke runs on the demo tenant
+// and never signs in. It is exercised here, against the real hash and the real
+// tables, while the fixture tenant still exists to be a member of.
+const signInEmail = `signin-${Date.now().toString(36)}@example.invalid`;
+const signInUser = await createUser(signInEmail, 'Sign-in Smoke', 'correct horse battery');
+await addMember(bTenantId, signInUser, 'viewer');
+
+const goodLogin = await login(signInEmail.toUpperCase(), 'correct horse battery');
+ok('the right password opens a session on the member tenant, case-insensitively',
+   goodLogin?.tenantId === bTenantId && goodLogin.role === 'viewer' && goodLogin.token.length >= 32);
+ok('a wrong password, an unknown address and a wrong tenant all answer the same null',
+   (await login(signInEmail, 'wrong')) === null
+   && (await login('nobody@example.invalid', 'correct horse battery')) === null
+   && (await login(signInEmail, 'correct horse battery', 'no-such-tenant')) === null);
+
+// The hash must not hold a database connection. It did: `login` was one
+// `withoutTenant` block, so each attempt pinned a pooled connection for ~100 ms
+// of CPU that needs no database, and ten concurrent sign-ins emptied the pool
+// for every other query in the process.
+//
+// Sampled, not timed. Twenty-four lookups starting together MUST queue for a
+// moment on a ten-connection pool, so "nobody ever waited" is the wrong
+// assertion (it was the first one written here, and it failed against correct
+// code). What distinguishes the two shapes is where the connections are while
+// the hashes run: under the old one all ten were checked out for the entire
+// stretch; now they are out for the few milliseconds of lookup at each end and
+// idle for the hundreds in between. The share of samples that found the pool
+// fully idle is a ratio of those durations, so it does not depend on how fast
+// the machine is — ~0% before, most of them now.
+const appPool = getPool();
+// Open the pool's connections first. Opening one resolves a hostname, which
+// libuv does on the same four-thread pool scrypt runs on — so a connection
+// requested mid-hash waits behind the hashes, and the first version of this
+// measurement read 54% idle because it was mostly watching connections being
+// established. Real, and worth knowing, but not what this check is about.
+await Promise.all(Array.from({ length: appPool.options.max ?? 10 }, () => appPool.query('SELECT 1')));
+let samples = 0;
+let idleSamples = 0;
+const sampler = setInterval(() => {
+  samples += 1;
+  if (appPool.totalCount - appPool.idleCount === 0 && appPool.waitingCount === 0) idleSamples += 1;
+}, 5);
+const concurrent = await Promise.all(
+  Array.from({ length: 24 }, () => login(signInEmail, 'wrong')),
+);
+clearInterval(sampler);
+const idleShare = samples === 0 ? 0 : idleSamples / samples;
+ok('no database connection is held while a password is being hashed',
+   concurrent.every((r) => r === null) && samples >= 10 && idleShare > 0.5,
+   `pool fully idle in ${(idleShare * 100).toFixed(0)}% of ${samples} samples across 24 concurrent sign-ins`);
+
+await owner.query('UPDATE users SET is_active = false WHERE id = $1', [signInUser]);
+ok('a deactivated user cannot sign in with the right password',
+   (await login(signInEmail, 'correct horse battery')) === null);
+await owner.query('DELETE FROM users WHERE id = $1', [signInUser]);
 
 // Clean up the fixture tenant. ON DELETE CASCADE from `tenants` removes its
 // building, floor, zone and sensor, which is itself worth asserting.

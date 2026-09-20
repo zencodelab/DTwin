@@ -1157,6 +1157,15 @@ try {
   await pool.query('DELETE FROM alert_rules WHERE name LIKE $1', ['smoke:%']);
 
   // --------------------------------------------------------------- shutdown
+  // Read before the shutdown below takes the server away. Everything above —
+  // simulator at 600x, ~1,300 lines of checks, deliberate bad keys — ran at the
+  // DEFAULT limits, and a limit an ordinary workload trips over is a bug in the
+  // limit. [12] reaches them on purpose, on a server configured to be reached.
+  const quiet = (await getJson<{ limits: Record<string, { refused: number }> }>(`${BASE}/healthz`)).limits;
+  ok('the whole suite ran at the default limits without meeting one',
+     Object.values(quiet).every((l) => l.refused === 0),
+     Object.entries(quiet).map(([k, v]) => `${k} ${v.refused}`).join(', '));
+
   console.log('\n[10] Graceful shutdown');
   // Put known rows in the buffer and signal before they can be flushed on the
   // interval, so the shutdown path is what carries them.
@@ -1257,8 +1266,173 @@ try {
      refused.code !== 0 && refused.stderr.includes('INGEST_REGISTRY_MAX_SENSORS'),
      `exit ${refused.code}; ${refused.stderr.includes('would exceed') ? 'named the limit' : 'no explanation'}`);
 
+  console.log('\n[12] Rate limits');
+  // A second server with limits tight enough to reach in a test. The suite
+  // above ran at the defaults and must not have met one — which is itself the
+  // first assertion: a limit a normal workload trips over is a bug.
+  const LIMITED = `http://127.0.0.1:${PORT + 2}`;
+  const limited = spawn(tsxBin, [join(here, 'server.ts')], {
+    env: {
+      ...process.env, AUTH_SECRET,
+      INGEST_PORT: String(PORT + 2),
+      SIM_ENABLED: 'false',
+      ALERT_ENABLED: 'false',
+      INGEST_RATE_READINGS_PER_S: '1',
+      INGEST_RATE_READINGS_BURST: '10000',
+      INGEST_RATE_REQUESTS_PER_S: '5',
+      INGEST_RATE_AUTH_FAILURES_PER_MIN: '1',
+      INGEST_RATE_AUTH_FAILURES_BURST: '3',
+      WS_RATE_FRAMES_PER_S: '2',
+      WS_MAX_CONNECTIONS_PER_TENANT: '2',
+    },
+    stdio: ['ignore', 'ignore', 'inherit'],
+  });
+
+  try {
+    await until(
+      () => fetch(`${LIMITED}/healthz`).then(() => true, () => false),
+      (up) => up, 30_000,
+    );
+
+    const tenantB = await createTenant(`smoke-rl-${Date.now().toString(36)}`, 'Smoke Rate Limit B');
+    const keyB = (await createApiKey(tenantB, 'device', 'smoke-rl-device', ['ingest:write'])).key;
+    const batch = (n: number) => ({
+      readings: Array.from({ length: n }, () => ({ externalId: 'rate-limit-probe', value: 1 })),
+    });
+    const post = (key: string, body: unknown) => fetch(`${LIMITED}/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify(body),
+    });
+
+    // ---- readings, per tenant
+    const first = await post(deviceKey, batch(6_000));
+    const second = await post(deviceKey, batch(6_000));
+    const secondBody = await second.json() as { retryAfterS?: number };
+    ok('a tenant within its reading budget is accepted', first.status === 202, `HTTP ${first.status}`);
+    ok('the batch that would exceed it is refused whole, with Retry-After',
+       second.status === 429
+         && Number(second.headers.get('retry-after')) > 0
+         && secondBody.retryAfterS === Number(second.headers.get('retry-after')),
+       `HTTP ${second.status}, retry-after ${second.headers.get('retry-after')}s`);
+
+    // The point of keying by tenant: A exhausting its budget costs B nothing.
+    // Before this limit the only back-pressure was the write buffer shedding
+    // its oldest rows, which does not look at whose they are.
+    const bystander = await post(keyB, batch(6_000));
+    ok("another tenant's budget is untouched by the first tenant's flood",
+       bystander.status === 202, `HTTP ${bystander.status}`);
+
+    // A second key for the same tenant draws on the SAME budget, or a tenant
+    // would multiply its share by minting keys.
+    const secondKeyA = (await createApiKey(TENANT, 'device', `smoke-rl-a2-${Date.now()}`,
+      ['ingest:write'])).key;
+    const viaSecondKey = await post(secondKeyA, batch(6_000));
+    ok('a second key for the same tenant shares its budget', viaSecondKey.status === 429,
+       `HTTP ${viaSecondKey.status}`);
+
+    // ---- requests, per key
+    const burst = await Promise.all(Array.from({ length: 30 }, () => post(keyB, batch(1))));
+    const refusedRequests = burst.filter((r) => r.status === 429).length;
+    ok('requests past the per-key rate are refused before the body is parsed',
+       refusedRequests > 0 && refusedRequests < 30,
+       `${30 - refusedRequests} accepted, ${refusedRequests} refused of 30`);
+
+    // ---- WebSocket frames, per connection
+    const flooded = await new Promise<{ code: number; sawError: boolean }>((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${PORT + 2}/ws`);
+      let sawError = false;
+      const timer = setTimeout(() => reject(new Error('flooded socket was never closed')), 10_000);
+      socket.on('open', () => {
+        for (let i = 0; i < 40; i += 1) socket.send(JSON.stringify({ type: 'ping', ts: i }));
+      });
+      socket.on('message', (data: Buffer) => {
+        const parsed = parseServerMessage(data.toString());
+        if (parsed.ok && parsed.message.type === 'error' && parsed.message.code === 'rate_limited') {
+          sawError = true;
+        }
+      });
+      socket.on('close', (code) => { clearTimeout(timer); resolve({ code, sawError }); });
+      socket.on('error', () => {});
+    });
+    ok('a socket flooding frames is told why and closed, not silently dropped',
+       flooded.sawError && flooded.code === 1008, `close code ${flooded.code}`);
+
+    // ---- WebSocket connections, per tenant
+    const held: WebSocket[] = [];
+    const openLimited = (tenantId: string) => new Promise<'authenticated' | string>((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${PORT + 2}/ws`);
+      const timer = setTimeout(() => reject(new Error('no answer to auth')), 10_000);
+      held.push(socket);
+      socket.on('open', () => socket.send(JSON.stringify({
+        type: 'auth', ticket: signWsTicket({ tenantId, userId: ACTING_USER }),
+      })));
+      socket.on('message', (data: Buffer) => {
+        const parsed = parseServerMessage(data.toString());
+        if (!parsed.ok) return;
+        if (parsed.message.type === 'authenticated') { clearTimeout(timer); resolve('authenticated'); }
+        if (parsed.message.type === 'error') { clearTimeout(timer); resolve(parsed.message.code); }
+      });
+      socket.on('error', () => {});
+    });
+    const one = await openLimited(TENANT);
+    const two = await openLimited(TENANT);
+    const three = await openLimited(TENANT);
+    const otherTenantSocket = await openLimited(tenantB);
+    ok('a tenant at its connection ceiling is refused another socket',
+       one === 'authenticated' && two === 'authenticated' && three === 'too_many_connections',
+       `${one}, ${two}, ${three}`);
+    ok('and the ceiling is per tenant, not per service', otherTenantSocket === 'authenticated',
+       otherTenantSocket);
+    for (const socket of held) socket.close();
+
+    // ---- failed authentication, per address. LAST, because it is meant to
+    // lock this address out, good key or not.
+    const bad = () => post('not-a-real-key-'.padEnd(43, 'x'), batch(1));
+    const failures401 = [await bad(), await bad(), await bad()].map((r) => r.status);
+    const fourth = await bad();
+    ok('failed authentication is rationed per address',
+       failures401.every((c) => c === 401) && fourth.status === 429
+         && Number(fourth.headers.get('retry-after')) > 0,
+       `${failures401.join(', ')}, then ${fourth.status}`);
+
+    // The check precedes the lookup, because the lookup is what is rationed —
+    // so a good key from a locked-out address is refused too, without a query.
+    // That is the cost of protecting the pool, and it is why only FAILURES are
+    // charged: this address got here by failing, not by being busy.
+    const goodKeyLockedOut = await post(keyB, batch(1));
+    ok('a locked-out address is refused before any key is looked up',
+       goodKeyLockedOut.status === 429, `HTTP ${goodKeyLockedOut.status}`);
+
+    ok('/healthz stays open to a locked-out address, and reports the refusals',
+       await (async () => {
+         const health = await (await fetch(`${LIMITED}/healthz`)).json() as {
+           limits: Record<string, { refused: number }>;
+         };
+         return health.limits.authFailures!.refused >= 2
+           && health.limits.readings!.refused >= 2
+           && health.limits.requests!.refused >= 1
+           && health.limits.frames!.refused >= 1;
+       })());
+
+    await pool.query('DELETE FROM tenants WHERE id = $1', [tenantB]);
+  } finally {
+    // SIGTERM, and wait. `tsx` runs the server as a CHILD of the process this
+    // handle points at; it forwards SIGTERM but cannot forward SIGKILL, so
+    // killing the wrapper outright orphans the real server — still listening,
+    // and still holding this suite's stderr open, which is how the first run of
+    // this section passed every check and then never returned.
+    const exited = new Promise<void>((resolve) => limited.once('exit', () => resolve()));
+    limited.kill('SIGTERM');
+    await Promise.race([exited, sleep(10_000)]);
+    ok('the rate-limited server shut down when asked', await waitForPortFree(PORT + 2),
+       `port ${PORT + 2}`);
+  }
+
 } finally {
-  server?.kill('SIGKILL');
+  // SIGTERM: tsx forwards it to the real server; it cannot forward SIGKILL, which
+  // would orphan that process on any path that throws before [10].
+  server?.kill('SIGTERM');
   await closePool();
 }
 

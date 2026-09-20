@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { LoginRequest } from '@dtwin/types';
 import { login } from '@dtwin/db/queries';
 import { SESSION_COOKIE, cookieOptions } from '@/lib/tenant';
+import { addressOf, loginLimits, withVerificationSlot } from '@/lib/login-limits';
 
 export const dynamic = 'force-dynamic';
 
@@ -19,7 +20,18 @@ export const dynamic = 'force-dynamic';
  * The token is never handed to JavaScript. It goes straight into an HttpOnly
  * cookie, which is also why ingest gets a separate short-lived signed ticket
  * rather than this value — the page cannot read this one to forward it.
+ *
+ * Attempts are rationed (`lib/login-limits.ts`). The 429 is as uninformative as
+ * the 401: it is keyed on what was typed, not on whether it matched anyone.
  */
+function tooMany(retryAfterS: number, status: 429 | 503 = 429) {
+  const seconds = Number.isFinite(retryAfterS) ? Math.max(1, retryAfterS) : 60;
+  return NextResponse.json(
+    { error: 'Too many sign-in attempts. Try again shortly.', retryAfterS: seconds },
+    { status, headers: { 'retry-after': String(seconds) } },
+  );
+}
+
 export async function POST(request: Request) {
   let parsed;
   try {
@@ -32,8 +44,26 @@ export async function POST(request: Request) {
   }
 
   const { email, password, tenantSlug } = parsed.data;
-  const result = await login(email, password, tenantSlug);
+  const emailKey = email.trim().toLowerCase();
+  const address = addressOf(request);
+
+  // Checked before the hash is computed, since the hash is what is rationed.
+  const byEmail = loginLimits.perEmail.exhausted(emailKey);
+  if (!byEmail.ok) return tooMany(byEmail.retryAfterS);
+  if (address) {
+    const byAddress = loginLimits.perAddress.exhausted(address);
+    if (!byAddress.ok) return tooMany(byAddress.retryAfterS);
+  }
+
+  const attempt = await withVerificationSlot(() => login(email, password, tenantSlug));
+  // 503, not 429: this caller did nothing wrong, the service is simply at the
+  // number of verifications it will run at once.
+  if (!attempt.ran) return tooMany(1, 503);
+
+  const result = attempt.value;
   if (!result) {
+    loginLimits.perEmail.take(emailKey);
+    if (address) loginLimits.perAddress.take(address);
     return NextResponse.json({ error: 'Incorrect email or password.' }, { status: 401 });
   }
 

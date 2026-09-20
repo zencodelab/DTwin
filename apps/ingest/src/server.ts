@@ -3,10 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { closePool, verifyWsTicket } from '@dtwin/db';
 import {
-  RawTelemetryBatch, SimEvent, parseClientMessage, topics, type ServerMessage,
+  RawTelemetryBatch, SimEvent, clientAddress, parseClientMessage, topics, type ServerMessage,
 } from '@dtwin/types';
 import { listAlerts } from './rules/store.ts';
-import { authenticate } from './auth.ts';
+import { authenticate, type AuthFailure } from './auth.ts';
+import { createLimits } from './limits.ts';
 import { loadConfig } from './config.ts';
 import { Pipeline } from './pipeline.ts';
 import { DeviceSimulator, FAULT_KINDS, isFaultKind } from './simulator/index.ts';
@@ -29,6 +30,7 @@ import { DeviceSimulator, FAULT_KINDS, isFaultKind } from './simulator/index.ts'
 
 const config = loadConfig();
 const pipeline = new Pipeline(config);
+const limits = createLimits(config);
 
 const simulator = new DeviceSimulator(config, pipeline.registry, (readings) => {
   pipeline.ingestResolved(readings);
@@ -87,13 +89,41 @@ function asObject(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function send(res: ServerResponse, status: number, body: unknown): void {
+function send(
+  res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {},
+): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
+    ...headers,
   });
   res.end(payload);
+}
+
+/**
+ * 429 always carries Retry-After. A gateway that is told "no" and not "until
+ * when" retries immediately, and a rate limit that provokes a retry storm has
+ * made the thing it was for worse.
+ */
+function tooMany(res: ServerResponse, error: string, retryAfterS: number): void {
+  const seconds = Number.isFinite(retryAfterS) ? Math.max(1, retryAfterS) : 3600;
+  send(res, 429, { error, retryAfterS: seconds }, { 'retry-after': String(seconds) });
+}
+
+function refuse(res: ServerResponse, failure: AuthFailure): void {
+  if (failure.status === 429) return tooMany(res, failure.error, failure.retryAfterS ?? 60);
+  send(res, failure.status, { error: failure.error });
+}
+
+/** `authenticate`, with failures rationed per calling address. */
+function auth(req: IncomingMessage, scope: Parameters<typeof authenticate>[1]) {
+  return authenticate(req, scope, {
+    limiter: limits.authFailures,
+    address: clientAddress(
+      req.socket.remoteAddress, req.headers['x-forwarded-for'], config.INGEST_TRUSTED_PROXY_HOPS,
+    ),
+  });
 }
 
 const httpServer = createServer((req, res) => {
@@ -127,13 +157,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return send(res, healthy ? 200 : 503, {
         status: healthy ? 'ok' : 'degraded',
         ...stats,
+        // Refusals are counted where shed load already is. A limit nobody can
+        // see firing is indistinguishable from one set too high to matter.
+        limits: {
+          authFailures: limits.authFailures.stats,
+          requests: limits.requests.stats,
+          readings: limits.readings.stats,
+          frames: limits.frames.stats,
+        },
         simulator: config.SIM_ENABLED ? simulator.stats : { enabled: false as const },
       });
     }
 
     case 'POST /ingest': {
-      const auth = await authenticate(req, 'ingest:write');
-      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+      const who = await auth(req, 'ingest:write');
+      if (!who.ok) return refuse(res, who.failure);
+
+      // Requests per key, checked before the body is read: parsing is the cost
+      // this one rations, so it has to come before the parse.
+      const keyId = who.principal.kind === 'api_key' ? who.principal.apiKeyId : who.principal.tenantId;
+      const request = limits.requests.take(keyId);
+      if (!request.ok) return tooMany(res, 'request rate exceeded for this key', request.retryAfterS);
 
       // Authenticate BEFORE parsing. Parsing an 8 MB body for a caller with no
       // valid key is work an unauthenticated stranger gets to make us do.
@@ -147,15 +191,24 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
           issues: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
         });
       }
-      const result = pipeline.ingestRaw(auth.principal.tenantId, parsed.data);
+      // Readings per TENANT, weighted by the batch. The write buffer sheds its
+      // oldest rows on overflow without asking whose they are, so without this
+      // one tenant's flood is every other tenant's data loss. The whole batch
+      // is refused rather than part of it admitted: a gateway can retry a
+      // batch, but cannot know which half of one was kept.
+      const budget = limits.readings.take(who.principal.tenantId, parsed.data.readings.length);
+      if (!budget.ok) {
+        return tooMany(res, 'reading rate exceeded for this tenant', budget.retryAfterS);
+      }
+      const result = pipeline.ingestRaw(who.principal.tenantId, parsed.data);
       // 202, not 200: the readings are buffered, not yet durable. Claiming
       // otherwise would be a lie the writer cannot back up.
       return send(res, 202, result);
     }
 
     case 'POST /internal/sim-event': {
-      const auth = await authenticate(req, 'sim:notify');
-      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+      const who = await auth(req, 'sim:notify');
+      if (!who.ok) return refuse(res, who.failure);
 
       const json = await readJson(req);
       if (!json.ok) return send(res, json.status, { error: json.error });
@@ -174,7 +227,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       // refuse — a service key must not be usable to push a fabricated event
       // into someone else's dashboard by naming their building id.
       const owner = pipeline.registry.ownerOf(topics.building(event.buildingId));
-      if (owner !== auth.principal.tenantId) {
+      if (owner !== who.principal.tenantId) {
         return send(res, 403, { error: 'building does not belong to this tenant' });
       }
 
@@ -192,8 +245,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     case 'POST /internal/notify-sweep': {
-      const auth = await authenticate(req, 'ingest:write');
-      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+      const who = await auth(req, 'ingest:write');
+      if (!who.ok) return refuse(res, who.failure);
 
       // Run the notification sweep now rather than at the next interval.
       //
@@ -210,19 +263,19 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     case 'GET /alerts': {
-      const auth = await authenticate(req, 'ingest:write');
-      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+      const who = await auth(req, 'ingest:write');
+      if (!who.ok) return refuse(res, who.failure);
 
       const state = url.searchParams.get('state');
       const filter = state === 'live' || state === 'resolved' ? state : undefined;
       return send(res, 200, {
-        alerts: await listAlerts(auth.principal.tenantId, filter),
+        alerts: await listAlerts(who.principal.tenantId, filter),
       });
     }
 
     case 'POST /alerts/ack': {
-      const auth = await authenticate(req, 'ingest:write');
-      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+      const who = await auth(req, 'ingest:write');
+      if (!who.ok) return refuse(res, who.failure);
 
       // `by` is no longer accepted from the body. It used to be, which made the
       // acknowledgement trail worth nothing: anyone could acknowledge an alert
@@ -243,7 +296,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }
 
       const alert = await pipeline.alerts.acknowledge(
-        auth.principal.tenantId, alertId, actingUser);
+        who.principal.tenantId, alertId, actingUser);
       // 409, not 404: the alert exists but is no longer open, which is a
       // different thing for a caller to handle than a bad id. An alert in
       // ANOTHER tenant also lands here rather than 404 — deliberately, since
@@ -254,8 +307,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     case 'POST /simulator/fault': {
-      const auth = await authenticate(req, 'ingest:write');
-      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+      const who = await auth(req, 'ingest:write');
+      if (!who.ok) return refuse(res, who.failure);
 
       const json = await readJson(req);
       if (!json.ok) return send(res, json.status, { error: json.error });
@@ -267,11 +320,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const found = sensorIdArg
         ? pipeline.registry.byId(sensorIdArg)
         : externalIdArg
-          ? pipeline.registry.lookup(auth.principal.tenantId, externalIdArg)
+          ? pipeline.registry.lookup(who.principal.tenantId, externalIdArg)
           : undefined;
       // A sensor id from another tenant reads as unknown, not forbidden: this
       // route must not become a way to probe which ids exist elsewhere.
-      const sensor = found?.tenantId === auth.principal.tenantId ? found : undefined;
+      const sensor = found?.tenantId === who.principal.tenantId ? found : undefined;
       if (!sensor) return send(res, 404, { error: 'unknown sensor' });
 
       if (!isFaultKind(body.kind)) {
@@ -286,16 +339,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     case 'DELETE /simulator/fault': {
-      const auth = await authenticate(req, 'ingest:write');
-      if (!auth.ok) return send(res, auth.failure.status, { error: auth.failure.error });
+      const who = await auth(req, 'ingest:write');
+      if (!who.ok) return refuse(res, who.failure);
 
       const sensorId = url.searchParams.get('sensorId');
       if (!sensorId) {
-        simulator.clearFaultsForTenant(auth.principal.tenantId, pipeline.registry);
+        simulator.clearFaultsForTenant(who.principal.tenantId, pipeline.registry);
         return send(res, 200, { cleared: 'all for tenant' });
       }
       const sensor = pipeline.registry.byId(sensorId);
-      if (sensor?.tenantId !== auth.principal.tenantId) {
+      if (sensor?.tenantId !== who.principal.tenantId) {
         return send(res, 404, { error: 'unknown sensor' });
       }
       return send(res, 200, { cleared: simulator.clearFault(sensorId) });
@@ -348,6 +401,18 @@ wss.on('connection', (socket: WebSocket) => {
   }, AUTH_GRACE_MS);
 
   socket.on('message', (data) => {
+    // Rationed before it is parsed, and before the auth gate: an unauthenticated
+    // socket can send frames for the whole grace period, and a `subscribe` frame
+    // carries up to 64 topics to authorise. The connection is CLOSED rather than
+    // the frame dropped — a dashboard sends a handful of frames per session, so
+    // a socket over this rate is not a dashboard, and a silently dropped
+    // `subscribe` would leave a real client waiting on data that is not coming.
+    if (!limits.frames.take(id).ok) {
+      reply({ type: 'error', code: 'rate_limited', message: 'too many frames; closing' });
+      socket.close(1008, 'rate limit');
+      return;
+    }
+
     const parsed = parseClientMessage(data.toString());
     if (!parsed.ok) {
       // A malformed frame is an expected condition on a public socket, not a
@@ -366,6 +431,17 @@ wss.on('connection', (socket: WebSocket) => {
         // that their signature was fine but stale is free information.
         reply({ type: 'error', code: 'auth_failed', message: 'invalid or expired ticket' });
         socket.close();
+        return;
+      }
+      // A ticket is signed rather than stored, so it cannot be single-use, and
+      // within its minute it opens as many sockets as its holder cares to.
+      // Each one is a subscriber the fan-out walks on every tick.
+      if (pipeline.fanout.connectionsFor(ticket.tenantId) >= config.WS_MAX_CONNECTIONS_PER_TENANT) {
+        reply({
+          type: 'error', code: 'too_many_connections',
+          message: `this tenant already holds ${config.WS_MAX_CONNECTIONS_PER_TENANT} connections`,
+        });
+        socket.close(1013, 'too many connections');
         return;
       }
       tenantId = ticket.tenantId;

@@ -1,6 +1,6 @@
 import type { IncomingMessage } from 'node:http';
 import { resolveApiKey } from '@dtwin/db';
-import { hasScope, type ApiScope, type Principal } from '@dtwin/types';
+import { hasScope, type ApiScope, type KeyedLimiter, type Principal } from '@dtwin/types';
 
 /**
  * Request authentication for the ingest service.
@@ -31,8 +31,16 @@ export function extractKey(req: IncomingMessage): string | null {
 }
 
 export interface AuthFailure {
-  status: 401 | 403;
+  status: 401 | 403 | 429;
   error: string;
+  /** Present on 429. */
+  retryAfterS?: number;
+}
+
+/** Where failures are counted, and against whom. */
+export interface FailureBudget {
+  limiter: KeyedLimiter;
+  address: string;
 }
 
 /**
@@ -44,22 +52,47 @@ export interface AuthFailure {
  * 401 and 403 are kept distinct because they tell the operator different
  * things — a wrong key versus a key that is real but not allowed to do this.
  * Neither response says which tenant the key belongs to.
+ *
+ * With a `budget`, failures are rationed per address — and the check comes
+ * BEFORE the lookup, because the lookup is the thing being protected: every
+ * key that does not resolve is still a query on a pool the telemetry writer
+ * shares. Only failures are charged. A 403 counts as one; it cost the same
+ * query, and a key being tried against routes it is not scoped for is not
+ * traffic to be generous with.
  */
 export async function authenticate(
   req: IncomingMessage,
   scope: ApiScope,
+  budget?: FailureBudget,
 ): Promise<{ ok: true; principal: Principal } | { ok: false; failure: AuthFailure }> {
+  if (budget) {
+    const allowed = budget.limiter.exhausted(budget.address);
+    if (!allowed.ok) {
+      return {
+        ok: false,
+        failure: {
+          status: 429,
+          error: 'too many failed authentication attempts from this address',
+          retryAfterS: allowed.retryAfterS,
+        },
+      };
+    }
+  }
+
   const key = extractKey(req);
   if (!key) {
+    // Not charged: no lookup was made, so nothing was spent.
     return { ok: false, failure: { status: 401, error: 'missing API key' } };
   }
 
   const principal = await resolveApiKey(key);
   if (!principal) {
+    budget?.limiter.take(budget.address);
     return { ok: false, failure: { status: 401, error: 'invalid API key' } };
   }
 
   if (!hasScope(principal, scope)) {
+    budget?.limiter.take(budget.address);
     return {
       ok: false,
       failure: { status: 403, error: `key is not scoped for ${scope}` },

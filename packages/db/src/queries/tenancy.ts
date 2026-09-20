@@ -34,6 +34,17 @@ const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
  *
  * A password is verified even when no user matched, against a dummy hash, so
  * the response time does not reveal whether the address exists.
+ *
+ * Three steps, and only the first and last hold a database connection. This
+ * was one `withoutTenant` block, which pinned a pooled connection for the
+ * whole of the hash — ~100 ms of CPU that needs no database at all. Ten
+ * concurrent sign-ins emptied a ten-connection pool, so the cheapest thing a
+ * stranger could do to the dashboard was type wrong passwords at it
+ * (docs/decisions.md §54).
+ *
+ * The user row is read again in the last step rather than trusted from the
+ * first: the connection was given back in between, and an account deactivated
+ * during the hash must not get a session out of a lookup made before it.
  */
 const ABSENT_USER_HASH =
   'scrypt$32768$8$1$AAAAAAAAAAAAAAAAAAAAAA$' +
@@ -44,7 +55,7 @@ export async function login(
   password: string,
   tenantSlug?: string,
 ): Promise<LoginResult | null> {
-  return withoutTenant(async (db) => {
+  const user = await withoutTenant(async (db) => {
     const { rows } = await db.query<{
       id: string; passwordHash: string | null; isActive: boolean;
     }>(
@@ -52,11 +63,14 @@ export async function login(
          FROM users WHERE lower(email) = lower($1)`,
       [email],
     );
+    return rows[0];
+  });
 
-    const user = rows[0];
-    const ok = await verifyPassword(password, user?.passwordHash ?? ABSENT_USER_HASH);
-    if (!user || !ok || !user.isActive) return null;
+  // No connection is held here.
+  const ok = await verifyPassword(password, user?.passwordHash ?? ABSENT_USER_HASH);
+  if (!user || !ok || !user.isActive) return null;
 
+  return withoutTenant(async (db) => {
     // Which tenant this session activates. Named slug if given, otherwise the
     // membership the user has held longest — stable across logins, which an
     // arbitrary "first row" would not be.
@@ -64,7 +78,9 @@ export async function login(
       `SELECT m.tenant_id AS "tenantId", m.role
          FROM tenant_members m
          JOIN tenants t ON t.id = m.tenant_id
+         JOIN users u   ON u.id = m.user_id
         WHERE m.user_id = $1
+          AND u.is_active
           AND t.status = 'active'
           AND ($2::text IS NULL OR t.slug = $2)
         ORDER BY m.created_at

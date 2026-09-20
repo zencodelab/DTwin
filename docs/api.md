@@ -52,7 +52,7 @@ Source: [ingest server](../apps/ingest/src/server.ts).
 
 | Method and path | Auth scope | Input | Current response |
 |---|---|---|---|
-| `GET /healthz` | none | — | 200 or 503; registry, writer, fan-out, alert/notification, simulator statistics. Reports process-level counters only, deliberately, so it can stay open with no key |
+| `GET /healthz` | none | — | 200 or 503; registry, writer, fan-out, alert/notification, simulator statistics, and `limits` — tracked keys, refusals and overflows for each rate limiter. Reports process-level counters only, deliberately, so it can stay open with no key |
 | `POST /ingest` | `ingest:write` | `RawTelemetryBatch` | 202 `{accepted, unknownIds, flagged, futureDated}`; a malformed JSON body is 400 and an oversized one 413. `unknownIds` also covers a real external id that belongs to **another tenant** — the key's own tenant genuinely does not have that point. `futureDated` counts readings refused for a timestamp more than `INGEST_MAX_CLOCK_SKEW_MS` (default 60 s) ahead of the server clock: unlike every other bad reading, those are not stored with a quality flag, because one of them blinds the rollups for every tenant ([§46](decisions.md#46-a-future-dated-reading-blinds-the-5-minute-view-for-everyone)) |
 | `GET /alerts` | `ingest:write` | Optional `state=live` or `state=resolved` | `{alerts: [...]}` for the key's own tenant; missing/unrecognized filter means all states |
 | `POST /alerts/ack` | `ingest:write` | `{alertId}` plus header `x-acting-user: <userId>` | 200 `{alert}`; missing fields 400; alert not open **or belonging to another tenant** 409 — the two cases are deliberately indistinguishable, so a caller cannot use this route to learn that an id exists elsewhere |
@@ -72,11 +72,28 @@ Fault kinds implemented by the synthetic generator are `drift`, `flatline`,
 requires the same `ingest:write` key as every other write route, and every
 fault is scoped to the key's own tenant.
 
-The HTTP reader limits bodies to 8 MiB. Malformed JSON and body-limit exceptions
-currently reach the generic 500 handler; clients should not assume every invalid
-request yields 400/413. Error normalization is outstanding work. Authentication
+The HTTP reader limits bodies to `INGEST_MAX_BODY_BYTES` (8 MiB by default).
+Malformed JSON is 400 and an oversized body 413; an unhandled fault is a 500
+whose body is `{"error":"internal error"}` and nothing more. Authentication
 runs **before** the body is read, so an unauthenticated caller is refused
 without the service parsing its payload.
+
+### Rate limits
+
+Every authenticated route can answer **429**, always with a `Retry-After`
+header and the same number as `retryAfterS` in the body
+([§54](decisions.md#54-rate-limits-are-per-resource-keyed-by-whoever-can-exhaust-it)).
+A gateway should wait that long; retrying at once only spends the next token.
+
+| Limit | Keyed by | Default | At the limit |
+|---|---|---|---|
+| Failed authentication | calling address | 20 burst, 30/min | 429 **before** the key is looked up — so a valid key from a locked-out address is refused too. Only failures are charged |
+| Requests to `POST /ingest` | API key | 50/s, 100 burst | 429 before the body is read |
+| Readings | **tenant** | 20,000/s, 40,000 burst | the whole batch is refused: a gateway can retry a batch, but cannot know which half of one was kept. Every key a tenant holds draws on the same budget |
+
+The calling address is the socket's, unless `INGEST_TRUSTED_PROXY_HOPS` declares
+proxies you operate; then it is read from `X-Forwarded-For` counting back from
+the **right**. The first entry is whatever the caller typed and is never used.
 
 ### Send a reading
 
@@ -117,17 +134,20 @@ good. Full contract: [telemetry.ts](../packages/types/src/telemetry.ts).
 
 ## Browser-facing HTTP
 
-🚧 **Not yet converted for tenancy.** These routes still call the old,
-unscoped `@dtwin/db` query functions and currently fail `npm run typecheck`
-against the tenancy-aware `packages/db`. Nothing below is tenant-scoped or
-authenticated yet — the table describes pre-migration behavior, kept here as
-the target contract this layer is converging toward, not what a build of this
-branch currently does.
+Every route below resolves its tenant from the `dtwin_session` cookie — never
+from a parameter — and answers the one shared 401 when there is none. (With
+`DTWIN_ALLOW_DEMO_TENANT=true` and `DTWIN_DEMO_TENANT_ID` set, an
+unauthenticated request falls back to that tenant; it is a development
+convenience and off by default.)
 
 Sources: [Next.js routes](../apps/web/app/api).
 
 | Method and path | Parameters | Response / purpose |
 |---|---|---|
+| `POST /api/auth/login` | `{email, password, tenantSlug?}` | 200 and an HttpOnly session cookie; **401** with one message for every kind of failure; **429** after repeated failures against the address typed (10 burst, refilling one a minute — a delay, never a lockout), keyed on what was typed and not on whether it matched a user, so it reveals nothing the 401 did not; **503** when three password verifications are already running. 429 and 503 carry `Retry-After` |
+| `POST /api/auth/logout` | — | Deletes the session and clears the cookie |
+| `POST /api/auth/tenant` | `{tenantId}` | Switches the session to another tenant the user belongs to |
+| `GET /api/ws-ticket` | — | `{ticket}` — a 60-second signed ticket for the ingest socket |
 | `GET /api/heatmap` | Required `buildingId`; `metric=temperature_c`, `hours=1` defaults | `{zones}` with values, setpoints and deadbands; missing data is null |
 | `GET /api/zones/{id}` | Zone UUID | `{readings, equipment, maintenance, profile}` |
 | `GET /api/sensors/{id}/history` | `resolution=5m` and `hours=6` defaults | `{buckets}`; resolution allows `5m`, `1h`, `1d` |
@@ -135,10 +155,10 @@ Sources: [Next.js routes](../apps/web/app/api).
 | `POST /api/simulate` | Worker simulation request | Proxies worker response/status; connection failure returns 502 |
 | `GET /api/simulate` | Required `runId` | `{run}` while unfinished; full summary after completion |
 
-These read endpoints do not offer asset/rule CRUD. Pagination and time-window
-limits are not generally implemented. UUID, metric, and numeric parameter
-validation varies by route. The simulation GET proxy does not consistently
-preserve upstream error status; inspect the body as well as the HTTP code.
+These read endpoints do not offer asset/rule CRUD. Ids are parsed as UUIDs,
+metrics against the enum, and `hours` against a per-resolution ceiling; anything
+else is a 400 that names the limit, never a silent clamp
+([§53](decisions.md#53-every-bound-says-what-it-does-when-it-is-reached)).
 
 The browser's standing alert list is read directly from the database through
 Next.js, so it can load even when ingest is unavailable. That is separate from
@@ -234,7 +254,13 @@ query strings end up in access logs and proxy traces.
 `ping`/`pong` work before authentication, so a client can keep the socket alive
 while it fetches a ticket. Every other message before a successful `auth` is
 refused with `{"type":"error","code":"unauthenticated", ...}`. A connection that
-sends no `auth` frame within 10 seconds is closed by the server. On success the
+sends no `auth` frame within 10 seconds is closed by the server. A connection
+sending more than `WS_RATE_FRAMES_PER_S` frames a second (20, with a burst of
+60) is sent `{"type":"error","code":"rate_limited"}` and **closed** with 1008 —
+closed rather than throttled, because a silently dropped `subscribe` would leave
+a real client waiting on data that is not coming. A tenant already holding
+`WS_MAX_CONNECTIONS_PER_TENANT` sockets (200) gets `too_many_connections` and
+close code 1013. On success the
 server replies:
 
 ```json
