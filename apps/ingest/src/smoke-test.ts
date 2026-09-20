@@ -676,6 +676,19 @@ try {
     condition: 'threshold_above', threshold: 27, consecutive: 1,
   });
   await sleep(900);
+
+  // Silence the simulator for this point first.
+  //
+  // Debounce counts CONSECUTIVE breaches, and the simulator is writing healthy
+  // values to the same sensor throughout. Locally the three posts below land
+  // between its ticks; on a slower machine one of its readings interleaves,
+  // resets the streak, and the rule never opens — which is how CI failed this
+  // while the engine was behaving exactly as specified. `offline` makes the
+  // simulator skip the sensor, so the only readings are the ones posted here.
+  await postJson(`${BASE}/simulator/fault`,
+    { sensorId: probe.id, kind: 'offline' });
+  await sleep(400);
+
   for (let i = 0; i < 3; i++) {
     await postJson(`${BASE}/ingest`, {
       readings: [{ externalId: probe.externalId, ts: Date.now() + i, value: 9999 }],
@@ -684,8 +697,13 @@ try {
   const badData = await until(liveAlerts, (r) => r.alerts.some((a) => a.ruleId === rangeRule));
   ok('out_of_range fires on an implausible reading',
      badData.alerts.some((a) => a.ruleId === rangeRule));
+  // The invariant this section exists for (decisions.md §17), and now a
+  // stronger statement of it: with the simulator silent, EVERY reading this
+  // sensor has is an out-of-range 9999, so a threshold rule that read flagged
+  // values would certainly fire. It must not.
   ok('a flagged reading does not raise a thermal alarm',
      !badData.alerts.some((a) => a.ruleId === noisyRule));
+  await del(`${BASE}/simulator/fault?sensorId=${probe.id}`);
 
   // ------------------------------------------------ notification delivery
   console.log('\n[7] Alert notifications');
