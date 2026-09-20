@@ -260,10 +260,16 @@ try:
 
         better_plant = simulate(client, scenarioName="chiller upgrade",
                                 params={"hvacCopScale": 1.25})
+        # Two claims in one check, so the detail names both: a failure that
+        # prints one number cannot say which half broke. CI hit this and the
+        # message could not distinguish "COP did not help" from "plug load
+        # moved", which are very different bugs.
         ok("a better COP reduces HVAC electricity without changing the load",
            better_plant["building"]["hvacKwh"] < b["hvacKwh"]
            and better_plant["building"]["plugKwh"] == b["plugKwh"],
-           f"{better_plant['building']['hvacKwh']:.0f} kWh")
+           f"hvac {better_plant['building']['hvacKwh']:.1f} vs {b['hvacKwh']:.1f} kWh"
+           f" (margin {b['hvacKwh'] - better_plant['building']['hvacKwh']:+.3f});"
+           f" plug {better_plant['building']['plugKwh']:.6f} vs {b['plugKwh']:.6f}")
 
         ppa = simulate(client, scenarioName="green tariff",
                        params={"gridCarbonKgPerKwh": 0.1})
