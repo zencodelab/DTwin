@@ -5,6 +5,12 @@ import type { SimRunState } from '@/lib/ws';
 
 interface Breakdown {
   hvacKwh: number; lightingKwh: number; plugKwh: number;
+  /**
+   * Both are SUBSETS of `hvacKwh`, never additions to it, so they are shown
+   * under the bar rather than as segments of it — a stacked bar whose parts
+   * summed to more than its whole would be a lie told in a chart.
+   */
+  latentKwh: number | null; fanKwh: number | null;
   totalKwh: number; co2Kg: number; euiKwhPerM2: number | null; unmetHours: number | null;
 }
 
@@ -206,6 +212,28 @@ export function ScenarioPanel({
                     {value.euiKwhPerM2 !== null && ` · ${value.euiKwhPerM2.toFixed(2)} kWh/m²`}
                     {value.unmetHours ? ` · ${value.unmetHours.toFixed(0)} unmet h` : ''}
                   </div>
+
+                  {/*
+                    What the HVAC bar is made of. Dehumidification and moving
+                    air are the two answers a facilities manager can act on —
+                    one says the climate is expensive, the other says the plant
+                    is — and a single HVAC number gives neither.
+                  */}
+                  {(value.latentKwh !== null || value.fanKwh !== null) && (
+                    <div className="tnum mt-0.5 text-[10px]"
+                         style={{ color: 'var(--text-muted)' }}>
+                      of which
+                      {value.latentKwh !== null && (
+                        ` ${value.latentKwh.toFixed(0)} kWh dehumidification`
+                        + ` (${((value.latentKwh / value.hvacKwh) * 100).toFixed(0)}%)`
+                      )}
+                      {value.latentKwh !== null && value.fanKwh !== null && ' ·'}
+                      {value.fanKwh !== null && (
+                        ` ${value.fanKwh.toFixed(0)} kWh fans`
+                        + ` (${((value.fanKwh / value.hvacKwh) * 100).toFixed(0)}%)`
+                      )}
+                    </div>
+                  )}
                 </li>
               );
             })}
