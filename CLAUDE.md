@@ -31,7 +31,7 @@ four packages are tenant-scoped:
   `X-Tenant-Id` header the web proxy sets from the session.
 
 Suites total **253 checks, all passing** (`db` 64, `ingest` 112, `sim` 54,
-`web` 23), plus **207 unit tests** (157 vitest, 50 pytest). CI runs types,
+`web` 23), plus **223 unit tests** (173 vitest, 50 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -115,7 +115,10 @@ Do not "optimise" it back to COPY.
   against a specific way the alert list turns into ignorable noise — see
   `docs/decisions.md` §16–18.
 - **Alerts are never coalesced or shed.** Telemetry has a successor; an alert
-  does not.
+  does not. That includes the SOCKET: `Fanout.send(…, { mustDeliver: true })`
+  closes a client too backlogged to take the frame rather than skipping it, and
+  the dashboard's reconnect refetches the open alerts (`docs/decisions.md` §56).
+  Never send an alert without `mustDeliver`, and never make it queue instead.
 - **Notification delivery is recorded in `alert_notifications`,** never
   fire-and-forget, and is dispatched off the alert path. The rows are written
   **in the alert's own transaction** (`openAlert`), which makes the table the
@@ -209,6 +212,12 @@ service.
   judged, or focusing a floor greys the rest of the building three minutes
   later. The baseline is for first paint only. Staleness is driven by a clock,
   not by frames — a dead gateway sends no frame to re-render on.
+- **The alert list is a snapshot reconciled with events** (`lib/alerts.ts`, §56):
+  the snapshot is the truth about everything before it was REQUESTED, events
+  about everything after. Do not go back to merging a live list over a
+  fetched-once list — a resolved alert that came from the snapshot then never
+  leaves the screen. The snapshot is refetched on every accepted subscription,
+  which is what makes ingest's close-on-backlog safe.
 - **`ZoneMesh`'s memo compares the visual's contents**, not its reference: the
   dashboard builds a fresh visual per zone per recompute.
 - **The 3D view is generated from the stored PostGIS geometry.** Do not

@@ -160,9 +160,15 @@ metrics against the enum, and `hours` against a per-resolution ceiling; anything
 else is a 400 that names the limit, never a silent clamp
 ([§53](decisions.md#53-every-bound-says-what-it-does-when-it-is-reached)).
 
-The browser's standing alert list is read directly from the database through
-Next.js, so it can load even when ingest is unavailable. That is separate from
-the live event channel and its current reconciliation limitations.
+The browser's alert list is read directly from the database through Next.js,
+so it loads even when ingest is unavailable. The dashboard treats that response
+as the truth about everything before it was **requested** and socket events as
+the truth about everything after, refetching on every accepted subscription and
+every five minutes
+([§56](decisions.md#56-an-alert-frame-is-never-skipped-a-client-too-slow-for-one-is-disconnected)).
+Any other client of the socket should reconcile the same way: there is no
+replay, so a snapshot after each reconnect is the only thing that can report an
+alert which resolved during the gap.
 
 ## Worker HTTP
 
@@ -323,7 +329,11 @@ now refused at the HTTP boundary if that building does not belong to the
 posting service key's tenant (see the ingest table above). Parse browser frames
 with `parseServerMessage` and tuples with `expandReading`.
 
-There is no durable event cursor, replay, or guaranteed delivery. Subscribe to
+There is no durable event cursor or replay. Delivery differs by message, on
+purpose. A client whose send buffer is over `INGEST_CLIENT_BUFFER_MAX_BYTES` has
+**telemetry and simulation-progress frames skipped** — each has a successor —
+but is **closed with 1013 rather than skipped when an alert frame is due**,
+because an alert is said once. Reconnect and refetch `/api/alerts`. Subscribe to
 the relevant `sim:<buildingId>` or building topic for simulation events, and retain
 HTTP recovery. See [architecture](architecture.md) for backpressure behavior.
 

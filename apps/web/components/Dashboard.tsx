@@ -13,6 +13,7 @@ import {
   OVERLAY_LABELS, NO_DATA_DARK, NO_DATA_LIGHT, STATUS,
   magnitudeColor, temperatureColor, type OverlayMetric,
 } from '@/lib/colors';
+import { reconcileAlerts } from '@/lib/alerts';
 import { formatAge, isStale, reduceZone, zoneSource } from '@/lib/live';
 import { useIsDark } from '@/lib/theme';
 import { useLiveData } from '@/lib/ws';
@@ -88,7 +89,9 @@ export function Dashboard({
   const [overlay, setOverlay] = useState<OverlayMetric>('temperature_c');
   const [showEquipment, setShowEquipment] = useState(true);
   const [baseline, setBaseline] = useState<Map<string, ZoneProfile>>(new Map());
-  const [standingAlerts, setStandingAlerts] = useState<AlertWithContext[]>([]);
+  const [alertSnapshot, setAlertSnapshot] = useState<{
+    alerts: AlertWithContext[]; requestedAt: number | null;
+  }>({ alerts: [], requestedAt: null });
   const [loadError, setLoadError] = useState<string | null>(null);
   const isDark = useIsDark();
 
@@ -117,7 +120,7 @@ export function Dashboard({
   }, [focusedFloorId, tree.building.id, tenantId]);
 
   const {
-    readings, listeningSince, alerts: liveAlerts, simRuns, connected,
+    readings, listeningSince, alertEvents, simRuns, connected,
   } = useLiveData(wsUrl, subscribed);
   const now = useNow(10_000);
 
@@ -148,12 +151,28 @@ export function Dashboard({
     return () => { cancelled = true; };
   }, [tree.building.id, overlay]);
 
+  // The open alerts, refetched — not fetched once.
+  //
+  // On every accepted subscription, because events missed while the socket was
+  // down are simply gone: this snapshot is the only thing that can say an alert
+  // resolved during the gap. Ingest now CLOSES a socket too backlogged to take
+  // an alert frame (decisions.md §56) precisely so that this runs. And every
+  // few minutes regardless, so no event ever has to be remembered for long.
+  const [alertRefresh, setAlertRefresh] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setAlertRefresh((n) => n + 1), 5 * 60_000);
+    return () => clearInterval(timer);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/alerts')
+    // Stamped when REQUESTED: the rows are read some time after this, and an
+    // event in between is applied on top rather than dropped.
+    const requestedAt = Date.now();
+    fetch('/api/alerts', { cache: 'no-store' })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`alerts ${r.status}`))))
       .then((d: { alerts: AlertWithContext[] }) => {
-        if (!cancelled) setStandingAlerts(d.alerts);
+        if (!cancelled) setAlertSnapshot({ alerts: d.alerts, requestedAt });
       })
       .catch((err: unknown) => {
         // An empty alert list and a failed request look identical on screen,
@@ -161,15 +180,12 @@ export function Dashboard({
         if (!cancelled) setLoadError(`Alert list unavailable: ${(err as Error).message}`);
       });
     return () => { cancelled = true; };
-  }, []);
+  }, [listeningSince, alertRefresh]);
 
-  // Alerts raised since load are merged over the list fetched at open, so the
-  // panel shows both history and anything that fires while it is watched.
-  const alerts = useMemo(() => {
-    const merged = new Map(standingAlerts.map((a) => [a.id, a]));
-    for (const a of liveAlerts) merged.set(a.id, a);
-    return [...merged.values()].filter((a) => a.state !== 'resolved');
-  }, [standingAlerts, liveAlerts]);
+  const alerts = useMemo(
+    () => reconcileAlerts(alertSnapshot.alerts, alertSnapshot.requestedAt, alertEvents),
+    [alertSnapshot, alertEvents],
+  );
 
   const alertingZones = useMemo(
     () => new Set(alerts.filter((a) => a.zoneId).map((a) => a.zoneId!)),

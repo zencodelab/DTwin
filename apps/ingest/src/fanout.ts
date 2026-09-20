@@ -7,6 +7,7 @@ export interface Socket {
   readyState: number;
   bufferedAmount: number;
   send(data: string): void;
+  close(code?: number, reason?: string): void;
 }
 
 const OPEN = 1;
@@ -32,6 +33,11 @@ export interface FanoutStats {
   framesSent: number;
   readingsSent: number;
   framesSkipped: number;
+  /**
+   * Sockets closed because they were too backlogged to take a frame that may
+   * not be skipped. Non-zero means clients are being made to reconcile.
+   */
+  backloggedClosed: number;
   /** Subscribe requests refused because the topic belongs to another tenant. */
   subscribesDenied: number;
 }
@@ -52,7 +58,9 @@ export class Fanout {
   #subscribers = new Map<string, Subscriber>();
   #pending = new Map<Topic, Reading[]>();
   #timer: NodeJS.Timeout | null = null;
-  #stats = { framesSent: 0, readingsSent: 0, framesSkipped: 0, subscribesDenied: 0 };
+  #stats = {
+    framesSent: 0, readingsSent: 0, framesSkipped: 0, backloggedClosed: 0, subscribesDenied: 0,
+  };
 
   /**
    * Decides whether a tenant may subscribe to a topic. Injected rather than
@@ -179,11 +187,28 @@ export class Fanout {
     }
   }
 
-  /** Send a non-telemetry message immediately (alerts, simulation progress). */
-  send(topic: Topic, message: ServerMessage): void {
+  /**
+   * Send a non-telemetry message immediately (alerts, simulation progress).
+   *
+   * `mustDeliver` is for a frame with no successor. Telemetry can be skipped
+   * for a slow client because the next batch carries newer values; simulation
+   * progress likewise. An alert cannot: "raised" is said once. This method used
+   * to push alerts through the same backlog-skipping path as telemetry, so the
+   * rule "alerts are never shed" held for the queue and not for the socket — a
+   * client slow enough to skip a telemetry frame silently never heard that an
+   * alert had opened.
+   *
+   * Neither of the obvious repairs is acceptable. Sending anyway queues without
+   * bound behind a client that is not reading (decisions.md §12). Skipping is
+   * the defect. So the socket is CLOSED: the client reconnects, and on every
+   * accepted subscription the dashboard refetches the open alerts over HTTP,
+   * which is the one source that cannot have missed anything (§56). The slow
+   * client loses its connection, not its alert.
+   */
+  send(topic: Topic, message: ServerMessage, options: { mustDeliver?: boolean } = {}): void {
     const subs = this.#byTopic.get(topic);
     if (!subs || subs.size === 0) return;
-    this.#deliver(subs, JSON.stringify(message));
+    this.#deliver(subs, JSON.stringify(message), options.mustDeliver === true);
   }
 
   tick(): void {
@@ -209,11 +234,18 @@ export class Fanout {
     }
   }
 
-  #deliver(subs: Set<Subscriber>, payload: string): void {
+  #deliver(subs: Set<Subscriber>, payload: string, mustDeliver = false): void {
     for (const sub of subs) {
       if (sub.socket.readyState !== OPEN) continue;
       if (sub.socket.bufferedAmount > this.config.INGEST_CLIENT_BUFFER_MAX_BYTES) {
-        this.#stats.framesSkipped++;
+        if (mustDeliver) {
+          this.#stats.backloggedClosed++;
+          // 1013 "try again later": the client did nothing wrong, and the
+          // dashboard's reconnect is what carries it to the snapshot.
+          sub.socket.close(1013, 'backlogged; reconnect and reconcile');
+        } else {
+          this.#stats.framesSkipped++;
+        }
         continue;
       }
       sub.socket.send(payload);

@@ -365,7 +365,7 @@ export class AlertEngine {
     // the same idea drifted, so now there is one.
     if (sensor) targets.push(...topicsFor(sensor));
 
-    for (const topic of targets) this.fanout.send(topic, message);
+    for (const topic of targets) this.fanout.send(topic, message, { mustDeliver: true });
   }
 }
 

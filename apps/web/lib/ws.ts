@@ -3,8 +3,9 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   expandReading, parseServerMessage,
-  type AlertWithContext, type SimulationSummary, type Topic,
+  type SimulationSummary, type Topic,
 } from '@dtwin/types';
+import { appendAlertEvent, type AlertEvent } from './alerts.ts';
 import { newer, type LiveReading } from './live.ts';
 
 export interface SimRunState {
@@ -25,7 +26,12 @@ export interface LiveState {
    * none. Silence before this moment is not evidence that a point is down.
    */
   listeningSince: number | null;
-  alerts: AlertWithContext[];
+  /**
+   * Alert events since the page opened, latest per alert. NOT a list of open
+   * alerts: what is open is the snapshot reconciled with these, and that is
+   * decided in `lib/alerts.ts` where the snapshot's age is known.
+   */
+  alertEvents: AlertEvent[];
   /** Simulation runs the worker has reported on, keyed by run id. */
   simRuns: Map<string, SimRunState>;
   connected: boolean;
@@ -45,7 +51,7 @@ export interface LiveState {
 export function useLiveData(url: string, topics: Topic[]): LiveState {
   const [readings, setReadings] = useState<Map<string, LiveReading>>(new Map());
   const [listeningSince, setListeningSince] = useState<number | null>(null);
-  const [alerts, setAlerts] = useState<AlertWithContext[]>([]);
+  const [alertEvents, setAlertEvents] = useState<AlertEvent[]>([]);
   const [simRuns, setSimRuns] = useState<Map<string, SimRunState>>(new Map());
   const [connected, setConnected] = useState(false);
 
@@ -122,14 +128,18 @@ export function useLiveData(url: string, topics: Topic[]): LiveState {
 
           case 'alert.raised':
           case 'alert.acknowledged':
-            setAlerts((prev) => [
-              message.alert,
-              ...prev.filter((a) => a.id !== message.alert.id),
-            ]);
+            setAlertEvents((prev) => appendAlertEvent(prev, {
+              kind: 'upsert', alert: message.alert, at: Date.now(),
+            }));
             break;
 
+          // Recorded, not merely removed from a live list. The alert being
+          // resolved may have come from the HTTP snapshot, which this hook
+          // never sees — dropping it from here alone left it on screen.
           case 'alert.resolved':
-            setAlerts((prev) => prev.filter((a) => a.id !== message.alert.id));
+            setAlertEvents((prev) => appendAlertEvent(prev, {
+              kind: 'resolved', alert: message.alert, at: Date.now(),
+            }));
             break;
 
           // The worker reports through ingest rather than holding its own
@@ -178,5 +188,5 @@ export function useLiveData(url: string, topics: Topic[]): LiveState {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, topicKey]);
 
-  return { readings, listeningSince, alerts, simRuns, connected };
+  return { readings, listeningSince, alertEvents, simRuns, connected };
 }

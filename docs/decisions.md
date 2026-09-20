@@ -1363,3 +1363,62 @@ default comparison is by reference. It now compares what the visual says.
 zone as "reading flagged" within one sample; an `offline` fault greys its zone
 with a growing age once three intervals pass; clearing both restores colour on
 the next frame.
+
+---
+
+## 56. An alert frame is never skipped; a client too slow for one is disconnected
+
+"Alerts are never coalesced or shed" has been a rule since §12, and it held for
+the queue and not for the socket. `Fanout.send` pushed alerts through the same
+`#deliver` as telemetry, which skips any client whose send buffer is over
+`INGEST_CLIENT_BUFFER_MAX_BYTES`. A client slow enough to miss a telemetry
+frame therefore silently never heard that an alert had opened. The 18 September
+review had this as a P0, and it was still open.
+
+**Neither obvious repair is acceptable.** Sending regardless queues without
+bound behind a client that is not reading — the exact failure §12 exists to
+prevent. Skipping is the defect. A per-client alert queue with its own bound
+only moves the question to what happens when *that* fills.
+
+**So the socket is closed**, with 1013. The dashboard reconnects on its own, and
+on every accepted subscription it refetches the open alerts over HTTP — the one
+source that cannot have missed anything, because it is the table. The slow
+client loses its connection, not its alert. Simulation progress goes on being
+skippable: it has a successor, and a polling fallback behind it.
+
+**That only works if the client reconciles correctly, and it did not** — the
+second P0 from the same review. The dashboard fetched open alerts once, at
+mount, and merged live events over them. `alert.resolved` removed the alert
+from the *live* list only, so an alert that was already open when the page
+loaded stayed on screen after it resolved, for as long as the page stayed open.
+An operator acts on that list.
+
+The rule now, in `apps/web/lib/alerts.ts`: **the snapshot is the truth about
+everything before it was requested; events are the truth about everything
+after.**
+
+- An event older than the snapshot is ignored. This is what makes the refetch
+  correct rather than merely frequent: an alert raised while connected and
+  resolved during a gap would otherwise be resurrected from the live list.
+- An event newer than it is applied on top, and a `resolved` removes the alert
+  wherever it came from.
+- "Requested", not "received". The rows were read somewhere between those two
+  moments; an event in that window is applied again, which is harmless —
+  upsert and remove are idempotent — where dropping it would lose it.
+
+Only the latest event per alert is kept, which loses nothing because both
+operations are last-writer-wins, so the memory is sized by distinct alerts and
+not by traffic. The snapshot is also refetched every five minutes, so no event
+has to be remembered for long. The merged list is sorted the way `/api/alerts`
+sorts, so a critical raised live lands at the top rather than appended under an
+hour of warnings, and an alert does not change position depending on which
+path delivered it.
+
+**Cost.** A client on a genuinely bad link is disconnected each time an alert
+fires while it is behind, and reconnects into the same link. That is visible —
+`fanout.backloggedClosed` on `/healthz`, "reconnecting" on the dashboard — and
+it is the honest state: that client is not receiving a live feed, and a green
+light over a connection silently dropping frames was the alternative.
+
+Still not addressed: the alert list is capped at 100 by the route, and an alert
+beyond that is invisible to this reconciliation as to everything else.
