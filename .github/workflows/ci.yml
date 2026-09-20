@@ -197,3 +197,28 @@ jobs:
           for f in /tmp/ingest.log /tmp/sim.log /tmp/web.log; do
             echo "::group::$f"; tail -100 "$f" 2>/dev/null || true; echo "::endgroup::"
           done
+
+      # Rollup questions cannot be answered from the API that returned nothing.
+      # The continuous-aggregate watermark is the thing that decides whether a
+      # recent row is visible (docs/decisions.md §46) and it is not exposed
+      # anywhere else.
+      - name: Database state on failure
+        if: failure()
+        env:
+          PGPASSWORD: dtwin_ci_pwd
+        run: |
+          psql -h localhost -U dtwin -d dtwin -c "
+            SELECT user_view_name,
+                   to_timestamp(_timescaledb_functions.cagg_watermark(mat_hypertable_id)/1e6) AS watermark
+              FROM _timescaledb_catalog.continuous_agg;"
+          psql -h localhost -U dtwin -d dtwin -c "
+            SELECT count(*) AS raw_rows,
+                   min(time) AS oldest, max(time) AS newest,
+                   count(DISTINCT sensor_id) AS sensors
+              FROM telemetry;"
+          psql -h localhost -U dtwin -d dtwin -c "
+            SELECT count(*) AS buckets_5m, min(bucket) AS oldest, max(bucket) AS newest
+              FROM telemetry_5m;"
+          psql -h localhost -U dtwin -d dtwin -c "
+            SELECT now() AS server_now, count(*) AS rows_last_hour
+              FROM telemetry WHERE time > now() - interval '1 hour';"
