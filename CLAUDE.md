@@ -58,7 +58,9 @@ Do not "optimise" it back to COPY.
 - **Migrations are append-only raw SQL.** Add a new numbered file; never edit an
   applied one. Mark a file `-- @no-transaction` if it creates a continuous
   aggregate or calls `create_hypertable` — TimescaleDB rejects those inside a
-  transaction block.
+  transaction block. A file named `*_seed.sql` is demo data: `db:migrate` skips
+  it and records `skipped:`, `db:seed` applies it, and the choice is one-way
+  per database.
 - **SQL enums and `packages/types/src/enums.ts` must stay in sync.**
 - **Never average a cumulative meter.** `sensors.is_cumulative` marks them; use
   `delta(counter_agg)` from the hourly/daily aggregates.
@@ -145,9 +147,14 @@ service.
 
 ```bash
 npm run typecheck
-npm run db:migrate
+npm run db:migrate          # or db:seed, on a fresh database you want demo data in
+npm run bootstrap           # only needed once per database
 npm run smoke -w @dtwin/db
 ```
+
+`npm run smoke -w @dtwin/ingest` refuses to run while a dev ingest holds :8787 —
+its device simulator writes the same meters, so the results would be
+meaningless. Stop `dev:ingest` first.
 
 The smoke test writes synthetic telemetry into the seeded building and checks
 the spatial tree, 3D picking, batch insert idempotency, reset-aware counter

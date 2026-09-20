@@ -24,6 +24,31 @@ types.setTypeParser(types.builtins.INT8, (v) => Number.parseInt(v, 10));
  * looks correct and silently serves every tenant's data to everyone. See
  * docs/decisions.md §41.
  */
+/**
+ * The development password is a convenience, and a convenience that works in
+ * production is how a development password reaches production. So it is
+ * refused there outright, the same way AUTH_SECRET has no fallback at all.
+ *
+ * `007_tenancy.sql` creates the role with this password and says to rotate it;
+ * this is the other half of that instruction, enforced rather than written
+ * down.
+ */
+const DEV_APP_PASSWORD = 'dtwin_app_dev_pwd';
+
+function appPassword(): string {
+  const supplied = process.env.POSTGRES_APP_PASSWORD;
+  if (supplied) return supplied;
+
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'POSTGRES_APP_PASSWORD (or DATABASE_URL) must be set in production. ' +
+        'The development default is refused here on purpose — rotate the ' +
+        'password 007_tenancy.sql created and supply it explicitly.',
+    );
+  }
+  return DEV_APP_PASSWORD;
+}
+
 function connectionConfig(url: string | undefined): PoolConfig {
   if (url) return { connectionString: url };
 
@@ -32,7 +57,7 @@ function connectionConfig(url: string | undefined): PoolConfig {
     port: Number(process.env.POSTGRES_PORT ?? 5432),
     database: process.env.POSTGRES_DB ?? 'dtwin',
     user: process.env.POSTGRES_APP_USER ?? 'dtwin_app',
-    password: process.env.POSTGRES_APP_PASSWORD ?? 'dtwin_app_dev_pwd',
+    password: appPassword(),
   };
 }
 

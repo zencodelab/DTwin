@@ -26,12 +26,29 @@ set -a
 source .env
 set +a
 npm run db:up
-npm run db:migrate
+npm run db:seed     # migrate, including the demonstration building
+npm run bootstrap   # create the first user and the two API keys
 npm run sim:install
 ```
 
-There are currently eight migrations, `001_spatial` through
-`008_tenancy_timeseries`. `007_tenancy.sql` also creates the `dtwin_app`
+`db:seed` is `db:migrate` plus the demo data. **Use `db:migrate` alone for
+anything real** — it skips `005_seed.sql` and records it as `skipped:`, so a
+deployment does not quietly acquire Corniche Tower. The choice is made once per
+database and cannot be reversed: `007_tenancy.sql` makes `tenant_id` NOT NULL,
+so the seed only inserts cleanly in its own chain position. To change your mind,
+`docker compose down -v` and start again. `npm run db:migrate --status` says
+which of the two any database got.
+
+`bootstrap` prints the tenant id and the two API keys **once** — put them in
+`.env` as `DTWIN_DEMO_TENANT_ID`, `INGEST_API_KEY` and `SIM_SERVICE_KEY`. It is
+idempotent: re-running reuses the existing tenant and user and leaves the
+password alone. `--rotate` replaces the keys (atomically, keeping the revoked
+rows as an audit trail); `--email`, `--name`, `--password` and `--tenant`
+override the defaults. Without `--password` it generates one and prints it,
+because a default password that works locally is a default password that ships.
+
+There are currently nine migrations, `001_spatial` through
+`009_api_key_rotation`. `007_tenancy.sql` also creates the `dtwin_app`
 database role that every service other than the migration runner must connect
 as — see the credentials section below, and set `DATABASE_URL` /
 `DATABASE_URL_OWNER` correctly in `.env` **before** running `db:migrate`, or
@@ -86,20 +103,27 @@ of the pilot deployment work.
 
 ## Credentials for a fresh database
 
-Migration `007` seeds one tenant (`corniche`) owning the demonstration
-building, but creates **no user and no API key** — there is nothing in the
-database yet that can authenticate. Every HTTP route on `apps/ingest` except
-`/healthz` requires a key, and its WebSocket requires a signed ticket minted
-from a logged-in session, so `apps/ingest`'s own smoke suite (and any manual
-exercise of it) needs both provisioned first. Using `npm run db:psql` or a
-short script against `packages/db/src/queries/tenancy.ts`:
+`npm run bootstrap` (above) does this. What follows is what it does and why,
+for when you need something it does not offer.
+
+Migration `007` seeds the `corniche` tenant **only if a building already
+exists** — that is, only on a seeded database — and creates **no user and no
+API key** on any database. Nothing shipped in a migration can authenticate,
+deliberately: a migration that carries credentials carries them to production.
+
+Every HTTP route on `apps/ingest` except `/healthz` requires a key, and its
+WebSocket requires a signed ticket minted from a logged-in session, so
+`apps/ingest`'s own smoke suite (and any manual exercise of it) needs both
+provisioned first. The building blocks are in
+[`packages/db/src/queries/tenancy.ts`](../packages/db/src/queries/tenancy.ts)
+and are what `bootstrap.ts` calls:
 
 ```ts
-import { createTenant, createUser, addMember, createApiKey } from '@dtwin/db/queries';
+import {
+  createTenant, createUser, addMember, createApiKey, rotateApiKey,
+} from '@dtwin/db/queries';
 
-// Only if you are not using the seeded 'corniche' tenant from 007:
-// const tenantId = await createTenant('acme', 'Acme Facilities');
-
+const tenantId = await createTenant('acme', 'Acme Facilities');
 const userId = await createUser('you@example.com', 'Your Name', 'a real password');
 await addMember(tenantId, userId, 'owner');
 
@@ -114,9 +138,15 @@ console.log(service.key);
 
 `createApiKey`'s return value is the only time the plaintext key exists;
 `api_keys.key_hash` is all that is stored. Losing it means creating a new key,
-not recovering the old one. `AUTH_SECRET` must also be set (see `.env.example`)
-before `apps/ingest` will start at all — it fails fast on boot rather than
-running with an insecure default; there is none to fall back to.
+not recovering the old one — use `rotateApiKey`, which revokes and reissues in
+one transaction so the name is never left without a live key.
+
+`AUTH_SECRET` must also be set (see `.env.example`) before `apps/ingest` will
+start at all — it fails fast on boot rather than running with an insecure
+default; there is none to fall back to. `POSTGRES_APP_PASSWORD` behaves the
+same way when `NODE_ENV=production`: the `dtwin_app_dev_pwd` that
+`007_tenancy.sql` creates the role with is refused there, so the rotation that
+migration asks for is enforced rather than merely recommended.
 
 ## Configuration that changes behavior
 

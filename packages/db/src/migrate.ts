@@ -11,6 +11,15 @@
  * it, and the owner is deliberately the only identity that bypasses those
  * policies. Services must never use this connection — see client.ts.
  *
+ * A file named `*_seed.sql` carries demonstration data, not schema, and is
+ * SKIPPED unless DTWIN_SEED_DEMO=true. Without that guard every production
+ * deploy would apply the demo building, because the seed sits in the same
+ * append-only chain as the schema. A skipped file is recorded as
+ * `skipped:<checksum>` so the chain still advances and `--status` can say what
+ * happened. It cannot be back-filled later: migration 007 makes `tenant_id`
+ * NOT NULL, so the seed only inserts cleanly in its own chain position. To get
+ * the demo data, recreate the database with `npm run db:seed`.
+ *
  * A file whose first lines contain `-- @no-transaction` is split into
  * statements and executed without a surrounding BEGIN. TimescaleDB refuses to
  * create a continuous aggregate inside a transaction block. Such a file can
@@ -26,7 +35,13 @@ import { splitStatements } from './sql-split.ts';
 
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
 
-type Migration = { version: string; sql: string; checksum: string; noTransaction: boolean };
+type Migration = {
+  version: string; sql: string; checksum: string;
+  noTransaction: boolean; isDemoSeed: boolean;
+};
+
+/** Marks a recorded-but-not-executed migration. See the note above. */
+const SKIPPED = 'skipped:';
 
 async function loadMigrations(): Promise<Migration[]> {
   const files = (await readdir(MIGRATIONS_DIR))
@@ -42,6 +57,10 @@ async function loadMigrations(): Promise<Migration[]> {
         checksum: createHash('sha256').update(sql).digest('hex').slice(0, 16),
         // Only honour the directive in the file's leading comment block.
         noTransaction: /^\s*--\s*@no-transaction\s*$/m.test(sql.slice(0, 500)),
+        // By filename, not by a directive inside the file: adding a directive
+        // would change the checksum of an already-applied migration and make
+        // every existing database report drift.
+        isDemoSeed: /_seed$/.test(file.replace(/\.sql$/, '')),
       };
     }),
   );
@@ -109,6 +128,14 @@ async function applyOne(m: Migration): Promise<void> {
   }
 }
 
+/** Advance the chain past a file we chose not to execute, visibly. */
+async function recordSkipped(m: Migration): Promise<void> {
+  await getOwnerPool().query(
+    'INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)',
+    [m.version, `${SKIPPED}${m.checksum}`],
+  );
+}
+
 async function main(): Promise<void> {
   const statusOnly = process.argv.includes('--status');
 
@@ -121,18 +148,33 @@ async function main(): Promise<void> {
       const seen = applied.get(m.version);
       const state = seen === undefined
         ? 'pending'
-        : seen === m.checksum
-          ? 'applied'
-          : `applied (CHECKSUM DRIFT — file edited since it ran; was ${seen}, now ${m.checksum})`;
+        : seen.startsWith(SKIPPED)
+          ? 'skipped (demo seed; DTWIN_SEED_DEMO was not set)'
+          : seen === m.checksum
+            ? 'applied'
+            : `applied (CHECKSUM DRIFT — file edited since it ran; was ${seen}, now ${m.checksum})`;
       console.log(`  ${m.version.padEnd(20)} ${state}`);
     }
     return;
   }
 
+  const seedDemo = process.env.DTWIN_SEED_DEMO === 'true';
+
   let count = 0;
   for (const m of migrations) {
     const seen = applied.get(m.version);
     if (seen !== undefined) {
+      if (seen.startsWith(SKIPPED)) {
+        if (seedDemo) {
+          console.warn(
+            `[migrate] ${m.version} was skipped on this database and cannot be ` +
+              `applied now — 007 made tenant_id NOT NULL, so the seed only ` +
+              `inserts in its own chain position. Recreate the database ` +
+              `(docker compose down -v) and run npm run db:seed.`,
+          );
+        }
+        continue;
+      }
       if (seen !== m.checksum) {
         console.warn(
           `[migrate] ${m.version} was edited after being applied ` +
@@ -140,6 +182,11 @@ async function main(): Promise<void> {
             `if the change matters.`,
         );
       }
+      continue;
+    }
+    if (m.isDemoSeed && !seedDemo) {
+      await recordSkipped(m);
+      console.log(`[migrate] skipping ${m.version} (demo data; set DTWIN_SEED_DEMO=true to apply)`);
       continue;
     }
     process.stdout.write(`[migrate] applying ${m.version}${m.noTransaction ? ' (no transaction)' : ''} … `);

@@ -11,6 +11,7 @@
   "scripts": {
     "migrate": "tsx src/migrate.ts",
     "migrate:status": "tsx src/migrate.ts --status",
+    "bootstrap": "tsx src/bootstrap.ts",
     "smoke": "tsx src/smoke-test.ts",
     "typecheck": "tsc --noEmit"
   },

@@ -1,6 +1,6 @@
 import type { TenantMembership, TenantRole } from '@dtwin/types';
 import type { Db } from '../client.ts';
-import { withoutTenant } from '../client.ts';
+import { withoutTenant, withTransaction } from '../client.ts';
 import { hashPassword, newToken, tokenHash, verifyPassword } from '../auth.ts';
 
 /**
@@ -253,5 +253,98 @@ export async function createApiKey(
       [tenantId, kind, name, prefix, tokenHash(key), scopes],
     );
     return { id: rows[0]!.id, key, prefix };
+  });
+}
+
+/**
+ * Look a user up by address, case-insensitively.
+ *
+ * Provisioning only. `login` deliberately does **not** use this: it needs the
+ * password hash in the same round trip so that a missing user and a wrong
+ * password cost the same time, and splitting the lookup out would reintroduce
+ * the enumeration oracle that function is written to avoid.
+ */
+export async function findUserByEmail(
+  email: string,
+): Promise<{ id: string; displayName: string; isActive: boolean } | null> {
+  return withoutTenant(async (db) => {
+    const { rows } = await db.query<{ id: string; displayName: string; isActive: boolean }>(
+      `SELECT id, display_name AS "displayName", is_active AS "isActive"
+         FROM users WHERE lower(email) = lower($1)`,
+      [email],
+    );
+    return rows[0] ?? null;
+  });
+}
+
+/**
+ * The tenant's API keys, without their secrets — there is nothing to return.
+ * `key_hash` is all that is stored, so a lost key is replaced, never recovered.
+ *
+ * Unscoped like the rest of this file: `api_keys` carries no tenant policy, so
+ * the predicate here is the only thing separating tenants.
+ */
+export async function listApiKeys(tenantId: string): Promise<Array<{
+  id: string; kind: 'device' | 'service'; name: string; prefix: string;
+  scopes: string[]; revokedAt: Date | null;
+}>> {
+  return withoutTenant(async (db) => {
+    const { rows } = await db.query<{
+      id: string; kind: 'device' | 'service'; name: string; prefix: string;
+      scopes: string[]; revokedAt: Date | null;
+    }>(
+      `SELECT id, kind, name, key_prefix AS "prefix", scopes,
+              revoked_at AS "revokedAt"
+         FROM api_keys WHERE tenant_id = $1 ORDER BY name`,
+      [tenantId],
+    );
+    return rows;
+  });
+}
+
+/**
+ * Replace a key, atomically.
+ *
+ * Revoking and creating are one transaction because they are one operation: if
+ * the create fails after the revoke commits, the tenant is left with no live
+ * key for that name and a device stops authenticating for reasons nobody
+ * changed. The order cannot be reversed — `api_keys_tenant_name_live_uidx`
+ * (009) permits only one un-revoked key per name — so the transaction is what
+ * makes it safe.
+ *
+ * The revoked row keeps its name and prefix as the audit trail.
+ */
+export async function rotateApiKey(
+  tenantId: string,
+  kind: 'device' | 'service',
+  name: string,
+  scopes: string[],
+): Promise<CreatedApiKey> {
+  const key = newToken();
+  const prefix = key.slice(0, 8);
+  return withTransaction(async (db) => {
+    await db.query(
+      `UPDATE api_keys SET revoked_at = now()
+        WHERE tenant_id = $1 AND name = $2 AND revoked_at IS NULL`,
+      [tenantId, name],
+    );
+    const { rows } = await db.query<{ id: string }>(
+      `INSERT INTO api_keys (tenant_id, kind, name, key_prefix, key_hash, scopes)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [tenantId, kind, name, prefix, tokenHash(key), scopes],
+    );
+    return { id: rows[0]!.id, key, prefix };
+  });
+}
+
+/** Revoke a key by name. Idempotent; returns false when nothing matched. */
+export async function revokeApiKey(tenantId: string, name: string): Promise<boolean> {
+  return withoutTenant(async (db) => {
+    const { rowCount } = await db.query(
+      `UPDATE api_keys SET revoked_at = now()
+        WHERE tenant_id = $1 AND name = $2 AND revoked_at IS NULL`,
+      [tenantId, name],
+    );
+    return (rowCount ?? 0) > 0;
   });
 }

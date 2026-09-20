@@ -57,16 +57,26 @@ set -a
 source .env
 set +a
 npm run db:up        # TimescaleDB-HA (bundles PostGIS + Toolkit)
-npm run db:migrate   # applies 001..008 including seed, notifications, tenancy
+npm run db:seed      # applies 001..009 *including* the demonstration building
+npm run bootstrap    # first user + the two API keys; prints them once
 npm run smoke -w @dtwin/db   # end-to-end check against the live database, incl. tenant isolation
 ```
 
-`.env.example` now separates the **application** role (`DATABASE_URL`, subject
-to row-level security) from the **schema owner** (`DATABASE_URL_OWNER`,
-migrations only) and requires `AUTH_SECRET` — see
-[credentials for a fresh database](docs/operations.md#credentials-for-a-fresh-database)
-for provisioning a user and API keys, without which nothing in `apps/ingest`
-can authenticate.
+Use **`npm run db:migrate`** instead of `db:seed` for anything real: it skips
+`005_seed.sql` so a deployment does not quietly acquire Corniche Tower. The
+choice is per-database and one-way — `007` makes `tenant_id` NOT NULL, so the
+seed only inserts in its own chain position. `npm run db:migrate --status`
+reports which one a database got.
+
+`npm run bootstrap` is what makes a fresh clone usable: migrations deliberately
+ship no user and no API key, and without them nothing in `apps/ingest` can
+authenticate. It is idempotent, and `--rotate` replaces the keys atomically.
+
+`.env.example` separates the **application** role (`DATABASE_URL`, subject to
+row-level security) from the **schema owner** (`DATABASE_URL_OWNER`, migrations
+only) and requires `AUTH_SECRET`; `POSTGRES_APP_PASSWORD` is likewise required
+under `NODE_ENV=production`. See
+[credentials for a fresh database](docs/operations.md#credentials-for-a-fresh-database).
 
 Local ingest and Python processes do not automatically load the root `.env`;
 export it in each service terminal, following the
