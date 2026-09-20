@@ -473,12 +473,22 @@ try {
        { externalId: 'nope', kind: 'flatline' })).status === 404);
 
   await sleep(1500);
+  // The most recent readings, not "readings in the last second".
+  //
+  // A time window compares the reading's timestamp, which comes from the
+  // ingest process's clock, against now(), which is the database's. Under load
+  // those two skew, and the window then reaches back far enough to include a
+  // sample from before the fault took effect — which is how CI reported "2
+  // distinct across 4 readings" for a simulator that had flatlined correctly.
+  // The question is whether the latest samples stopped changing, so the query
+  // asks exactly that and no clock is involved.
   const { rows: [flat] } = await pool.query(
     `SELECT count(DISTINCT value) AS distinct_values, count(*) AS n
-       FROM telemetry WHERE sensor_id = $1 AND time > now() - INTERVAL '1 second'`, [probe.id]);
+       FROM (SELECT value FROM telemetry WHERE sensor_id = $1
+              ORDER BY time DESC LIMIT 4) recent`, [probe.id]);
   ok('flatlined sensor stops changing',
      Number(flat.n) === 0 || Number(flat.distinct_values) <= 1,
-     `${flat.distinct_values} distinct across ${flat.n} readings`);
+     `${flat.distinct_values} distinct across the last ${flat.n} readings`);
   await del(`${BASE}/simulator/fault`);
 
   // ----------------------------------------------------------------- alerts
