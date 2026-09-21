@@ -9,8 +9,9 @@ A Digital Twin platform for one commercial building. npm-workspaces monorepo,
 not a monorepo build system — three apps, two shared packages, no Turborepo.
 
 Read [docs/decisions.md](docs/decisions.md) before changing the data model. It
-records ten decisions where the obvious choice is wrong for building analytics,
-each with the reasoning and, where it was checked, the evidence.
+records 62 decisions where the obvious choice is wrong for building analytics,
+each with the reasoning and, where it was checked, the evidence. (It said "ten"
+for far longer than it was true — if you add an ADR, fix this number.)
 
 ## Current state
 
@@ -23,9 +24,12 @@ four packages are tenant-scoped:
   are authorised per tenant on subscribe.
 - `apps/web` — the tenant comes from the session cookie (`lib/tenant.ts`), never
   from a request parameter. With no session it falls back to
-  `DTWIN_DEMO_TENANT_ID`, which is **ignored when `NODE_ENV=production`**; an
-  unauthenticated request then redirects to `/login`. Routes return the one
-  shared `unauthorized()` 401 rather than hand-writing the body.
+  `DTWIN_DEMO_TENANT_ID` — but only when **`DTWIN_ALLOW_DEMO_TENANT` is
+  exactly `'true'`**. It is NOT gated on `NODE_ENV`; nothing on that path has
+  read `NODE_ENV` since the fallback became an explicit runtime opt-in, and
+  four separate documents went on claiming otherwise. With the fallback off, an
+  unauthenticated request redirects to `/login`. Routes return the one shared
+  `unauthorized()` 401 rather than hand-writing the body.
 - `apps/sim` — a ContextVar bound by `tenant_scope()`, read by `connection()`,
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
