@@ -315,7 +315,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const state = url.searchParams.get('state');
       const filter = state === 'live' || state === 'resolved' ? state : undefined;
       return send(res, 200, {
-        alerts: await listAlerts(who.principal.tenantId, filter),
+        ...await listAlerts(who.principal.tenantId, filter, config.ALERT_LIST_LIMIT),
       });
     }
 

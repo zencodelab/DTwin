@@ -90,8 +90,8 @@ export function Dashboard({
   const [showEquipment, setShowEquipment] = useState(true);
   const [baseline, setBaseline] = useState<Map<string, ZoneProfile>>(new Map());
   const [alertSnapshot, setAlertSnapshot] = useState<{
-    alerts: AlertWithContext[]; requestedAt: number | null;
-  }>({ alerts: [], requestedAt: null });
+    alerts: AlertWithContext[]; requestedAt: number | null; total: number; truncated: boolean;
+  }>({ alerts: [], requestedAt: null, total: 0, truncated: false });
   const [loadError, setLoadError] = useState<string | null>(null);
   const isDark = useIsDark();
 
@@ -171,8 +171,12 @@ export function Dashboard({
     const requestedAt = Date.now();
     fetch('/api/alerts', { cache: 'no-store' })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`alerts ${r.status}`))))
-      .then((d: { alerts: AlertWithContext[] }) => {
-        if (!cancelled) setAlertSnapshot({ alerts: d.alerts, requestedAt });
+      .then((d: { alerts: AlertWithContext[]; total: number; truncated: boolean }) => {
+        if (!cancelled) {
+          setAlertSnapshot({
+            alerts: d.alerts, requestedAt, total: d.total, truncated: d.truncated,
+          });
+        }
       })
       .catch((err: unknown) => {
         // An empty alert list and a failed request look identical on screen,
@@ -359,7 +363,14 @@ export function Dashboard({
           />
           <Kpi
             label="Open alerts"
-            value={String(alerts.length)}
+            // The count the route COUNTED, not the number it sent. The list is
+            // capped; saying "100" to a tenant holding 431 would understate the
+            // one number on this screen that decides whether anyone acts.
+            value={
+              alertSnapshot.truncated
+                ? `${alerts.length} of ${alertSnapshot.total}`
+                : String(alerts.length)
+            }
             color={alerts.length > 0 ? STATUS.warning : undefined}
           />
           <span className="flex items-center gap-1.5" style={{ color: 'var(--text-secondary)' }}>
@@ -518,6 +529,12 @@ export function Dashboard({
                 style={{ color: 'var(--text-muted)' }}>
               Open alerts
             </h2>
+            {alertSnapshot.truncated && (
+              <p className="px-4 pb-1 text-xs" style={{ color: STATUS.warning }}>
+                Showing the {alertSnapshot.alerts.length} most recent of{' '}
+                {alertSnapshot.total}, most severe first.
+              </p>
+            )}
             <AlertList alerts={alerts} onSelectZone={selectZoneFromAlert} />
 
             <h2 className="px-4 pb-1 pt-5 text-[11px] font-semibold uppercase tracking-wider"

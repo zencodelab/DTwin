@@ -5,6 +5,15 @@ import { currentTenant, unauthorized } from '@/lib/tenant';
 export const dynamic = 'force-dynamic';
 
 /**
+ * Alerts shown at once.
+ *
+ * Not exported: a Next.js route module may only export the handlers and a
+ * fixed set of config names, and anything else fails the build. The number is
+ * reported in the RESPONSE instead, which is where a consumer needs it.
+ */
+const ALERT_LIST_LIMIT = 100;
+
+/**
  * Alerts currently live, with spatial context joined.
  *
  * Read straight from the database rather than proxied through the ingest
@@ -20,9 +29,13 @@ export async function GET() {
   const ctx = await currentTenant();
   if (!ctx) return unauthorized();
 
-  const alerts = await withTenant(ctx, async (db) => {
-    const { rows } = await db.query(
-      `SELECT a.id, a.severity, a.state, a.message,
+  const page = await withTenant(ctx, async (db) => {
+    const { rows } = await db.query<{ totalCount: string }>(
+      // count(*) OVER () is applied after WHERE and before LIMIT, so the total
+      // costs no second round trip and cannot disagree with the page it
+      // describes.
+      `SELECT count(*) OVER () AS "totalCount",
+              a.id, a.severity, a.state, a.message,
               a.trigger_value AS "triggerValue", a.threshold,
               a.opened_at AS "openedAt", a.acknowledged_by AS "acknowledgedBy",
               a.zone_id AS "zoneId", a.sensor_id AS "sensorId",
@@ -38,10 +51,13 @@ export async function GET() {
         ORDER BY
           CASE a.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
           a.opened_at DESC
-        LIMIT 100`,
+        LIMIT $1`,
+      [ALERT_LIST_LIMIT],
     );
-    return rows;
+    const total = rows.length > 0 ? Number(rows[0]!.totalCount) : 0;
+    const alerts = rows.map(({ totalCount: _totalCount, ...alert }) => alert);
+    return { alerts, total, limit: ALERT_LIST_LIMIT, truncated: total > alerts.length };
   });
 
-  return NextResponse.json({ alerts });
+  return NextResponse.json(page);
 }

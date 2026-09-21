@@ -1182,6 +1182,18 @@ try {
   await pool.query('DELETE FROM alert_rules WHERE name LIKE $1', ['smoke:%']);
 
   // --------------------------------------------------------------- shutdown
+  // An alert list that silently stops at its cap is the one screen an operator
+  // uses to decide whether anything is wrong, reporting a number that is not
+  // the number. At the default cap this suite is nowhere near it, so what is
+  // asserted here is that the total DESCRIBES the page; [12] reaches the cap.
+  const listed = await getJson<{
+    alerts: unknown[]; total: number; limit: number; truncated: boolean;
+  }>(`${BASE}/alerts`);
+  ok('the alert list reports how many alerts there are, not just how many it sent',
+     listed.total === listed.alerts.length && listed.truncated === false
+       && listed.limit === 200,
+     `${listed.alerts.length} of ${listed.total}, cap ${listed.limit}`);
+
   // Read before the shutdown below takes the server away. Everything above —
   // simulator at 600x, ~1,300 lines of checks, deliberate bad keys — ran at the
   // DEFAULT limits, and a limit an ordinary workload trips over is a bug in the
@@ -1302,6 +1314,7 @@ try {
       INGEST_PORT: String(PORT + 2),
       SIM_ENABLED: 'false',
       ALERT_ENABLED: 'false',
+      ALERT_LIST_LIMIT: '1',
       INGEST_RATE_READINGS_PER_S: '1',
       INGEST_RATE_READINGS_BURST: '10000',
       INGEST_RATE_REQUESTS_PER_S: '5',
@@ -1410,6 +1423,37 @@ try {
     ok('and the ceiling is per tenant, not per service', otherTenantSocket === 'authenticated',
        otherTenantSocket);
     for (const socket of held) socket.close();
+
+    // ---- an alert list at its cap. Before the lockout below, which would
+    // refuse this request on the address rather than answer it.
+    //
+    // Rows are made here rather than relied on: by this point the suite has
+    // resolved and cleaned up almost everything it raised, and a cap test that
+    // happens to run against one row proves nothing. Resolved, so the partial
+    // unique index on live alerts does not refuse the second one.
+    const { rows: [capSensor] } = await pool.query<{ id: string }>(
+      `SELECT id FROM sensors WHERE tenant_id = $1 LIMIT 1`, [TENANT]);
+    const capRuleId = await createRule({
+      name: `alert cap ${Date.now()}`, sensorId: capSensor!.id,
+      condition: 'threshold_above', threshold: 1e9,
+    });
+    await pool.query(
+      `INSERT INTO alerts (tenant_id, rule_id, sensor_id, severity, state, message, resolved_at)
+       SELECT $1, $2, $3, 'info'::alert_severity, 'resolved'::alert_state,
+              'smoke: alert cap ' || g, now()
+         FROM generate_series(1, 2) g`,
+      [TENANT, capRuleId, capSensor!.id]);
+
+    const capped = await (await fetch(`${LIMITED}/alerts`, {
+      headers: { authorization: `Bearer ${deviceKey}` },
+    })).json() as { alerts: unknown[]; total: number; limit: number; truncated: boolean };
+    ok('over its cap the list says so, and says how many it did not send',
+       capped.alerts.length === 1 && capped.limit === 1
+         && capped.total >= 3 && capped.truncated === true,
+       `sent ${capped.alerts.length} of ${capped.total}, truncated=${capped.truncated}`);
+
+    await pool.query('DELETE FROM alerts WHERE rule_id = $1', [capRuleId]);
+    await pool.query('DELETE FROM alert_rules WHERE id = $1', [capRuleId]);
 
     // ---- failed authentication, per address. LAST, because it is meant to
     // lock this address out, good key or not.

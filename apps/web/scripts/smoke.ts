@@ -160,8 +160,17 @@ async function main(): Promise<void> {
        (await status(`/api/sensors/${sensorId}/history?resolution=1h&hours=169`)) === 200);
 
     console.log('\n[5] Alerts');
-    const alerts = await getJson<{ alerts: unknown[] }>('/api/alerts');
+    const alerts = await getJson<{
+      alerts: unknown[]; total: number; limit: number; truncated: boolean;
+    }>('/api/alerts');
     ok('alerts endpoint answers', Array.isArray(alerts.alerts));
+    // The list is capped. A cap that does not say so leaves alerts invisible to
+    // every reader with nothing on screen admitting it (decisions.md §53).
+    ok('the alert list describes itself: total, cap, and whether it truncated',
+       alerts.total >= alerts.alerts.length
+         && alerts.alerts.length <= alerts.limit
+         && alerts.truncated === (alerts.total > alerts.alerts.length),
+       `${alerts.alerts.length} sent, ${alerts.total} total, cap ${alerts.limit}`);
 
     console.log('\n[6] Simulation proxy');
     const started = await fetch(`${BASE}/api/simulate`, {

@@ -100,6 +100,11 @@ const Env = z.object({
    * calling it just because the service booted.
    */
   ALERT_NOTIFY_ENABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
+  /**
+   * Alerts returned by `GET /alerts`. The response says the total and whether
+   * it truncated, so a cap can never hide an alert silently (§53).
+   */
+  ALERT_LIST_LIMIT: z.coerce.number().int().positive().default(200),
   ALERT_NOTIFY_RETRY_MS: z.coerce.number().int().positive().default(60_000),
   ALERT_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
 
