@@ -1616,3 +1616,65 @@ tree, so airflow is still per zone rather than per air handler — four AHUs eac
 see the *sum* of their zones, and a sum turns down less than its parts, so
 per-zone turn-down overstates the saving; and no economiser, which in a mild
 week is most of what a real plant would be doing.
+
+---
+
+## 60. The physics is verified against closed forms, which is not validation
+
+Every previous test of this model asserted a **direction**. Cooling peaks in the
+afternoon; a west zone peaks later than an east one; a better COP uses less
+electricity. Those catch sign errors and very little else — and this project has
+now twice shipped a model that pointed the right way and was wrong by a large
+factor: `occupancy_heat_gain_w_person` treated as entirely sensible (§48,
+overstating that gain ~70%), and the fan model whose three errors cancelled
+(§59, ±40–50% each). **Both survived every directional check in the suite.**
+
+The reason the tests were all directional is structural: the heat balance lived
+inside `run()`'s hot loop, so reaching it meant a migrated database, a seeded
+building, a spawned worker and a completed run. What that setup can observe is
+a summary — and a summary is where a factor-of-two error hides best.
+
+`integrate_substep` is now a module-level pure function: one substep for every
+zone, no database, no schedule lookup, no weather generation, no run id.
+`run()` calls it and nothing else does the arithmetic, so the tests and the
+production path cannot diverge. The extraction was proven behaviour-preserving
+before anything was asserted about it — the same three-day request, before and
+after, agreeing to twelve decimal places on every end use.
+
+**What is now checked against something independent of the code:**
+
+| Case | Closed form |
+|---|---|
+| Free float, envelope only | `T(t) = T_out + (T₀−T_out)·e^(−t/τ)`, `τ = C/UA` |
+| The same, discretely | `T_n = T_out + (T₀−T_out)(1 − UA·dt/C)ⁿ` — matched to 1e-12 |
+| Convergence order | halving `dt` halves the error: explicit Euler's published first order |
+| Time constant | 63.2% of the step covered after one `τ` |
+| Steady state | a constant gain settles at exactly `Q/UA` above outdoors |
+| Linearity | double the gain, double the rise |
+| First law | `C·ΔT = (q_net + q_hvac)·dt`, exactly, floating **and** pinned **and** short of capacity |
+| Ideal loads | a pinned zone is cooled by exactly its load — the equality that *is* §22 |
+| Step independence | 6 h of pinned cooling = `load × hours`, identical at dt = 60, 300 and 900 s |
+| Capacity shortfall | the zone ends above setpoint by exactly the unmet watts × dt / C |
+
+**Why the convergence-order test earns its place.** An integrator converging at
+the wrong order is integrating something else. It is the sharpest statement
+available here that the discretisation is sound, and no amount of
+"cooling peaks in the afternoon" implies it.
+
+**This is verification, not validation, and the distinction is the point.** In
+ASHRAE 140's terms there are three ways to test a building model: analytical
+verification, comparative testing against another tool, and empirical validation
+against a measured building. This is the **first and weakest** — the only one
+that needs no other software and no instrumented building. It establishes that
+where the physics is simple enough to solve with a pen, the engine gives the
+pen's answer.
+
+It does **not** establish that the model is right about a real building, and
+nothing here licenses quoting an absolute kWh figure to a client. Every closed
+form above is a single zone with terms switched off; none of them exercises
+solar geometry, psychrometrics, the occupancy schedule or the fan curve
+together, because those cases have no closed form — which is exactly why
+comparative testing against EnergyPlus exists and why it is still the largest
+open item in `docs/cto-assessment.md`.
+
+The honest sentence is: *analytically verified, not calibrated.*

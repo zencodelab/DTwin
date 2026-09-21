@@ -146,10 +146,27 @@ envelope, infiltration, ventilation, and HVAC terms. Ideal-loads control predict
 unconditioned temperature and applies conditioning within an auto-sized capacity.
 HVAC energy is electrical input after COP, not simply thermal load.
 
+> 📌 **Status, 21 September 2026.** The first bullet below is closed: latent
+> load ([§48](decisions.md#48-latent-load-is-a-load-on-the-coil-not-on-the-zone)),
+> per-zone facade orientation ([§49](decisions.md#49-facade-orientation-is-derived-from-the-geometry-not-stored-beside-it)),
+> a separate heating COP and a part-load fan model
+> ([§50](decisions.md#50-the-air-side-comes-from-the-asset-register-and-the-register-is-ambiguous),
+> [§59](decisions.md#59-the-fan-turns-down-runs-for-ventilation-and-heats-the-air-it-moves))
+> are all modelled. Inter-zone transfer is not.
+>
+> **The section's central judgement stands, with one qualification.** The
+> engine is now checked against closed-form solutions — Newton cooling and its
+> convergence order, steady state, the first law, ideal-loads exactness, step
+> independence ([§60](decisions.md#60-the-physics-is-verified-against-closed-forms-which-is-not-validation)).
+> That is *analytical verification*, the weakest of ASHRAE 140's three
+> categories. There is still **no comparative testing against a reference tool
+> and no empirical validation against a measured building**, which is what the
+> rest of this section is about and what remains the largest open item.
+
 Current limitations materially affect interpretation:
 
-- No latent/dehumidification load, inter-zone heat transfer, or individual facade
-  orientation; heating and cooling share one COP.
+- No inter-zone heat transfer, no room moisture balance (indoor humidity is a
+  target, not a state), and no chiller→AHU→VAV distribution tree.
 - Plant capacity is derived from zone design loads, not calibrated equipment
   curves or a full simulation of the asset serving network.
 - `observed` means reading the weather table. The query does not filter by

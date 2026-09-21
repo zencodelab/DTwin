@@ -31,7 +31,7 @@ four packages are tenant-scoped:
   `X-Tenant-Id` header the web proxy sets from the session.
 
 Suites total **263 checks, all passing** (`db` 70, `ingest` 115, `sim` 55,
-`web` 23), plus **240 unit tests** (182 vitest, 58 pytest). CI runs types,
+`web` 23), plus **257 unit tests** (182 vitest, 75 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -165,6 +165,14 @@ service.
 - `app/models.py` mirrors `packages/types/src/simulation.ts` field for field in
   camelCase. Change one, change the other; the smoke test round-trips a request
   to catch drift.
+- **`integrate_substep` is the only place the heat balance is computed**
+  (`docs/decisions.md` §60). It is pure — no database, no schedule, no run id —
+  so the closed-form tests in `tests/test_analytical.py` exercise the same
+  arithmetic production does. Never inline physics back into `run()`'s loop,
+  and never add a second copy for a test to call.
+- **Say "analytically verified", never "validated".** Closed forms cover free
+  float, steady state, conservation, ideal loads and step independence. There
+  is still no comparison against a reference tool and no measured baseline.
 - **HVAC uses ideal-loads control** — predict the unconditioned float, correct to
   the setpoint boundary. Never react after the deadband is crossed; that makes
   results depend on the integration step (`docs/decisions.md` §22).

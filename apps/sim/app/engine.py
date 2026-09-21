@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 import numpy as np
@@ -262,6 +262,186 @@ def _timeline(start: datetime, end: datetime, step_s: int) -> list[datetime]:
     return stamps
 
 
+class StepResult(NamedTuple):
+    """Everything one integration substep produced, in watts unless named otherwise."""
+
+    temperature: np.ndarray
+    cooling_w: np.ndarray
+    heating_w: np.ndarray
+    latent_met_w: np.ndarray
+    fan_w: np.ndarray
+    coil_w: np.ndarray
+    heating_net_w: np.ndarray
+    q_net_w: np.ndarray
+    q_solar_w: np.ndarray
+    q_light_w: np.ndarray
+    q_equip_w: np.ndarray
+    q_people_w: np.ndarray
+    q_envelope_w: np.ndarray
+    q_ventilation_w: np.ndarray
+    occupants: np.ndarray
+
+
+def setpoint_band(arrays: ZoneArrays) -> tuple[np.ndarray, np.ndarray]:
+    """The temperatures HVAC works to hold between."""
+    half = arrays.deadband / 2.0
+    return arrays.setpoint - half, arrays.setpoint + half
+
+
+def integrate_substep(
+    arrays: ZoneArrays,
+    temperature: np.ndarray,
+    *,
+    t_out: float,
+    irradiance: np.ndarray,
+    occupancy_fraction: np.ndarray,
+    outdoor_humidity: float,
+    indoor_humidity: np.ndarray,
+    design_fan_w: np.ndarray,
+    dt: float,
+) -> StepResult:
+    """Advance every zone by one substep.
+
+    The whole physics of this model, in one pure function: no database, no
+    schedule lookup, no weather generation, no run id. It was inlined in
+    `run()`'s hot loop, which meant the only way to exercise the heat balance
+    was to migrate a database, seed a building and spawn a worker — so the
+    physics was the least directly tested part of the project, and what
+    coverage it had could only assert directions ("cooling peaks in the
+    afternoon") rather than values.
+
+    Pulled out, it can be compared against closed-form solutions for the cases
+    that have them (docs/decisions.md §60). `run()` calls it and nothing else
+    does the arithmetic, so the tests and the production path cannot diverge.
+    """
+    occupants = arrays.design_occupancy * occupancy_fraction
+
+    q_solar = arrays.window_area * arrays.shgc * irradiance
+    q_light = arrays.lighting_w * np.maximum(occupancy_fraction, MIN_LIGHTING_FRACTION)
+    q_equip = arrays.equipment_w * (
+        PLUG_STANDBY_FRACTION + (1.0 - PLUG_STANDBY_FRACTION) * occupancy_fraction
+    )
+    q_people = occupants * arrays.occupancy_gain_w
+
+    delta_t = t_out - temperature
+    q_envelope = arrays.ua_envelope * delta_t
+    q_infiltration = arrays.ua_infiltration * delta_t
+    ua_ventilation = (
+        occupants * arrays.ventilation_m3_s_person
+        * AIR_DENSITY_KG_M3 * AIR_CP_J_KGK
+    )
+    q_ventilation = ua_ventilation * delta_t
+
+    # The fan moves the ventilation air this balance has always charged
+    # for, so it runs whenever anyone is present, at the VAV minimum at
+    # least. That much is known before the control decision, and every
+    # watt of it ends up as heat in the airstream serving the zone — so
+    # it belongs in the balance, where the coil (or the heating it
+    # offsets) then accounts for it without a special case.
+    ventilating = occupants > 0.0
+    fan_floor_w = fans.fan_power_w(
+        np.where(ventilating, fans.MIN_FLOW_FRACTION, 0.0), design_fan_w
+    )
+
+    q_net = (
+        q_solar + q_light + q_equip + q_people
+        + q_envelope + q_infiltration + q_ventilation
+        + fans.HEAT_TO_AIRSTREAM_FRACTION * fan_floor_w
+    )
+
+    # Latent load, kept OUT of q_net on purpose.
+    #
+    # Drying air does not change its temperature, so moisture has no
+    # place in the sensible balance that decides where the zone floats
+    # to. It is a load on the COIL, not on the node — which is exactly
+    # why a sensible-only model does not approximate this term, it has
+    # no term for it. See docs/decisions.md §48.
+    #
+    # Two sources: outdoor air brought in for ventilation and leaking
+    # in through the envelope, and the people themselves.
+    outdoor_air_kg_s = (
+        (ua_ventilation + arrays.ua_infiltration) / AIR_CP_J_KGK
+    )
+    q_latent = psychro.latent_power_w(
+        outdoor_air_kg_s, outdoor_humidity, indoor_humidity
+    ) + occupants * arrays.occupancy_latent_w
+
+    # Ideal-loads control, as EnergyPlus calls it: predict where the
+    # node would float to with no HVAC, then apply exactly the power
+    # needed to land on the nearest setpoint boundary, bounded by
+    # installed plant.
+    #
+    # The naive alternative — react once the measured temperature has
+    # already crossed the deadband — is bang-bang control, and its
+    # overshoot is one step's worth of gain. That is invisible in an
+    # office (0.07 K per step) and dominant in a server room, where
+    # 90 kW into a small thermal mass moves the node 1.5 K per 300 s
+    # step and manufactures unmet hours that describe the integration
+    # step rather than the building. Predicting the float removes the
+    # overshoot entirely and makes the result step-size independent.
+    lower, upper = setpoint_band(arrays)
+
+    free_float = temperature + q_net * dt / arrays.thermal_capacity_j_k
+    per_kelvin = arrays.thermal_capacity_j_k / dt
+
+    cooling = np.clip(
+        np.where(free_float > upper, (free_float - upper) * per_kelvin, 0.0),
+        0.0, arrays.capacity_w,
+    )
+    heating = np.clip(
+        np.where(free_float < lower, (lower - free_float) * per_kelvin, 0.0),
+        0.0, arrays.capacity_w,
+    )
+    q_hvac = heating - cooling
+
+    temperature = free_float + q_hvac * dt / arrays.thermal_capacity_j_k
+
+    # Latent load is only met while the coil is running. With no
+    # cooling call there is nothing dehumidifying the space, and
+    # charging for moisture removal that did not happen would invent
+    # energy — the space simply drifts damp, which is what an
+    # unconditioned building in this climate does.
+    latent_met = np.where(cooling > 0.0, q_latent, 0.0)
+
+    # Air-side energy (§50, §59). The fan runs for ventilation or for a
+    # coil call, turns down with the sensible load to the VAV minimum,
+    # and draws power along a variable-speed curve rather than in
+    # proportion to flow.
+    running = ventilating | (cooling > 0.0) | (heating > 0.0)
+    fan_w = fans.fan_power_w(
+        fans.flow_fraction(cooling, arrays.capacity_w, running), design_fan_w
+    )
+
+    # Fan heat above the floor already in q_net. It could not go into
+    # the balance: it depends on the cooling the balance decides, and
+    # solving that circle would make the result depend on the step. So
+    # it is charged where it lands — on the coil while cooling, and as
+    # heating the coil did not have to supply while heating.
+    fan_heat_extra = fans.HEAT_TO_AIRSTREAM_FRACTION * (fan_w - fan_floor_w)
+    coil_w = cooling + latent_met + np.where(cooling > 0.0, fan_heat_extra, 0.0)
+    heating_net = np.maximum(
+        heating - np.where(heating > 0.0, fan_heat_extra, 0.0), 0.0
+    )
+
+    return StepResult(
+        temperature=temperature,
+        cooling_w=cooling,
+        heating_w=heating,
+        latent_met_w=latent_met,
+        fan_w=fan_w,
+        coil_w=coil_w,
+        heating_net_w=heating_net,
+        q_net_w=q_net,
+        q_solar_w=q_solar,
+        q_light_w=q_light,
+        q_equip_w=q_equip,
+        q_people_w=q_people,
+        q_envelope_w=q_envelope,
+        q_ventilation_w=q_infiltration + q_ventilation,
+        occupants=occupants,
+    )
+
+
 def run(
     run_id: UUID,
     request: SimulationRequest,
@@ -348,6 +528,8 @@ def run(
     interval_hours = request.intervalS / 3600.0
     dt = float(substep_s)
 
+    lower, upper = setpoint_band(arrays)
+
     rows: list[tuple] = []
     total_intervals = len(interval_starts)
     step_index = 0
@@ -367,146 +549,48 @@ def run(
             if step_index >= n_steps:
                 break
 
-            t_out = series.dry_bulb_c[step_index]
-            irradiance = irradiance_by_zone[:, step_index]
             hour = int(series.local_hour[step_index]) % 24
             day_type = int(series.day_type_index[step_index])
-
             occupancy_fraction = np.clip(
                 occupancy_table[:, day_type, hour] * arrays.occupancy_scale, 0.0, 1.0
             )
-            occupants = arrays.design_occupancy * occupancy_fraction
 
-            q_solar = arrays.window_area * arrays.shgc * irradiance
-            q_light = arrays.lighting_w * np.maximum(occupancy_fraction, MIN_LIGHTING_FRACTION)
-            q_equip = arrays.equipment_w * (
-                PLUG_STANDBY_FRACTION + (1.0 - PLUG_STANDBY_FRACTION) * occupancy_fraction
+            step = integrate_substep(
+                arrays, temperature,
+                t_out=series.dry_bulb_c[step_index],
+                irradiance=irradiance_by_zone[:, step_index],
+                occupancy_fraction=occupancy_fraction,
+                outdoor_humidity=outdoor_humidity_series[step_index],
+                indoor_humidity=indoor_humidity,
+                design_fan_w=design_fan_w,
+                dt=dt,
             )
-            q_people = occupants * arrays.occupancy_gain_w
-
-            delta_t = t_out - temperature
-            q_envelope = arrays.ua_envelope * delta_t
-            q_infiltration = arrays.ua_infiltration * delta_t
-            ua_ventilation = (
-                occupants * arrays.ventilation_m3_s_person
-                * AIR_DENSITY_KG_M3 * AIR_CP_J_KGK
-            )
-            q_ventilation = ua_ventilation * delta_t
-
-            # The fan moves the ventilation air this balance has always charged
-            # for, so it runs whenever anyone is present, at the VAV minimum at
-            # least. That much is known before the control decision, and every
-            # watt of it ends up as heat in the airstream serving the zone — so
-            # it belongs in the balance, where the coil (or the heating it
-            # offsets) then accounts for it without a special case.
-            ventilating = occupants > 0.0
-            fan_floor_w = fans.fan_power_w(
-                np.where(ventilating, fans.MIN_FLOW_FRACTION, 0.0), design_fan_w
-            )
-
-            q_net = (
-                q_solar + q_light + q_equip + q_people
-                + q_envelope + q_infiltration + q_ventilation
-                + fans.HEAT_TO_AIRSTREAM_FRACTION * fan_floor_w
-            )
-
-            # Latent load, kept OUT of q_net on purpose.
-            #
-            # Drying air does not change its temperature, so moisture has no
-            # place in the sensible balance that decides where the zone floats
-            # to. It is a load on the COIL, not on the node — which is exactly
-            # why a sensible-only model does not approximate this term, it has
-            # no term for it. See docs/decisions.md §48.
-            #
-            # Two sources: outdoor air brought in for ventilation and leaking
-            # in through the envelope, and the people themselves.
-            outdoor_air_kg_s = (
-                (ua_ventilation + arrays.ua_infiltration) / AIR_CP_J_KGK
-            )
-            q_latent = psychro.latent_power_w(
-                outdoor_air_kg_s, outdoor_humidity_series[step_index], indoor_humidity
-            ) + occupants * arrays.occupancy_latent_w
-
-            # Ideal-loads control, as EnergyPlus calls it: predict where the
-            # node would float to with no HVAC, then apply exactly the power
-            # needed to land on the nearest setpoint boundary, bounded by
-            # installed plant.
-            #
-            # The naive alternative — react once the measured temperature has
-            # already crossed the deadband — is bang-bang control, and its
-            # overshoot is one step's worth of gain. That is invisible in an
-            # office (0.07 K per step) and dominant in a server room, where
-            # 90 kW into a small thermal mass moves the node 1.5 K per 300 s
-            # step and manufactures unmet hours that describe the integration
-            # step rather than the building. Predicting the float removes the
-            # overshoot entirely and makes the result step-size independent.
-            upper = arrays.setpoint + arrays.deadband / 2.0
-            lower = arrays.setpoint - arrays.deadband / 2.0
-
-            free_float = temperature + q_net * dt / arrays.thermal_capacity_j_k
-            per_kelvin = arrays.thermal_capacity_j_k / dt
-
-            cooling = np.clip(
-                np.where(free_float > upper, (free_float - upper) * per_kelvin, 0.0),
-                0.0, arrays.capacity_w,
-            )
-            heating = np.clip(
-                np.where(free_float < lower, (lower - free_float) * per_kelvin, 0.0),
-                0.0, arrays.capacity_w,
-            )
-            q_hvac = heating - cooling
-
-            temperature = free_float + q_hvac * dt / arrays.thermal_capacity_j_k
+            temperature = step.temperature
 
             kwh = dt / J_PER_KWH
 
-            # Latent load is only met while the coil is running. With no
-            # cooling call there is nothing dehumidifying the space, and
-            # charging for moisture removal that did not happen would invent
-            # energy — the space simply drifts damp, which is what an
-            # unconditioned building in this climate does.
-            latent_met = np.where(cooling > 0.0, q_latent, 0.0)
-
-            # Air-side energy (§50, §59). The fan runs for ventilation or for a
-            # coil call, turns down with the sensible load to the VAV minimum,
-            # and draws power along a variable-speed curve rather than in
-            # proportion to flow.
-            running = ventilating | (cooling > 0.0) | (heating > 0.0)
-            fan_w = fans.fan_power_w(
-                fans.flow_fraction(cooling, arrays.capacity_w, running), design_fan_w
-            )
-
-            # Fan heat above the floor already in q_net. It could not go into
-            # the balance: it depends on the cooling the balance decides, and
-            # solving that circle would make the result depend on the step. So
-            # it is charged where it lands — on the coil while cooling, and as
-            # heating the coil did not have to supply while heating.
-            fan_heat_extra = fans.HEAT_TO_AIRSTREAM_FRACTION * (fan_w - fan_floor_w)
-            coil_w = cooling + latent_met + np.where(cooling > 0.0, fan_heat_extra, 0.0)
-            heating_net = np.maximum(
-                heating - np.where(heating > 0.0, fan_heat_extra, 0.0), 0.0
-            )
-
             # fan_w is not divided by COP: it is already electricity, not a
             # thermal load a machine has to move.
-            acc["fan"] += fan_w * kwh
+            acc["fan"] += step.fan_w * kwh
             acc["hvac"] += (
-                coil_w / arrays.cop + heating_net / arrays.heating_cop + fan_w
+                step.coil_w / arrays.cop
+                + step.heating_net_w / arrays.heating_cop
+                + step.fan_w
             ) * kwh
-            acc["latent"] += latent_met / arrays.cop * kwh
-            acc["light"] += q_light * kwh
-            acc["plug"] += q_equip * kwh
-            acc["solar"] += q_solar * kwh
-            acc["internal"] += (q_light + q_equip + q_people) * kwh
-            acc["envelope"] += q_envelope * kwh
-            acc["ventilation"] += (q_infiltration + q_ventilation) * kwh
+            acc["latent"] += step.latent_met_w / arrays.cop * kwh
+            acc["light"] += step.q_light_w * kwh
+            acc["plug"] += step.q_equip_w * kwh
+            acc["solar"] += step.q_solar_w * kwh
+            acc["internal"] += (step.q_light_w + step.q_equip_w + step.q_people_w) * kwh
+            acc["envelope"] += step.q_envelope_w * kwh
+            acc["ventilation"] += step.q_ventilation_w * kwh
 
             occupied = occupancy_fraction > 0.05
             out_of_band = (temperature > upper + UNMET_TOLERANCE_K) | (
                 temperature < lower - UNMET_TOLERANCE_K
             )
             acc["unmet"] += np.where(occupied & out_of_band, dt / 3600.0, 0.0)
-            acc["occupants"] += occupants
+            acc["occupants"] += step.occupants
             acc["temp"] += temperature
 
             step_index += 1
