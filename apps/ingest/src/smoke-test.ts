@@ -1061,6 +1061,25 @@ try {
   ok('/healthz stays open, since a load balancer has no key',
      (await fetch(`${BASE}/healthz`)).ok);
 
+  // A request id the caller chose is kept, so a trace started in the browser
+  // keeps its identity here; one that could forge a log line is replaced; and
+  // either way it comes back on the response, because an id nobody can see is
+  // an id nobody can quote (decisions.md §61).
+  const traced = await fetch(`${BASE}/healthz`, { headers: { 'x-request-id': 'trace-abc_1.2' } });
+  // Spaces and length, not a newline or a trailing space: fetch refuses to
+  // transmit either, so those can only arrive from a raw socket. The unit tests
+  // cover them at the function; this covers what a real client can put on the
+  // wire.
+  const forged = await fetch(`${BASE}/healthz`,
+    { headers: { 'x-request-id': 'not an id '.repeat(12).trim() } });
+  const minted = await fetch(`${BASE}/healthz`);
+  ok('a usable request id is echoed, a hostile one is replaced, and one is minted otherwise',
+     traced.headers.get('x-request-id') === 'trace-abc_1.2'
+       && /^[0-9a-f-]{36}$/.test(forged.headers.get('x-request-id') ?? '')
+       && /^[0-9a-f-]{36}$/.test(minted.headers.get('x-request-id') ?? ''),
+     `echoed=${traced.headers.get('x-request-id')} ` +
+     `sanitised=${forged.headers.get('x-request-id')?.slice(0, 8)}`);
+
   // The probes and the scrape endpoint are open for the same reason, which is
   // only acceptable because none of them says anything about a tenant.
   const [livez, readyz, metricsRes] = await Promise.all(

@@ -20,10 +20,10 @@
     "test:py": "cd apps/sim && .venv/bin/python -m pytest -q",
     "test:watch": "vitest",
     "typecheck": "npm run typecheck -w @dtwin/types && npm run typecheck -w @dtwin/db && npm run typecheck -w @dtwin/ingest && npm run typecheck -w @dtwin/web",
-    "dev:ingest": "npm run dev -w @dtwin/ingest",
+    "dev:ingest": "LOG_FORMAT=${LOG_FORMAT:-text} npm run dev -w @dtwin/ingest",
     "smoke": "npm run smoke -w @dtwin/db && npm run smoke -w @dtwin/ingest && npm run smoke:sim && npm run smoke -w @dtwin/web",
     "sim:install": "cd apps/sim && uv venv --python 3.12 && uv pip install -r requirements.txt",
-    "dev:sim": "cd apps/sim && .venv/bin/uvicorn app.main:app --port ${SIM_PORT:-8000}",
+    "dev:sim": "cd apps/sim && LOG_FORMAT=${LOG_FORMAT:-text} .venv/bin/uvicorn app.main:app --port ${SIM_PORT:-8000}",
     "smoke:sim": "cd apps/sim && .venv/bin/python -m app.smoke_test",
     "dev:web": "npm run dev -w @dtwin/web",
     "build": "npm run build -w @dtwin/web"

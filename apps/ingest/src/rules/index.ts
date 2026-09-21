@@ -15,6 +15,7 @@ import {
 } from './store.ts';
 import { activeTenants } from '../tenants.ts';
 import { Notifier } from './notify.ts';
+import { log } from '../log.ts';
 
 /** Conditions answerable from the current value; the rest need the sweep. */
 const INSTANTANEOUS = new Set([
@@ -104,7 +105,7 @@ export class AlertEngine {
     this.#sweepTimer ??= setInterval(() => this.sweep(), this.config.ALERT_SWEEP_INTERVAL_MS);
     this.#refreshTimer ??= setInterval(() => {
       void this.refresh().catch((err: unknown) => {
-        console.error('[alerts] refresh failed:', (err as Error).message);
+        log.error('alerts.refresh_failed', err);
       });
     }, this.config.ALERT_REFRESH_MS);
   }
@@ -294,10 +295,10 @@ export class AlertEngine {
       // fast path that delivers them now instead of at the next sweep; if it
       // throws, or the process dies before it runs, the sweep finds them.
       void this.notifier.deliverForAlert(sensor.tenantId, alert).catch((err: unknown) => {
-        console.error('[alerts] notify failed:', (err as Error).message);
+        log.error('alerts.notify_failed', err, { alertId: alert.id });
       });
     } catch (err) {
-      console.error(`[alerts] failed to open ${rule.name}:`, (err as Error).message);
+      log.error('alerts.open_failed', err, { rule: rule.name, sensorId: sensor.id });
     } finally {
       this.#inFlight.delete(key);
     }
@@ -318,7 +319,7 @@ export class AlertEngine {
       this.#counts.resolved++;
       if (alert) this.#emit({ type: 'alert.resolved', alert }, sensor);
     } catch (err) {
-      console.error('[alerts] failed to resolve:', (err as Error).message);
+      log.error('alerts.resolve_failed', err, { sensorId: sensor.id });
     } finally {
       this.#inFlight.delete(key);
     }

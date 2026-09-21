@@ -1556,6 +1556,9 @@ figures belong behind authentication, from the database.
 database. The services still log lines of text. And neither the worker nor the
 web service exposes metrics.
 
+> **The logging half is now done** ([§61](#61-one-request-id-three-services-and-an-event-name-that-is-not-prose)).
+> Metrics for the worker and the web service are not.
+
 ---
 
 ## 59. The fan turns down, runs for ventilation, and heats the air it moves
@@ -1691,3 +1694,78 @@ comparative testing against EnergyPlus exists and why it is still the largest
 open item in `docs/cto-assessment.md`.
 
 The honest sentence is: *analytically verified, not calibrated.*
+
+---
+
+## 61. One request id, three services, and an event name that is not prose
+
+§58 shipped `/metrics` and the probes and recorded what was still missing:
+structured logging with a correlation id. This is that, and it is the last of
+the three observability items the original plan named.
+
+**What was wrong with `console.error('[alerts] failed to open', name, err)`.**
+A person can read it. Nothing else can. The interesting values are interpolated
+into a sentence, so there is no field to filter on and no way to count how often
+something happened without a regex over free text. And the one that matters at
+three in the morning: **no way to select the lines belonging to the request that
+went wrong** out of every other request interleaved with it.
+
+Two separate ideas fix that.
+
+**An event name, and fields.** `event` is a stable identifier that never
+contains a value — `alerts.open_failed` — and everything variable is a named
+field. Aggregation keys on the event; the prose is for whoever reads one line.
+The wording can change freely, the event never.
+
+**A request id carried out of band.** `AsyncLocalStorage` in Node and a
+`ContextVar` in Python keep it attached to the logical request across every
+`await`, callback and background thread, so it does not have to be threaded
+through the signature of every function that might log. Code deep in the
+pipeline logs it without knowing it exists — and a simulation run keeps the id
+of the click that started it for its whole life, including the parts that
+finish long after the HTTP response.
+
+**It spans the services, which is the whole point.** The browser's id (or one
+minted at the edge) goes to the web proxy, which forwards it to the worker,
+which forwards it to ingest on `/internal/sim-event`. One `grep` returns the
+story of one click. Every service also returns it in `x-request-id`, because an
+id nobody can see is an id nobody can quote in a bug report.
+
+**A caller-supplied id is sanitised at every boundary.** Bounded to 64
+characters and `[A-Za-z0-9._-]`, because an id is written into a log line and an
+unchecked one is log forging — `\n{"level":"info"...}` would be a second record
+that never happened, and an ANSI escape drives the terminal of whoever tails the
+file. JSON output escapes newlines anyway, so the defence is belt and braces;
+text output has no such guarantee. It is **replaced rather than rejected**: the
+id is diagnostic, and failing a telemetry POST over a malformed header would be
+a poor trade.
+
+*Found while testing it:* neither `fetch` nor `httpx` will transmit a header
+value containing a newline or a trailing space — they raise locally. So those
+cases can only arrive from a raw socket, and the suites assert what a real
+client can actually put on the wire while the unit tests cover the rest at the
+function. A test that cannot send its hostile input is not testing anything.
+
+**The record shape is identical across both languages** — `ts`, `level`,
+`service`, `event`, then fields. Python's `WARNING` is mapped to `warn` and
+`CRITICAL` to `error`, because a consumer filtering `level="warn"` that silently
+misses one service is the kind of gap nobody notices until the night it matters.
+
+**Access logging is ours, not uvicorn's.** The middleware records
+`http.request` with method, path, status and duration, and uvicorn's own access
+logger is silenced rather than left to print a second, unstructured copy of the
+same event with no request id and no duration. Probe paths log at `debug` —
+three a minute saying nothing when healthy.
+
+**JSON is the default because the default is what production gets.** `text` is
+for a human watching a dev server and is what `npm run dev:*` asks for. That is
+an explicit choice by environment variable, not a `NODE_ENV` branch: this
+project has been bitten by a build-time constant gating a runtime decision.
+
+**Never log a secret.** No API keys, no session tokens, no ticket payloads, no
+passwords. A key's *id* is fine and is what an audit trail wants; the key itself
+must not reach a log file, where it outlives every rotation.
+
+**Still not done:** the web service logs through Next.js's own output rather
+than this, so the first hop of a trace is thinner than the other two; and
+neither the worker nor the web service exposes `/metrics`.

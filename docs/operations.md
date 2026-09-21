@@ -207,6 +207,19 @@ curl --fail http://localhost:8000/healthz
 docker compose logs --tail=100 ingest sim web
 ```
 
+Logs are JSON, one object per line, with a stable `event` and named fields
+([§61](decisions.md#61-one-request-id-three-services-and-an-event-name-that-is-not-prose)).
+`LOG_FORMAT=text` is for a terminal. Every request carries an `x-request-id`,
+taken from the caller when usable and returned on the response; the web proxy
+forwards it to the worker and the worker forwards it to ingest, so one id
+covers a browser click end to end:
+
+```bash
+docker compose logs --no-log-prefix ingest sim | grep '"requestId":"<id>"'
+docker compose logs --no-log-prefix ingest | python3 -c 'import sys,json;
+[print(r["event"], r.get("error","")) for r in map(json.loads, sys.stdin) if r["level"]=="error"]'
+```
+
 Under an orchestrator, liveness is `/livez` and readiness is `/readyz`. **Do not
 point a liveness probe at `/healthz` or `/readyz`**: both go 503 during a
 database outage, and restarting ingest then discards the write buffer that

@@ -4,6 +4,7 @@ import { activeTenants } from '../tenants.ts';
 import type { AlertWithContext } from '@dtwin/types';
 import type { Config } from '../config.ts';
 import { checkDestination, postPinned } from './destination.ts';
+import { log } from '../log.ts';
 
 /**
  * Alert notification delivery.
@@ -132,7 +133,7 @@ export class Notifier {
     if (!this.config.ALERT_NOTIFY_ENABLED) return;
     this.#retryTimer ??= setInterval(() => {
       void this.retryPending().catch((err: unknown) => {
-        console.error('[notify] retry sweep failed:', (err as Error).message);
+        log.error('notify.sweep_failed', err);
       });
     }, this.config.ALERT_NOTIFY_RETRY_MS);
   }
@@ -215,7 +216,12 @@ export class Notifier {
     };
 
     if (target.channel === 'log') {
-      console.log(`[notify] ${alert.severity.toUpperCase()} ${alert.message}`);
+      // The `log` channel IS a notification channel, so this is the one
+      // place a log line is the product rather than a diagnostic.
+      log.info('notify.alert', {
+        channel: 'log', severity: alert.severity, alertId: alert.id,
+        message: alert.message, zoneId: alert.zoneId,
+      });
       await this.#markDelivered(tenantId, id);
       this.#stats.delivered++;
       return;
@@ -298,7 +304,9 @@ export class Notifier {
     if (!check.ok) {
       await this.#markFailed(tenantId, id, `blocked: ${check.reason}`);
       this.#stats.blocked++;
-      console.warn(`[notify] blocked webhook ${rawUrl}: ${check.reason}`);
+      // The URL is operator-supplied configuration, not a secret, and the
+      // reason is the whole value of the line.
+      log.warn('notify.webhook_blocked', { url: rawUrl, reason: check.reason });
       return;
     }
 

@@ -81,6 +81,18 @@ whose body is `{"error":"internal error"}` and nothing more. Authentication
 runs **before** the body is read, so an unauthenticated caller is refused
 without the service parsing its payload.
 
+### Request ids
+
+Every route accepts `X-Request-Id` and returns it. A value of up to 64
+characters from `[A-Za-z0-9._-]` is kept; anything else is replaced with a
+fresh one rather than refused, so a malformed header never fails a telemetry
+POST. The same id appears in every log record for that request, and the web
+proxy and the simulation worker pass it along, so one id covers a browser click
+across all three services
+([§61](decisions.md#61-one-request-id-three-services-and-an-event-name-that-is-not-prose)).
+A 500 response carries it in the body as well, since that is the one case where
+the caller has nothing else to quote.
+
 ### Rate limits
 
 Every authenticated route can answer **429**, always with a `Retry-After`

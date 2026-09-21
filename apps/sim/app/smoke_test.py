@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -177,6 +178,22 @@ try:
         # ------------------------------------------------------------ plumbing
         print("\n[1] Service and validation")
         ok("healthz reports ok", client.get(f"{BASE}/healthz").json()["status"] == "ok")
+
+        # The middle hop of the trace. The web proxy sends the browser's id
+        # here, and this worker sends it on to ingest, so one id covers a click
+        # end to end (decisions.md §61).
+        traced = client.get(f"{BASE}/healthz", headers={"x-request-id": "trace-abc_1.2"})
+        # Spaces and length, not a newline or a trailing space: httpx refuses
+        # to transmit either, so those can only arrive from a raw socket. The
+        # unit tests cover them at the function; this covers what a real client
+        # can actually put on the wire.
+        forged = client.get(
+            f"{BASE}/healthz", headers={"x-request-id": ("not an id " * 12).strip()})
+        ok("a usable request id is echoed and a hostile one is replaced",
+           traced.headers.get("x-request-id") == "trace-abc_1.2"
+           and re.fullmatch(r"[A-Za-z0-9._-]{1,64}",
+                            forged.headers.get("x-request-id") or ""),
+           f"echoed={traced.headers.get('x-request-id')}")
         ok(
             "unknown building is a 404",
             client.post(f"{BASE}/simulate", json={

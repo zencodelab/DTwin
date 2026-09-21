@@ -20,6 +20,8 @@ from uuid import UUID
 
 import httpx
 
+from . import log as applog
+
 log = logging.getLogger("sim.notify")
 
 INGEST_BASE_URL = os.environ.get("INGEST_BASE_URL", "http://localhost:8787")
@@ -37,6 +39,11 @@ def _post(payload: dict[str, Any]) -> bool:
     headers = {"content-type": "application/json"}
     if INGEST_API_KEY:
         headers["authorization"] = f"Bearer {INGEST_API_KEY}"
+    # Forward the id, so the last hop of the trace joins the first two. The
+    # web proxy gave it to this worker; this worker gives it to ingest.
+    request_id = applog.get_request_id()
+    if request_id:
+        headers["x-request-id"] = request_id
 
     try:
         response = httpx.post(
@@ -46,14 +53,17 @@ def _post(payload: dict[str, Any]) -> bool:
             timeout=TIMEOUT_S,
         )
         if response.status_code >= 400:
-            log.warning("ingest rejected %s: %s %s",
-                        payload.get("type"), response.status_code, response.text[:200])
+            log.warning("ingest.rejected", extra={
+                "eventType": payload.get("type"),
+                "status": response.status_code,
+                "body": response.text[:200],
+            })
             return False
         return True
     except httpx.HTTPError as exc:
         # Debug, not warning: ingest being down is normal in a worker-only
         # deployment, and a failed broadcast changes nothing about the run.
-        log.debug("could not reach ingest: %s", exc)
+        log.debug("ingest.unreachable", extra={"error": str(exc)})
         return False
 
 

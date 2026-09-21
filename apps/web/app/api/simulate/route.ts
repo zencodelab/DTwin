@@ -21,6 +21,20 @@ function workerAuth(): Record<string, string> {
 const SIM_BASE = process.env.SIM_BASE_URL ?? 'http://localhost:8000';
 
 /**
+ * Forward the caller's request id so one id covers the whole click.
+ *
+ * This route is the gateway: the browser's fetch, the worker's run and the
+ * relay the worker posts back to ingest are otherwise three unrelated log
+ * files with no shared key (docs/decisions.md §61). Both services sanitise
+ * what arrives, so nothing here has to trust the header's contents — only
+ * pass it along.
+ */
+function traceHeaders(request: Request): Record<string, string> {
+  const id = request.headers.get('x-request-id');
+  return id ? { 'x-request-id': id } : {};
+}
+
+/**
  * Proxy to the Python worker.
  *
  * The browser never talks to the simulation service directly: it is an internal
@@ -42,6 +56,7 @@ export async function POST(request: Request) {
         'content-type': 'application/json',
         'x-tenant-id': ctx.tenantId,
         ...workerAuth(),
+        ...traceHeaders(request),
       },
       body: JSON.stringify(body),
     });
@@ -65,7 +80,7 @@ export async function GET(request: Request) {
   if (!run.ok) return run.response;
   const runId = run.value;
 
-  const headers = { 'x-tenant-id': ctx.tenantId, ...workerAuth() };
+  const headers = { 'x-tenant-id': ctx.tenantId, ...workerAuth(), ...traceHeaders(request) };
 
   try {
     // `.ok` is checked before `.json()`. Without it a worker 404 or 500 parsed

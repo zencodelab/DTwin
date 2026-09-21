@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **266 checks, all passing** (`db` 70, `ingest` 117, `sim` 55,
-`web` 24), plus **257 unit tests** (182 vitest, 75 pytest). CI runs types,
+Suites total **268 checks, all passing** (`db` 70, `ingest` 118, `sim` 56,
+`web` 24), plus **279 unit tests** (195 vitest, 84 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -113,6 +113,12 @@ Do not "optimise" it back to COPY.
 - **Never hold a database connection across a password hash.** `login()` is
   three steps for this reason; scrypt also shares libuv's four threads with
   hostname resolution, which is why the sign-in ceiling is three, not four.
+- **Log an event name and fields, never a sentence** (`docs/decisions.md` §61).
+  `log.info('alerts.open_failed', { rule })`, not `console.error('[alerts] …')`.
+  The `event` never contains a value. The request id rides in
+  `AsyncLocalStorage` (TS) and a `ContextVar` (Python) — never add it to a
+  function signature. Both services emit the same record shape; Python's
+  `WARNING` maps to `warn`. **Never log a key, token, ticket or password.**
 - **Liveness never asks the database** (`docs/decisions.md` §58). `/livez` is
   the liveness probe, `/readyz` readiness; pointing liveness at `/healthz`
   restarts ingest during a database outage and discards the write buffer.

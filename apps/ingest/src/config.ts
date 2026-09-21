@@ -194,6 +194,14 @@ const Env = z.object({
    */
   WS_MAX_CONNECTIONS_PER_TENANT: z.coerce.number().int().positive().default(200),
 
+  /**
+   * Structured logging (docs/decisions.md §61). JSON by default because the
+   * default is what production gets; the dev scripts ask for `text`, which is
+   * for a human watching a terminal and is not what a machine reads.
+   */
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  LOG_FORMAT: z.enum(['json', 'text']).default('json'),
+
   SIM_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
   SIM_TICK_MS: z.coerce.number().int().positive().default(1000),
   /**

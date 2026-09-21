@@ -6,6 +6,7 @@ import { assessQuality } from './quality.ts';
 import { SensorRegistry, type RegisteredSensor } from './registry.ts';
 import { AlertEngine } from './rules/index.ts';
 import { TelemetryWriter } from './writer.ts';
+import { log } from './log.ts';
 
 /**
  * The ingest path, in one place: resolve -> quality -> persist + fan out.
@@ -63,7 +64,7 @@ export class Pipeline {
         // up its zone's rules once the engine re-expands too.
         .then(() => (this.config.ALERT_ENABLED ? this.alerts.refresh() : undefined))
         .catch((err: unknown) => {
-          console.error('[ingest] registry refresh failed:', (err as Error).message);
+          log.error('registry.refresh_failed', err);
         });
     }, this.config.INGEST_REGISTRY_REFRESH_MS);
   }
@@ -142,16 +143,17 @@ export class Pipeline {
       // database looked exactly like one with nothing new to load — while every
       // reading from a newly provisioned point was reported as an unknown id.
       void this.registry.refresh().catch((err: unknown) => {
-        console.error('[ingest] out-of-band registry refresh failed', err);
+        log.error('registry.out_of_band_refresh_failed', err);
       });
     }
 
     if (futureDated > 0) {
-      console.warn(
-        `[ingest] refused ${futureDated} reading(s) dated more than ` +
-          `${this.config.INGEST_MAX_CLOCK_SKEW_MS}ms ahead of this clock ` +
-          `(tenant ${tenantId}) — check the gateway's time`,
-      );
+      log.warn('ingest.future_dated_refused', {
+        refused: futureDated,
+        maxSkewMs: this.config.INGEST_MAX_CLOCK_SKEW_MS,
+        tenantId,
+        hint: "check the gateway's clock",
+      });
     }
 
     return { accepted: readings.length, unknownIds: [...unknown], flagged, futureDated };

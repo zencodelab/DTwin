@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import engine, notify, repository, weather
+from . import log as applog
 from .auth import verify_caller
 from .config import settings
 from .db import close_pool, connection, connection_unscoped, tenant_scope
@@ -30,7 +32,7 @@ from .models import (
     ZoneBreakdown,
 )
 
-logging.basicConfig(level=logging.INFO, format="[sim] %(message)s")
+applog.configure()
 log = logging.getLogger("sim")
 
 
@@ -55,18 +57,47 @@ async def lifespan(_: FastAPI):
         try:
             reaped = repository.reap_orphaned_runs()
             if reaped:
-                log.warning(
-                    "failed %d run(s) left in flight by a previous process", reaped
-                )
+                log.warning("runs.reaped", extra={"reaped": reaped})
         except Exception:
             # A worker that cannot reap is still a worker that can simulate.
             # /healthz reports the database separately.
-            log.exception("could not reap orphaned runs at startup")
+            log.exception("runs.reap_failed")
     yield
     close_pool()
 
 
+_PROBE_PATHS = frozenset({"/healthz"})
+
 app = FastAPI(title="DTwin simulation worker", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Bind the caller's request id, or mint one, and send it back.
+
+    Outermost, so a request that fails inside a dependency still logs under an
+    id the caller was given. The id is bound in a ContextVar, which a
+    background run inherits at creation — so the run's own log lines, written
+    long after this response, still carry the id of the click that started it
+    (docs/decisions.md §61).
+    """
+    request_id = applog.set_request_id(request.headers.get("x-request-id"))
+    started = time.monotonic()
+    response = await call_next(request)
+    response.headers["x-request-id"] = request_id
+
+    # Our own access line, so it carries the request id and a duration and is
+    # a record rather than a sentence. uvicorn's is silenced in log.configure()
+    # rather than left to print a second, unstructured copy of the same event.
+    # Probes are debug: three of them a minute, saying nothing when healthy.
+    level = logging.DEBUG if request.url.path in _PROBE_PATHS else logging.INFO
+    log.log(level, "http.request", extra={
+        "method": request.method,
+        "path": request.url.path,
+        "status": response.status_code,
+        "durationMs": round((time.monotonic() - started) * 1000, 1),
+    })
+    return response
 
 
 def tenant_id(x_tenant_id: str | None = Header(default=None)) -> str:
@@ -134,7 +165,7 @@ def _execute(run_id: UUID, request: SimulationRequest, tenant: str) -> None:
             repository.mark_running(run_id)
             engine.run(run_id, request, on_progress=on_progress)
             repository.mark_completed(run_id)
-            log.info("run %s completed", run_id)
+            log.info("run.completed", extra={"runId": str(run_id)})
 
             summary = _build_summary(run_id)
             if summary is not None:
@@ -142,14 +173,14 @@ def _execute(run_id: UUID, request: SimulationRequest, tenant: str) -> None:
         except RunCancelled:
             # mark_cancelled already ran, in the request that asked for it, so
             # the row is correct whether or not the loop noticed in time.
-            log.info("run %s cancelled", run_id)
+            log.info("run.cancelled", extra={"runId": str(run_id)})
             notify.failed(run_id, request.buildingId, "cancelled")
         # Catching broadly on purpose: the run row is the error channel. A
         # background task has no caller left to raise to, so an escaped
         # exception would strand the run at `running` forever with nothing
         # recorded — the exact state the reaper would later have to clean up.
         except Exception as exc:
-            log.exception("run %s failed", run_id)
+            log.exception("run.failed", extra={"runId": str(run_id)})
             message = f"{type(exc).__name__}: {exc}"
             repository.mark_failed(run_id, message)
             notify.failed(run_id, request.buildingId, message)

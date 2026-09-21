@@ -8,6 +8,7 @@ import {
 import { listAlerts } from './rules/store.ts';
 import { authenticate, type AuthFailure } from './auth.ts';
 import { createLimits } from './limits.ts';
+import { configureLogging, log, requestIdFrom, withRequest, bindRequestTenant } from './log.ts';
 import { ingestMetrics, renderMetrics } from './metrics.ts';
 import { loadConfig } from './config.ts';
 import { Pipeline } from './pipeline.ts';
@@ -32,6 +33,7 @@ import { DeviceSimulator, FAULT_KINDS, isFaultKind } from './simulator/index.ts'
 const config = loadConfig();
 const pipeline = new Pipeline(config);
 const limits = createLimits(config);
+configureLogging({ level: config.LOG_LEVEL, format: config.LOG_FORMAT });
 
 const simulator = new DeviceSimulator(config, pipeline.registry, (readings) => {
   pipeline.ingestResolved(readings);
@@ -118,26 +120,56 @@ function refuse(res: ServerResponse, failure: AuthFailure): void {
 }
 
 /** `authenticate`, with failures rationed per calling address. */
-function auth(req: IncomingMessage, scope: Parameters<typeof authenticate>[1]) {
-  return authenticate(req, scope, {
+async function auth(req: IncomingMessage, scope: Parameters<typeof authenticate>[1]) {
+  const result = await authenticate(req, scope, {
     limiter: limits.authFailures,
     address: clientAddress(
       req.socket.remoteAddress, req.headers['x-forwarded-for'], config.INGEST_TRUSTED_PROXY_HOPS,
     ),
   });
+  // Every later log line for this request carries the tenant, without any of
+  // them being given it.
+  if (result.ok) bindRequestTenant(result.principal.tenantId);
+  return result;
 }
 
+const PROBE_PATHS = new Set(['/healthz', '/livez', '/readyz', '/metrics']);
+
 const httpServer = createServer((req, res) => {
-  void handle(req, res).catch((err: unknown) => {
+  // One context per request, established before anything else can log. The id
+  // is the caller's when they sent a usable one, so a trace started by the
+  // dashboard keeps its identity across services; it goes back on the response
+  // so whoever saw the failure can quote it (docs/decisions.md §61).
+  const requestId = requestIdFrom(req.headers['x-request-id']);
+  const path = (req.url ?? '/').split('?')[0]!;
+  const route = `${req.method} ${path}`;
+  res.setHeader('x-request-id', requestId);
+
+  // One access record per request, written when the response finishes so it
+  // can carry the status and the duration. Probes are debug — three a minute
+  // saying nothing when healthy — and everything else is info.
+  const started = process.hrtime.bigint();
+  res.once('finish', () => {
+    const durationMs = Number(process.hrtime.bigint() - started) / 1e6;
+    const fields = {
+      method: req.method, path, status: res.statusCode,
+      durationMs: Math.round(durationMs * 10) / 10,
+    };
+    if (PROBE_PATHS.has(path)) log.debug('http.request', fields);
+    else log.info('http.request', fields);
+  });
+
+  void withRequest({ requestId, route }, () => handle(req, res)).catch((err: unknown) => {
     // Log the detail, return none of it. The message can name a table, a
     // constraint or a connection string, and a caller that could not be
-    // trusted with the request cannot be trusted with the post-mortem.
-    console.error('[ingest] unhandled error', err);
+    // trusted with the request cannot be trusted with the post-mortem. The id
+    // is the bridge: it is in both, and it discloses nothing.
+    log.error('http.unhandled', err);
     // Writing a second time throws inside this catch, which is how a response
     // that had already started became an unhandled rejection rather than a
     // logged fault.
     if (res.headersSent) return res.destroy();
-    send(res, 500, { error: 'internal error' });
+    send(res, 500, { error: 'internal error', requestId });
   });
 });
 
@@ -434,7 +466,7 @@ wss.on('connection', (socket: WebSocket) => {
     try {
       socket.send(JSON.stringify(message));
     } catch (err) {
-      console.error('[ingest] failed to reply on socket', err);
+      log.error('ws.reply_failed', err, { subscriberId: id });
     }
   };
 
@@ -545,7 +577,7 @@ wss.on('connection', (socket: WebSocket) => {
 // ------------------------------------------------------------------ lifecycle
 
 async function shutdown(signal: string): Promise<void> {
-  console.log(`\n[ingest] ${signal} — draining`);
+  log.info('service.draining', { signal });
   simulator.stop();
   wss.close();
   httpServer.close();
@@ -562,9 +594,15 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
 await pipeline.start();
 if (config.SIM_ENABLED) {
   await simulator.start();
-  console.log(`[ingest] simulator on — ${pipeline.registry.size} sensors, speedup ${config.SIM_SPEEDUP}x`);
+  log.info('simulator.started', {
+    sensors: pipeline.registry.size, speedup: config.SIM_SPEEDUP,
+  });
 }
 
 httpServer.listen(config.INGEST_PORT, () => {
-  console.log(`[ingest] http://localhost:${config.INGEST_PORT} · ws://localhost:${config.INGEST_PORT}/ws`);
+  log.info('service.listening', {
+    port: config.INGEST_PORT,
+    http: `http://localhost:${config.INGEST_PORT}`,
+    ws: `ws://localhost:${config.INGEST_PORT}/ws`,
+  });
 });
