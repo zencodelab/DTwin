@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **263 checks, all passing** (`db` 70, `ingest` 115, `sim` 55,
-`web` 23), plus **257 unit tests** (182 vitest, 75 pytest). CI runs types,
+Suites total **266 checks, all passing** (`db` 70, `ingest` 117, `sim` 55,
+`web` 24), plus **257 unit tests** (182 vitest, 75 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -129,6 +129,10 @@ Do not "optimise" it back to COPY.
   conditions, and keep `rate_of_change` on a least-squares fit.** Each guards
   against a specific way the alert list turns into ignorable noise — see
   `docs/decisions.md` §16–18.
+- **A list that stops at its cap says so.** Both alert listings return
+  `total`, `limit` and `truncated` beside the page, via `count(*) OVER ()` in
+  the same query (`docs/decisions.md` §53, §56). Never return a bare array from
+  a capped query.
 - **Alerts are never coalesced or shed.** Telemetry has a successor; an alert
   does not. That includes the SOCKET: `Fanout.send(…, { mustDeliver: true })`
   closes a client too backlogged to take the frame rather than skipping it, and

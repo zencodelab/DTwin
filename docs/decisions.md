@@ -1433,6 +1433,19 @@ fires while it is behind, and reconnects into the same link. That is visible —
 it is the honest state: that client is not receiving a live feed, and a green
 light over a connection silently dropping frames was the alternative.
 
+> **Since addressed.** Both alert listings now return `total`, `limit` and
+> `truncated` beside the page, and the dashboard shows "100 of 431" rather than
+> "100". The cap stays — it truncates rather than throwing, unlike the spatial
+> tree, because the ordering is severity-then-recency so the head of the list is
+> the part worth acting on, and refusing would take the whole screen away to
+> protect the tail. `count(*) OVER ()` supplies the total in the same query:
+> window functions run after `WHERE` and before `LIMIT`, so it costs no second
+> round trip and cannot disagree with the page it describes.
+>
+> One consequence to know: while truncated, an alert outside the page does not
+> appear when one inside it resolves, until the next snapshot (five minutes).
+> The count is right throughout, which is what the screen is read for.
+
 Still not addressed: the alert list is capped at 100 by the route, and an alert
 beyond that is invisible to this reconciliation as to everything else.
 

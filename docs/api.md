@@ -57,7 +57,7 @@ Source: [ingest server](../apps/ingest/src/server.ts).
 | `GET /readyz` | none | — | 200 or 503 by the same judgement as `/healthz`, without the payload; the readiness probe |
 | `GET /metrics` | none | — | Prometheus text exposition (`text/plain; version=0.0.4`) of the same counters. Process-level only: no tenant, sensor or key appears in any label, which is what lets it be served without a key |
 | `POST /ingest` | `ingest:write` | `RawTelemetryBatch` | 202 `{accepted, unknownIds, flagged, futureDated}`; a malformed JSON body is 400 and an oversized one 413. `unknownIds` also covers a real external id that belongs to **another tenant** — the key's own tenant genuinely does not have that point. `futureDated` counts readings refused for a timestamp more than `INGEST_MAX_CLOCK_SKEW_MS` (default 60 s) ahead of the server clock: unlike every other bad reading, those are not stored with a quality flag, because one of them blinds the rollups for every tenant ([§46](decisions.md#46-a-future-dated-reading-blinds-the-5-minute-view-for-everyone)) |
-| `GET /alerts` | `ingest:write` | Optional `state=live` or `state=resolved` | `{alerts: [...]}` for the key's own tenant; missing/unrecognized filter means all states |
+| `GET /alerts` | `ingest:write` | Optional `state=live` or `state=resolved` | `{alerts, total, limit, truncated}` for the key's own tenant; missing/unrecognized filter means all states. `total` counts every matching alert, so a page at its `ALERT_LIST_LIMIT` (200) can never hide one silently ([§53](decisions.md#53-every-bound-says-what-it-does-when-it-is-reached)) |
 | `POST /alerts/ack` | `ingest:write` | `{alertId}` plus header `x-acting-user: <userId>` | 200 `{alert}`; missing fields 400; alert not open **or belonging to another tenant** 409 — the two cases are deliberately indistinguishable, so a caller cannot use this route to learn that an id exists elsewhere |
 | `POST /simulator/fault` | `ingest:write` | `{sensorId}` or `{externalId}`, plus `kind`, optional `magnitude` | 200 with sensor/kind; missing sensor, or a sensor id belonging to another tenant, 404; missing kind 400 |
 | `DELETE /simulator/fault` | `ingest:write` | Optional `sensorId` query parameter | Clears that sensor's fault (404 if it is another tenant's), or every fault **for the key's own tenant** when the parameter is omitted — never every fault on the process |
@@ -154,7 +154,7 @@ Sources: [Next.js routes](../apps/web/app/api).
 | `GET /api/heatmap` | Required `buildingId`; `metric=temperature_c`, `hours=1` defaults | `{zones}` with values, setpoints and deadbands; missing data is null |
 | `GET /api/zones/{id}` | Zone UUID | `{readings, equipment, maintenance, profile}` |
 | `GET /api/sensors/{id}/history` | `resolution=5m` and `hours=6` defaults | `{buckets}`; resolution allows `5m`, `1h`, `1d` |
-| `GET /api/alerts` | None | At most 100 non-resolved alerts, ordered by severity then opening time |
+| `GET /api/alerts` | None | `{alerts, total, limit, truncated}` — at most 100 non-resolved alerts, ordered by severity then opening time, with the full count beside them |
 | `POST /api/simulate` | Worker simulation request | Proxies worker response/status; connection failure returns 502 |
 | `GET /api/simulate` | Required `runId` | `{run}` while unfinished; full summary after completion |
 
