@@ -1,4 +1,7 @@
-import { METRIC_UNITS, topics, type AlertWithContext, type Reading, type ServerMessage, type Topic } from '@dtwin/types';
+import {
+  METRIC_UNITS, Quality, topics,
+  type AlertWithContext, type Reading, type ServerMessage, type Topic,
+} from '@dtwin/types';
 import type { Config } from '../config.ts';
 import { topicsFor, type Fanout } from '../fanout.ts';
 import type { RegisteredSensor, SensorRegistry } from '../registry.ts';
@@ -59,6 +62,11 @@ export interface EngineStats {
  * nobody reads. The cooldown then bounds how quickly the same target may
  * re-open after resolving.
  */
+/**
+ * How long a live setpoint reading stands in for the profile's designed value.
+ */
+const SETPOINT_STALE_MS = 60 * 60 * 1000;
+
 export class AlertEngine {
   #rules: AlertRuleRow[] = [];
   #targets: RuleTarget[] = [];
@@ -67,7 +75,8 @@ export class AlertEngine {
   #sensorState = new Map<string, SensorState>();
   #targetState = new Map<string, TargetState>();
   #profileSetpoints = new Map<string, number>();
-  #liveSetpoints = new Map<string, number>();
+  /** zoneId -> the last GOOD setpoint reading, with when it was taken. */
+  #liveSetpoints = new Map<string, { value: number; ts: number }>();
   #inFlight = new Set<string>();
   #startedAt = 0;
   #sweepTimer: NodeJS.Timeout | null = null;
@@ -195,9 +204,23 @@ export class AlertEngine {
 
     this.#sensorState.set(sensor.id, state);
 
-    // A live setpoint point overrides the zone's profile value.
-    if (sensor.metric === 'setpoint_temp_c' && sensor.zoneId) {
-      this.#liveSetpoints.set(sensor.zoneId, reading.value);
+    // A live setpoint point overrides the zone's profile value — but only a
+    // GOOD one, and only while it is fresh.
+    //
+    // This store used to accept every setpoint reading unconditionally, a few
+    // lines from the gate that refuses a flagged reading as a VALUE (§17). So a
+    // setpoint point reporting an implausible number became the comparison
+    // baseline for every `deviation_from_setpoint` rule in its zone, and
+    // nothing ever evicted it: the zone stayed pinned to a bad reference until
+    // the process restarted. A rule whose whole job is to notice drift was
+    // measuring it from a number the quality gate had already rejected.
+    //
+    // The timestamp is kept so a setpoint point that DIES falls back to the
+    // profile rather than holding its last value for ever — §55's reasoning,
+    // applied to a reference instead of a drawn value.
+    if (sensor.metric === 'setpoint_temp_c' && sensor.zoneId
+        && reading.quality === Quality.Good) {
+      this.#liveSetpoints.set(sensor.zoneId, { value: reading.value, ts: reading.ts });
     }
 
     const targets = this.#bySensor.get(sensor.id);
@@ -217,6 +240,24 @@ export class AlertEngine {
     }
   }
 
+  /**
+   * The live setpoint for a zone, while it is still trustworthy.
+   *
+   * A fixed hour rather than the point's own sample interval, because a
+   * setpoint is a slow-moving quantity: silence that long means the point is
+   * gone, not that nobody touched the dial. Past it the profile's designed
+   * value takes over, and that cannot go stale.
+   */
+  #liveSetpointFor(zoneId: string, now: number): number | undefined {
+    const held = this.#liveSetpoints.get(zoneId);
+    if (!held) return undefined;
+    if (now - held.ts > SETPOINT_STALE_MS) {
+      this.#liveSetpoints.delete(zoneId);
+      return undefined;
+    }
+    return held.value;
+  }
+
   #evaluateTarget(target: RuleTarget, state: SensorState | undefined, now: number): void {
     const { rule, sensor, key } = target;
     if (!isEvaluable(rule, state)) return;
@@ -224,7 +265,7 @@ export class AlertEngine {
     const ctx: EvalContext = {
       now,
       setpoint: sensor.zoneId
-        ? this.#liveSetpoints.get(sensor.zoneId) ?? this.#profileSetpoints.get(sensor.zoneId)
+        ? this.#liveSetpointFor(sensor.zoneId, now) ?? this.#profileSetpoints.get(sensor.zoneId)
         : undefined,
       startedAt: this.#startedAt,
     };

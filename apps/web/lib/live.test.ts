@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Quality } from '@dtwin/types';
 import {
-  ageMs, formatAge, isStale, newer, reduceZone, zoneSource, type LiveReading,
+  ageMs, formatAge, isStale, newer, reducePower, reduceZone, zoneSource, type LiveReading,
 } from './live.ts';
 
 const NOW = 1_800_000_000_000;
@@ -142,4 +142,45 @@ describe('formatAge', () => {
     [30_000, '<1 min'], [4 * MIN, '4 min'], [59 * MIN, '59 min'],
     [90 * MIN, '1 h'], [50 * 60 * MIN, '2 d'],
   ])('%d ms → %s', (ms, expected) => expect(formatAge(ms)).toBe(expected));
+});
+
+describe('reducePower', () => {
+  const meter = (
+    floorId: string | null, over: Partial<LiveReading> = {}, sampleIntervalS = 60,
+  ) => ({ floorId, sampleIntervalS, reading: reading(over) });
+  const dead = (floorId: string | null) =>
+    meter(floorId, { ts: NOW - 30 * MIN, receivedAt: NOW - 30 * MIN });
+
+  it('sums the meters that are reporting and counts how many that was', () => {
+    const t = reducePower([meter('f1', { value: 10 }), meter('f2', { value: 5 })], null, NOW, 0);
+    expect(t).toEqual({ kw: 15, reporting: 2, meters: 2 });
+  });
+
+  it('drops a dead meter from the total rather than holding its last value', () => {
+    const t = reducePower([meter('f1', { value: 10 }), dead('f2')], null, NOW, 0);
+    expect(t).toMatchObject({ kw: 10, reporting: 1, meters: 2 });
+  });
+
+  it('drops a flagged meter too', () => {
+    const t = reducePower([meter('f1', { value: 10, quality: Quality.DeviceFault })], null, NOW, 0);
+    expect(t).toMatchObject({ kw: 0, reporting: 0, meters: 1 });
+  });
+
+  it('holds an out-of-scope meter, because we arranged its silence', () => {
+    // Focused on f1, so f2's meter hears nothing by design and keeps its value.
+    const t = reducePower([meter('f1', { value: 10 }), dead('f2')], 'f1', NOW, 0);
+    expect(t).toMatchObject({ kw: 10 + 23, reporting: 2 });
+  });
+
+  it('still judges a meter ON the focused floor — the defect this replaced did not', () => {
+    // The old code passed `since = now` for EVERY meter as soon as any floor
+    // was focused, so this dead in-scope meter went on contributing for ever.
+    const t = reducePower([meter('f1', { value: 10 }), dead('f1')], 'f1', NOW, 0);
+    expect(t).toMatchObject({ kw: 10, reporting: 1, meters: 2 });
+  });
+
+  it('treats a meter of unknown floor as out of scope while a floor is focused', () => {
+    expect(reducePower([dead(null)], 'f1', NOW, 0)).toMatchObject({ reporting: 1 });
+    expect(reducePower([dead(null)], null, NOW, 0)).toMatchObject({ reporting: 0 });
+  });
 });

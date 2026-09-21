@@ -50,13 +50,30 @@ export function ViewerMenu({
   }, [open, memberships, viewer]);
 
   if (!viewer) {
+    // A signpost, not just a label. Everything a person can DO here — sign out,
+    // switch tenant, command a setpoint — needs a person, and the demo session
+    // used to announce that it was not one without saying where to become one.
+    //
+    // The tooltip names the gate that actually exists. It used to say "ignored
+    // when NODE_ENV=production", which stopped being true when the fallback
+    // became an explicit runtime opt-in: nothing in `lib/tenant.ts` reads
+    // NODE_ENV any more.
     return (
-      <span
-        className="rounded px-2 py-1 text-xs"
-        style={{ border: '1px dashed var(--border)', color: 'var(--text-muted)' }}
-        title="DTWIN_DEMO_TENANT_ID is set and no one is signed in. Ignored when NODE_ENV=production."
-      >
-        demo tenant · {tenantName}
+      <span className="flex items-center gap-2 text-xs">
+        <span
+          className="rounded px-2 py-1"
+          style={{ border: '1px dashed var(--border)', color: 'var(--text-muted)' }}
+          title="DTWIN_ALLOW_DEMO_TENANT is true and nobody is signed in."
+        >
+          demo tenant · {tenantName}
+        </span>
+        <a
+          href="/login"
+          className="rounded px-2 py-1"
+          style={{ border: '1px solid var(--border)', color: 'var(--text-primary)' }}
+        >
+          Sign in
+        </a>
       </span>
     );
   }

@@ -148,6 +148,57 @@ export function zoneSource(live: ZoneLive, hasBaseline: boolean): ZoneSource {
   return 'none';
 }
 
+export interface MeterInput {
+  sampleIntervalS: number;
+  reading: LiveReading | undefined;
+  /** The floor this meter's equipment sits on; null when unknown. */
+  floorId: string | null;
+}
+
+export interface PowerTotal {
+  kw: number;
+  reporting: number;
+  meters: number;
+}
+
+/**
+ * Sum the meters that are actually reporting.
+ *
+ * Extracted from the dashboard because the defect it had was in the
+ * COMPOSITION, not in any one predicate: it applied "out of scope is held, not
+ * judged" as a single switch for every meter, so focusing any floor made
+ * `since = now` for all of them — which floors every age at zero and makes
+ * staleness unreachable. The KPI then froze, and a meter that had genuinely
+ * stopped went on contributing its last value for as long as the page stayed
+ * on that floor.
+ *
+ * Each meter is judged against the scope IT is in, because the subscription is
+ * per point. Summing `value ?? 0` was the earlier version of the same mistake
+ * (§55): a dead meter must leave the total, and say it left.
+ */
+export function reducePower(
+  meters: MeterInput[],
+  focusedFloorId: string | null,
+  now: number,
+  listeningSince: number,
+): PowerTotal {
+  let kw = 0;
+  let reporting = 0;
+
+  for (const meter of meters) {
+    const reading = meter.reading;
+    if (!reading || reading.quality !== Quality.Good) continue;
+
+    const inScope = focusedFloorId === null || meter.floorId === focusedFloorId;
+    const since = inScope ? listeningSince : now;
+    if (isStale(reading, meter.sampleIntervalS, now, since)) continue;
+
+    kw += reading.value;
+    reporting += 1;
+  }
+  return { kw, reporting, meters: meters.length };
+}
+
 export function formatAge(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
   if (minutes < 1) return '<1 min';

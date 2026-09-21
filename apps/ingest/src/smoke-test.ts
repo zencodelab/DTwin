@@ -1298,8 +1298,21 @@ try {
   const refusalOf = async (res: Response) =>
     ((await res.json()) as { refusal?: string }).refusal;
 
-  // Off by default, and that default is the point: an outward-ACTING capability
-  // must not switch itself on because a service booted and a table existed.
+  // Borrow the tenant's control settings, and give them back.
+  //
+  // This suite runs against the SEEDED tenant — the same one a developer has
+  // open in a browser — and section [13] has to switch control on and drop the
+  // rate limit to exercise anything. It used to set `enabled = false` in its
+  // cleanup and leave every other column where it had moved it, so a test run
+  // silently reconfigured the dev environment and left the feature looking
+  // broken to whoever was using it. A check that changes shared state owes it
+  // back exactly as found.
+  const { rows: [priorSettings] } = await owner.query<{
+    enabled: boolean; min_interval_s: number; max_deviation_k: number;
+    max_step_k: number; default_duration_s: number; max_duration_s: number;
+    command_ttl_s: number;
+  }>('SELECT * FROM control_settings WHERE tenant_id = $1', [TENANT]);
+
   await owner.query('DELETE FROM control_settings WHERE tenant_id = $1', [TENANT]);
   const offByDefault = await control(cmd());
   ok('supervisory control is refused until someone switches it on',
@@ -1406,8 +1419,32 @@ try {
   await owner.query(
     `DELETE FROM telemetry WHERE sensor_id = $1 AND quality = 2`, [ctlSensor.id]);
   await owner.query('DELETE FROM control_commands WHERE tenant_id = $1', [TENANT]);
-  await owner.query(
-    `UPDATE control_settings SET enabled = false WHERE tenant_id = $1`, [TENANT]);
+
+  // Put the settings back exactly as they were found — including absent, which
+  // is what a tenant that has never configured control looks like.
+  await owner.query('DELETE FROM control_settings WHERE tenant_id = $1', [TENANT]);
+  if (priorSettings) {
+    await owner.query(
+      `INSERT INTO control_settings
+         (tenant_id, enabled, min_interval_s, max_deviation_k, max_step_k,
+          default_duration_s, max_duration_s, command_ttl_s)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        TENANT, priorSettings.enabled, priorSettings.min_interval_s,
+        priorSettings.max_deviation_k, priorSettings.max_step_k,
+        priorSettings.default_duration_s, priorSettings.max_duration_s,
+        priorSettings.command_ttl_s,
+      ]);
+  }
+  ok('the suite gives the tenant its control settings back as it found them',
+     await (async () => {
+       const { rows } = await owner.query<{ enabled: boolean; min_interval_s: number }>(
+         'SELECT enabled, min_interval_s FROM control_settings WHERE tenant_id = $1', [TENANT]);
+       if (!priorSettings) return rows.length === 0;
+       return rows[0]?.enabled === priorSettings.enabled
+         && rows[0]?.min_interval_s === priorSettings.min_interval_s;
+     })(),
+     priorSettings ? `restored enabled=${priorSettings.enabled}` : 'restored to absent');
 
   console.log('\n[10] Graceful shutdown');
   // Put known rows in the buffer and signal before they can be flushed on the

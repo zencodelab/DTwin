@@ -81,6 +81,11 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_APP_USER:-dtwin_app}:${POSTGRES_APP_PASSWORD:-dtwin_app_dev_pwd}@db:5432/${POSTGRES_DB:-dtwin}
       - NEXT_PUBLIC_WS_URL=ws://localhost:8787/ws
       - SIM_BASE_URL=http://sim:8000
+      # Supervisory control is proxied to ingest, which owns the safety
+      # envelope. Without this the web container falls back to
+      # http://localhost:8787 — its OWN loopback, where nothing listens — and
+      # every /api/control call is a 502 that reads as "the feature is broken".
+      - INGEST_BASE_URL=http://ingest:8787
       # The worker refuses a caller that cannot present a key with the sim:run
       # scope. `npm run bootstrap` mints it.
       - SIM_API_KEY=${SIM_API_KEY:-}

@@ -19,8 +19,9 @@ export default async function Page() {
   const ctx = await currentTenant();
   // No session and no demo tenant: send them to the front door rather than
   // explaining the absence. This is the whole reason the Compose stack was
-  // unusable — NODE_ENV=production disables the demo fallback, and without a
-  // login screen that left nowhere to go.
+  // unusable — with the demo fallback off (it is opt-in via
+  // DTWIN_ALLOW_DEMO_TENANT, not NODE_ENV) and no login screen, there was
+  // nowhere to go.
   if (!ctx) redirect('/login');
 
   const viewer = await currentViewer();

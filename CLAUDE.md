@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **289 checks, all passing** (`db` 70, `ingest` 137, `sim` 56,
-`web` 26), plus **315 unit tests** (231 vitest, 84 pytest). CI runs types,
+Suites total **290 checks, all passing** (`db` 70, `ingest` 138, `sim` 56,
+`web` 26), plus **321 unit tests** (237 vitest, 84 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -245,6 +245,13 @@ service.
 
 ## Web — `apps/web`
 
+- **Gate `/login` on `currentViewer`, never `currentTenant`.** The demo
+  fallback satisfies `currentTenant`, so gating on it redirects every visitor
+  away and makes the login form unreachable — which is exactly what shipped.
+- **A check that changes shared state owes it back.** The ingest suite runs
+  against the SEEDED tenant; section [13] borrows its `control_settings` and
+  restores them, absent-if-absent. A test that reconfigures the developer's
+  environment makes a working feature look broken.
 - **There is a login screen** (`app/login`, `app/api/auth/*`), built on the
   session machinery that already existed in `packages/db`. Before it, the
   Compose stack was unusable: `next start` sets `NODE_ENV=production`, which

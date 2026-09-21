@@ -123,9 +123,21 @@ export function ControlPanel({
   };
 
   if (error) {
+    // A refusal that names its remedy should also offer it. This is the panel
+    // that tells a demo visitor they need to be a person; sending them looking
+    // for the front door on their own is how a feature reads as broken.
+    const needsSignIn = error.includes('Sign in');
     return (
       <p className="px-4 pb-3 text-xs" style={{ color: STATUS.critical }}>
         Control unavailable — {error}
+        {needsSignIn && (
+          <>
+            {' '}
+            <a href="/login" style={{ color: STATUS.warning, textDecoration: 'underline' }}>
+              Go to sign in
+            </a>
+          </>
+        )}
       </p>
     );
   }

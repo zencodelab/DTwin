@@ -14,7 +14,7 @@ import {
   magnitudeColor, temperatureColor, type OverlayMetric,
 } from '@/lib/colors';
 import { reconcileAlerts } from '@/lib/alerts';
-import { formatAge, isStale, reduceZone, zoneSource } from '@/lib/live';
+import { formatAge, reducePower, reduceZone, zoneSource } from '@/lib/live';
 import { useIsDark } from '@/lib/theme';
 import { useLiveData } from '@/lib/ws';
 
@@ -308,26 +308,38 @@ export function Dashboard({
    * says how many meters that was, because "41 kW" and "41 kW from 7 of 12
    * meters" are different facts.
    *
-   * Power meters hang off equipment, which is spread across floors, so with a
-   * floor in frame most of them are out of scope like any other floor's points
-   * and are held rather than judged.
+   * Power meters hang off equipment, which is spread across floors, so each
+   * meter is judged against the scope IT is in — not against one switch for
+   * all of them.
+   *
+   * That distinction was a real defect. This used to pass `since = now` for
+   * every meter the moment any floor was focused, which floors every age at
+   * zero and makes `isStale` unconditionally false. Focusing a floor therefore
+   * froze the KPI: meters that had genuinely stopped went on contributing
+   * their last value indefinitely, and the "n/m meters" warning could never
+   * appear. §55's rule is "silence is only evidence while we were listening" —
+   * per point, because the subscription is per point.
    */
-  const livePower = useMemo(() => {
-    const since = focusedFloorId === null ? (listeningSince ?? now) : now;
-    let sum = 0;
-    let reporting = 0;
-    let meters = 0;
-    for (const sensor of tree.sensors) {
-      if (sensor.metric !== 'power_kw') continue;
-      meters += 1;
-      const reading = readings.get(sensor.id);
-      if (!reading || reading.quality !== 0) continue;
-      if (isStale(reading, sensor.sampleIntervalS, now, since)) continue;
-      sum += reading.value;
-      reporting += 1;
-    }
-    return { kw: sum, reporting, meters };
-  }, [tree.sensors, readings, now, listeningSince, focusedFloorId]);
+  const meterFloor = useMemo(() => {
+    const equipmentFloor = new Map(tree.equipment.map((e) => [e.id, e.floorId]));
+    const zoneFloor = new Map(
+      tree.floors.flatMap((f) => f.zones.map((z) => [z.id, f.id] as const)),
+    );
+    return (sensor: SpatialTree['sensors'][number]): string | null =>
+      (sensor.equipmentId ? equipmentFloor.get(sensor.equipmentId) ?? null : null)
+      ?? (sensor.zoneId ? zoneFloor.get(sensor.zoneId) ?? null : null);
+  }, [tree.equipment, tree.floors]);
+
+  const livePower = useMemo(() => reducePower(
+    tree.sensors
+      .filter((s) => s.metric === 'power_kw')
+      .map((s) => ({
+        sampleIntervalS: s.sampleIntervalS,
+        reading: readings.get(s.id),
+        floorId: meterFloor(s),
+      })),
+    focusedFloorId, now, listeningSince ?? now,
+  ), [tree.sensors, readings, now, listeningSince, focusedFloorId, meterFloor]);
 
   const selectZoneFromAlert = useCallback((zoneId: string) => {
     const floor = tree.floors.find((f) => f.zones.some((z) => z.id === zoneId));
