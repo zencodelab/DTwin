@@ -81,6 +81,8 @@ export async function getLatestReadingsForZone(
     `SELECT DISTINCT ON (t.sensor_id)
             t.sensor_id AS "sensorId", s.metric, s.unit,
             t.value, t.quality, t.time AS ts,
+            -- The same multiple as STALE_INTERVALS in @dtwin/types/freshness.
+            -- SQL cannot import it; if that constant changes, change this too.
             (now() - t.time) > (s.sample_interval_s * 3 * INTERVAL '1 second') AS "isStale"
        FROM telemetry_t t
        JOIN sensors s ON s.id = t.sensor_id

@@ -202,7 +202,29 @@ async function main(): Promise<void> {
          `${summary?.building?.totalKwh?.toFixed(0)} kWh`);
     }
 
-    console.log('\n[7] Sign-in limits');
+    console.log('\n[7] Supervisory control');
+    // This suite runs on the demo tenant, which has no user behind it — so it
+    // exercises exactly the refusal that matters most about the control path:
+    // a command is recorded against a person, and an unattributable session
+    // cannot issue one (decisions.md §62).
+    const controlRead = await fetch(`${BASE}/api/control`);
+    const controlBody = await controlRead.json() as { error?: string };
+    ok('an unattributable session may read the building and command nothing',
+       controlRead.status === 403 && (controlBody.error ?? '').includes('recorded against a person'),
+       `HTTP ${controlRead.status}`);
+
+    const controlWrite = await fetch(`${BASE}/api/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        zoneId: '00000000-0000-4000-8000-000000000000',
+        setpointTempC: 24, reason: 'web smoke should never get this far',
+      }),
+    });
+    ok('and the write path refuses it before any zone is looked up',
+       controlWrite.status === 403, `HTTP ${controlWrite.status}`);
+
+    console.log('\n[8] Sign-in limits');
     // Addresses nobody has, fresh each run: the limiter is keyed on what was
     // typed, so an invented address exercises it exactly as a real one would —
     // which is the property that stops the 429 becoming an enumeration oracle.

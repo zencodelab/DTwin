@@ -207,6 +207,15 @@ curl --fail http://localhost:8000/healthz
 docker compose logs --tail=100 ingest sim web
 ```
 
+Supervisory control is **off until a tenant switches it on**, and an owner or
+admin must do it — `POST /control/settings {"enabled": true}`. Overrides lapse
+on their own (`effective_until`); nothing reverts them, so the way to stop one
+early is `POST /control/commands/cancel` if it has not been applied, or to wait.
+To stop everything at once, set `enabled` false: it is read on every gateway
+claim and never cached, queued commands then lapse untouched, and applied
+overrides run out on their own clocks
+([§62](decisions.md#62-the-twin-is-allowed-to-act-and-every-part-of-that-is-a-refusal)).
+
 Logs are JSON, one object per line, with a stable `event` and named fields
 ([§61](decisions.md#61-one-request-id-three-services-and-an-event-name-that-is-not-prose)).
 `LOG_FORMAT=text` is for a terminal. Every request carries an `x-request-id`,
@@ -246,6 +255,8 @@ health endpoint. Inspect the page and its API/socket behavior separately.
 | Missing gateway readings | Ingest `unknownIds`, registry contents, active sensors | Correct external-ID mapping; wait for refresh and resend with the original timestamps |
 | A zone is grey with "no reading · N min" or "reading flagged" | That zone's sensors: `last_seen_at`, and `quality` on recent rows in `telemetry` | The map is reporting a real condition, not failing: only good readings under three sample intervals old colour a zone ([§55](decisions.md#55-the-live-map-judges-a-reading-before-it-draws-one)). Fix the point; colour returns on its next good reading |
 | Clients reconnect whenever an alert fires | `fanout.backloggedClosed` on `/healthz` | Those clients were too backlogged to take an alert frame, which is never skipped ([§56](decisions.md#56-an-alert-frame-is-never-skipped-a-client-too-slow-for-one-is-disconnected)). Look at their link, or at `INGEST_CLIENT_BUFFER_MAX_BYTES` |
+| A command sits `pending` and is never applied | `GET /control/commands`; `withheld` from the gateway's claim | The gateway is not polling, or the envelope is refusing it at dispatch — equipment in fault/maintenance, or the zone's own sensor stale or flagged. `outcome_detail` on the row names which |
+| Setpoints revert on their own | `effective_until` on the applied command | Working as designed: an override expires so a dead optimiser cannot hold a building. Re-issue, or change the thermal profile if it should be permanent |
 | Gateways receive 429 | `limits` on `/healthz`; the `Retry-After` header | A tenant is over its reading budget, or an address is failing authentication. Raise `INGEST_RATE_*` only after confirming the traffic is legitimate ([§54](decisions.md#54-rate-limits-are-per-resource-keyed-by-whoever-can-exhaust-it)) |
 | Alert appears resolved in DB but open on screen | Fresh `/api/alerts` versus browser state | Reload to refresh the snapshot; track the browser reconciliation defect |
 | No notification arrives | `ALERT_NOTIFY_ENABLED`, rule config, `alert_notifications`, `alerts.notify` health counters | Inspect status and last error; exhausted attempts and resolved alerts are not automatically retried |

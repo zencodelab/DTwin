@@ -199,6 +199,16 @@ const Env = z.object({
    * default is what production gets; the dev scripts ask for `text`, which is
    * for a human watching a terminal and is not what a machine reads.
    */
+  /**
+   * Supervisory control (docs/decisions.md §62). The envelope itself is per
+   * tenant, in `control_settings`, because it is a question about a building.
+   * These two are about this process.
+   */
+  /** How often the in-process gateway collects commands. */
+  CONTROL_POLL_MS: z.coerce.number().int().positive().default(5_000),
+  CONTROL_LIST_LIMIT: z.coerce.number().int().positive().default(200),
+  CONTROL_CLAIM_MAX: z.coerce.number().int().positive().default(50),
+
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
   LOG_FORMAT: z.enum(['json', 'text']).default('json'),
 

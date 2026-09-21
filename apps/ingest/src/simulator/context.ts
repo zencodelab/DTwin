@@ -37,6 +37,16 @@ export interface EquipmentContext {
 
 export interface SimContext {
   timezone: string;
+  /**
+   * Supervisory overrides in force, zone id -> setpoint.
+   *
+   * Separate from `ZoneContext.setpointC`, which is the zone's DESIGNED
+   * setpoint and never changes. An override is a temporary layer over it, and
+   * keeping them apart is what makes expiry free: the map is rebuilt from the
+   * database each poll, and an override that has lapsed simply is not in the
+   * new one (§62).
+   */
+  overrides: Map<string, number>;
   zones: Map<string, ZoneContext>;
   equipment: Map<string, EquipmentContext>;
   /** scheduleId -> dayType -> 24 hourly fractions */
@@ -81,6 +91,9 @@ export async function loadSimContext(tenantId: string): Promise<SimContext> {
 
   return {
     timezone: building.rows[0]?.timezone ?? 'UTC',
+    // Empty until the first command poll fills it. Loading overrides here too
+    // would put the same query in two places with two lifetimes.
+    overrides: new Map<string, number>(),
     zones: new Map(zones.rows.map((z) => [z.id, z])),
     equipment: new Map(equipment.rows.map((e) => [e.id, e])),
     schedules,

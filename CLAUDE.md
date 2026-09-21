@@ -30,8 +30,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **268 checks, all passing** (`db` 70, `ingest` 118, `sim` 56,
-`web` 24), plus **279 unit tests** (195 vitest, 84 pytest). CI runs types,
+Suites total **289 checks, all passing** (`db` 70, `ingest` 137, `sim` 56,
+`web` 26), plus **315 unit tests** (231 vitest, 84 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -139,6 +139,14 @@ Do not "optimise" it back to COPY.
   `total`, `limit` and `truncated` beside the page, via `count(*) OVER ()` in
   the same query (`docs/decisions.md` §53, §56). Never return a bare array from
   a capped query.
+- **Supervisory control is the one path that WRITES to the building**
+  (`docs/decisions.md` §62). A command is an override that EXPIRES — never
+  edit `thermal_profiles.setpoint_temp_c` to apply one. Commands are PULLED by
+  the gateway, never pushed. The envelope is a pure function and runs twice:
+  at request and again at dispatch. A zone whose reading the live map would
+  refuse to paint is a zone control must refuse to command (§55). `enabled`
+  defaults to false and the kill switch is read on every claim, never cached.
+  `control:dispatch` is deliberately separate from `ingest:write`.
 - **Alerts are never coalesced or shed.** Telemetry has a successor; an alert
   does not. That includes the SOCKET: `Fanout.send(…, { mustDeliver: true })`
   closes a client too backlogged to take the frame rather than skipping it, and

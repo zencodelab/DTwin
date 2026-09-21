@@ -1,4 +1,7 @@
-import { Quality, type QualityCode } from '@dtwin/types';
+import {
+  Quality, STALE_INTERVALS, isReadingStale, readingAgeMs,
+  type QualityCode,
+} from '@dtwin/types';
 
 /**
  * What the dashboard remembers about a point, and how it decides whether that
@@ -22,11 +25,11 @@ export interface LiveReading {
 }
 
 /**
- * A point is stale after this many missed samples — the same multiple
- * `getZoneDetail` applies in SQL (`sample_interval_s * 3`), so the panel's
- * first paint and the live view agree on what stale means.
+ * Re-exported, not redefined. The rule lives in `@dtwin/types` because the
+ * supervisory control envelope applies the same one (§62): a zone this view
+ * would refuse to paint is a zone control must refuse to command.
  */
-export const STALE_INTERVALS = 3;
+export { STALE_INTERVALS };
 
 /**
  * How long ago the point was last known good, in ms.
@@ -42,14 +45,15 @@ export const STALE_INTERVALS = 3;
  * across a reconnect.
  */
 export function ageMs(reading: LiveReading, now: number, listeningSince: number): number {
-  const lastKnown = Math.max(Math.min(reading.ts, reading.receivedAt), listeningSince);
-  return Math.max(0, now - lastKnown);
+  return readingAgeMs(reading.ts, reading.receivedAt, now, listeningSince);
 }
 
 export function isStale(
   reading: LiveReading, sampleIntervalS: number, now: number, listeningSince: number,
 ): boolean {
-  return ageMs(reading, now, listeningSince) > sampleIntervalS * STALE_INTERVALS * 1000;
+  return isReadingStale(
+    reading.ts, reading.receivedAt, sampleIntervalS, now, listeningSince,
+  );
 }
 
 /**

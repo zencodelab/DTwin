@@ -105,6 +105,22 @@ export const API_SCOPES = [
    * believing that header sound — see apps/sim/app/auth.py.
    */
   'sim:run',
+  /**
+   * A BMS gateway collecting supervisory commands and reporting what it did.
+   *
+   * Separate from `ingest:write` on purpose, and this is the important part:
+   * a key that may write telemetry must not thereby be able to move a
+   * building's setpoints. They are different authorities held by the same
+   * physical device, and a single scope covering both would mean every
+   * gateway credential is a control credential (docs/decisions.md §62).
+   */
+  /**
+   * Issuing and cancelling supervisory commands on behalf of a signed-in user.
+   * Held by the web service; the acting user travels in `x-acting-user` and
+   * their ROLE is looked up in the database, never asserted by the caller.
+   */
+  'control:write',
+  'control:dispatch',
 ] as const;
 export type ApiScope = (typeof API_SCOPES)[number];
 

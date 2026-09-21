@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { METRIC_UNITS, type MetricType } from '@dtwin/types';
 import { STATUS } from '@/lib/colors';
 import { ageMs, formatAge, isStale, type LiveReading } from '@/lib/live';
+import { ControlPanel } from './ControlPanel';
 import { Sparkline, type Point } from './Sparkline';
 
 interface Reading {
@@ -243,6 +244,14 @@ export function ZonePanel({
             <Sparkline points={history} unit={METRIC_UNITS[selectedSensor.metric]} />
           </div>
         )}
+      </Section>
+
+      <Section title="Supervisory control">
+        <ControlPanel
+          zoneId={zoneId}
+          zoneName={zoneName}
+          designedSetpointC={detail.profile?.setpointC ?? null}
+        />
       </Section>
 
       <Section title="Serving equipment">

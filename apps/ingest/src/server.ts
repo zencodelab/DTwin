@@ -3,9 +3,14 @@ import { randomUUID } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { closePool, verifyWsTicket } from '@dtwin/db';
 import {
-  RawTelemetryBatch, SimEvent, clientAddress, parseClientMessage, topics, type ServerMessage,
+  CommandResultReport, ControlSettingsUpdate, RawTelemetryBatch, SetpointCommandRequest,
+  SimEvent, clientAddress, parseClientMessage, topics, type ServerMessage,
 } from '@dtwin/types';
 import { listAlerts } from './rules/store.ts';
+import { claimForGateway, issueCommand, memberRole, reportResult } from './control/service.ts';
+import {
+  cancelCommand, getSettings, listCommands, updateSettings,
+} from './control/store.ts';
 import { authenticate, type AuthFailure } from './auth.ts';
 import { createLimits } from './limits.ts';
 import { configureLogging, log, requestIdFrom, withRequest, bindRequestTenant } from './log.ts';
@@ -282,6 +287,177 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       // 202, not 200: the readings are buffered, not yet durable. Claiming
       // otherwise would be a lie the writer cannot back up.
       return send(res, 202, result);
+    }
+
+    // ---------------------------------------------------------------- control
+    //
+    // The operator surface. `control:write` says the CALLER (the web service)
+    // may act for this tenant's users; `x-acting-user` says which user; the
+    // user's ROLE is looked up in the database, never taken from the request.
+    // Three separate facts, from three sources that cannot all be forged by
+    // one of them (docs/decisions.md §62).
+    case 'POST /control/commands': {
+      const who = await auth(req, 'control:write');
+      if (!who.ok) return refuse(res, who.failure);
+
+      const actingUser = req.headers['x-acting-user'];
+      if (typeof actingUser !== 'string') {
+        return send(res, 400, { error: 'an acting user is required' });
+      }
+
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+      const parsed = SetpointCommandRequest.safeParse(json.value);
+      if (!parsed.success) {
+        return send(res, 400, {
+          error: 'invalid command',
+          issues: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
+        });
+      }
+
+      const result = await issueCommand(who.principal.tenantId, actingUser, parsed.data);
+      if (!result.ok) {
+        // 409, not 400: the request is well formed and the building's state is
+        // what refuses it. A 400 would invite the caller to fix their payload.
+        const status = result.refusal === 'unknown_zone' ? 404
+          : result.refusal === 'forbidden_role' ? 403
+          : 409;
+        return send(res, status, { error: result.message, refusal: result.refusal });
+      }
+      if (result.dryRun) {
+        return send(res, 200, {
+          dryRun: true, allowed: true,
+          previousTempC: result.verdict.previousTempC,
+          durationS: result.verdict.durationS,
+          expiresAt: result.verdict.expiresAt,
+          effectiveUntil: result.verdict.effectiveUntil,
+        });
+      }
+      return send(res, 202, { command: result.command });
+    }
+
+    case 'GET /control/commands': {
+      const who = await auth(req, 'control:write');
+      if (!who.ok) return refuse(res, who.failure);
+      return send(res, 200,
+        await listCommands(who.principal.tenantId, config.CONTROL_LIST_LIMIT));
+    }
+
+    case 'POST /control/commands/cancel': {
+      const who = await auth(req, 'control:write');
+      if (!who.ok) return refuse(res, who.failure);
+
+      const actingUser = req.headers['x-acting-user'];
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+      const body = asObject(json.value);
+      const commandId = typeof body?.commandId === 'string' ? body.commandId : null;
+      if (!commandId || typeof actingUser !== 'string') {
+        return send(res, 400, { error: 'commandId and an acting user are required' });
+      }
+
+      const role = await memberRole(who.principal.tenantId, actingUser);
+      if (role === null || role === 'viewer') {
+        return send(res, 403, { error: 'this user may not cancel commands' });
+      }
+      const cancelled = await cancelCommand(who.principal.tenantId, commandId, actingUser);
+      // Already applied, already lapsed, or another tenant's: all 409, and
+      // deliberately indistinguishable — the alternative is a way to discover
+      // which command ids exist.
+      if (!cancelled) return send(res, 409, { error: 'no command to cancel' });
+      return send(res, 200, { command: cancelled });
+    }
+
+    case 'GET /control/settings': {
+      const who = await auth(req, 'control:write');
+      if (!who.ok) return refuse(res, who.failure);
+      return send(res, 200, await getSettings(who.principal.tenantId));
+    }
+
+    case 'POST /control/settings': {
+      const who = await auth(req, 'control:write');
+      if (!who.ok) return refuse(res, who.failure);
+
+      const actingUser = req.headers['x-acting-user'];
+      if (typeof actingUser !== 'string') {
+        return send(res, 400, { error: 'an acting user is required' });
+      }
+      // The envelope and the kill switch are not an operator's to change.
+      // Commanding within limits and setting the limits are different
+      // authorities, and collapsing them would make the envelope advisory.
+      const role = await memberRole(who.principal.tenantId, actingUser);
+      if (role !== 'owner' && role !== 'admin') {
+        return send(res, 403, { error: 'only an owner or admin may change control settings' });
+      }
+
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+      const parsed = ControlSettingsUpdate.safeParse(json.value);
+      if (!parsed.success) {
+        return send(res, 400, {
+          error: 'invalid settings',
+          issues: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
+        });
+      }
+      const updated = await updateSettings(who.principal.tenantId, actingUser, parsed.data);
+      log.warn('control.settings_changed', {
+        actingUser, enabled: updated.enabled, ...parsed.data,
+      });
+      return send(res, 200, updated);
+    }
+
+    // ------------------------------------------------------- gateway surface
+    //
+    // Commands are PULLED, never pushed. A BMS gateway sits behind the
+    // building's firewall and accepts no inbound connection; it already reaches
+    // out to post telemetry, so it reaches out for its work too. That keeps the
+    // deliberate asymmetry of this service — everything enters through a
+    // request the building itself made — and means controlling a building needs
+    // no open port on the building's side.
+    case 'POST /control/dispatch/claim': {
+      const who = await auth(req, 'control:dispatch');
+      if (!who.ok) return refuse(res, who.failure);
+
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+      const body = asObject(json.value) ?? {};
+      // Names the claimant in the lease, so two gateways sharing a key are
+      // still distinguishable in the audit trail. Falls back to the key id,
+      // which every principal reaching this route has.
+      const gateway = typeof body.gateway === 'string' && body.gateway.length <= 64
+        ? body.gateway
+        : who.principal.kind === 'api_key' ? who.principal.apiKeyId : 'unknown';
+      const limit = typeof body.limit === 'number' && body.limit > 0
+        ? Math.min(Math.floor(body.limit), config.CONTROL_CLAIM_MAX)
+        : config.CONTROL_CLAIM_MAX;
+
+      const { commands, withheld } = await claimForGateway(
+        who.principal.tenantId, gateway, limit);
+      return send(res, 200, { commands, withheld });
+    }
+
+    case 'POST /control/dispatch/result': {
+      const who = await auth(req, 'control:dispatch');
+      if (!who.ok) return refuse(res, who.failure);
+
+      const json = await readJson(req);
+      if (!json.ok) return send(res, json.status, { error: json.error });
+      const body = asObject(json.value);
+      const commandId = typeof body?.commandId === 'string' ? body.commandId : null;
+      const parsed = CommandResultReport.safeParse(body);
+      if (!commandId || !parsed.success) {
+        return send(res, 400, {
+          error: 'commandId and an outcome are required',
+          issues: parsed.success ? [] : parsed.error.issues.map((i) => i.message),
+        });
+      }
+
+      const settled = await reportResult(
+        who.principal.tenantId, commandId, parsed.data.outcome, parsed.data.detail);
+      // Not dispatched to anyone, or already settled: reporting twice is not an
+      // error a gateway can act on, but it must not silently look like success.
+      if (!settled) return send(res, 409, { error: 'no dispatched command with that id' });
+      return send(res, 200, { command: settled });
     }
 
     case 'POST /internal/sim-event': {

@@ -51,6 +51,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  */
 let deviceKey = '';
 let serviceKey = '';
+let controlKey = '';
+let gatewayKey = '';
+let ADMIN_USER = '';
+let VIEWER_USER = '';
 let TENANT = '';
 let ACTING_USER = '';
 
@@ -220,8 +224,33 @@ try {
     `INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'operator')
      ON CONFLICT DO NOTHING`, [TENANT, ACTING_USER]);
 
+  // Two more identities for the control surface. An admin, because changing
+  // the envelope is deliberately not an operator's authority; and a viewer,
+  // because a read-only role that can move setpoints is not read-only.
+  const { rows: [adminUser] } = await owner.query<{ id: string }>(
+    `INSERT INTO users (email, display_name) VALUES ($1, 'Smoke Admin')
+     ON CONFLICT (lower(email)) DO UPDATE SET display_name = EXCLUDED.display_name
+     RETURNING id`, ['smoke-admin@example.invalid']);
+  ADMIN_USER = adminUser!.id;
+  await owner.query(
+    `INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'admin')
+     ON CONFLICT (tenant_id, user_id) DO UPDATE SET role = 'admin'`, [TENANT, ADMIN_USER]);
+
+  const { rows: [viewerUser] } = await owner.query<{ id: string }>(
+    `INSERT INTO users (email, display_name) VALUES ($1, 'Smoke Viewer')
+     ON CONFLICT (lower(email)) DO UPDATE SET display_name = EXCLUDED.display_name
+     RETURNING id`, ['smoke-viewer@example.invalid']);
+  VIEWER_USER = viewerUser!.id;
+  await owner.query(
+    `INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'viewer')
+     ON CONFLICT (tenant_id, user_id) DO UPDATE SET role = 'viewer'`, [TENANT, VIEWER_USER]);
+
   deviceKey = (await createApiKey(TENANT, 'device', `smoke-device-${Date.now()}`,
     ['ingest:write'])).key;
+  controlKey = (await createApiKey(TENANT, 'service', `smoke-control-${Date.now()}`,
+    ['control:write'])).key;
+  gatewayKey = (await createApiKey(TENANT, 'device', `smoke-gateway-${Date.now()}`,
+    ['control:dispatch'])).key;
   serviceKey = (await createApiKey(TENANT, 'service', `smoke-service-${Date.now()}`,
     ['sim:notify'])).key;
 
@@ -255,6 +284,10 @@ try {
       // exercise a single page, and an off-by-one at the boundary — a sensor
       // dropped or fetched twice — is exactly what paging gets wrong.
       INGEST_REGISTRY_PAGE_ROWS: '50',
+      // The in-process gateway is parked for this run, so section [13] drives
+      // the command lifecycle over HTTP deterministically rather than racing
+      // the device simulator for every claim.
+      CONTROL_POLL_MS: '3600000',
       ALERT_SMTP_URL: 'smtp://127.0.0.1:9712',
       ALERT_EMAIL_FROM: 'dtwin-alerts@example.invalid',
       AUTH_SECRET,
@@ -1221,6 +1254,160 @@ try {
   ok('the whole suite ran at the default limits without meeting one',
      Object.values(quiet).every((l) => l.refused === 0),
      Object.entries(quiet).map(([k, v]) => `${k} ${v.refused}`).join(', '));
+
+  console.log('\n[13] Supervisory control');
+  // The only part of this system that writes to the building. Everything here
+  // is a refusal except the two that should succeed, which is the right ratio
+  // for a control path (decisions.md §62).
+  const ctlZone = (await withTenant({ tenantId: TENANT }, (db) =>
+    db.query<{ id: string; name: string }>(
+      `SELECT id, name FROM zones WHERE name = 'OFF-201' LIMIT 1`))).rows[0]!;
+
+  // Own the zone before commanding it, exactly as [3] owns its telemetry
+  // window. An override left APPLIED by a previous run — or by someone trying
+  // the feature in dev — is the zone's current setpoint, so every step and
+  // every "no change" below would be measured from it rather than from the
+  // designed 23 °C. That is how the first run of this section passed four
+  // refusals that should have fired and accepted three commands that should
+  // not have existed.
+  await owner.query('DELETE FROM control_commands WHERE tenant_id = $1', [TENANT]);
+
+  const control = (body: unknown, user = ACTING_USER, key = controlKey) =>
+    fetch(`${BASE}/control/commands`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${key}`,
+        'x-acting-user': user,
+      },
+      body: JSON.stringify(body),
+    });
+  const settings = (patch: unknown, user: string) =>
+    fetch(`${BASE}/control/settings`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${controlKey}`,
+        'x-acting-user': user,
+      },
+      body: JSON.stringify(patch),
+    });
+  const cmd = (over: Record<string, unknown> = {}) =>
+    ({ zoneId: ctlZone.id, setpointTempC: 24.5, reason: 'smoke: pre-cool', ...over });
+
+  const refusalOf = async (res: Response) =>
+    ((await res.json()) as { refusal?: string }).refusal;
+
+  // Off by default, and that default is the point: an outward-ACTING capability
+  // must not switch itself on because a service booted and a table existed.
+  await owner.query('DELETE FROM control_settings WHERE tenant_id = $1', [TENANT]);
+  const offByDefault = await control(cmd());
+  ok('supervisory control is refused until someone switches it on',
+     offByDefault.status === 409 && await refusalOf(offByDefault) === 'control_disabled',
+     `HTTP ${offByDefault.status}`);
+
+  ok('an operator may not change the envelope or the kill switch',
+     (await settings({ enabled: true }, ACTING_USER)).status === 403);
+  ok('an admin may', (await settings({ enabled: true, minIntervalS: 0 }, ADMIN_USER)).status === 200);
+
+  const asViewer = await control(cmd(), VIEWER_USER);
+  ok('a viewer may not command, though they may read everything',
+     asViewer.status === 403 && await refusalOf(asViewer) === 'forbidden_role',
+     `HTTP ${asViewer.status}`);
+
+  // The envelope is measured against THIS zone's designed setpoint, not a
+  // global range: a server room and an open-plan floor do not share one.
+  ok('a setpoint outside the zone\'s envelope is refused',
+     await refusalOf(await control(cmd({ setpointTempC: 31 }))) === 'outside_envelope');
+  ok('a jump larger than one step is refused',
+     await refusalOf(await control(cmd({ setpointTempC: 26 }))) === 'step_too_large');
+  ok('a command that changes nothing is refused rather than spending a cycle',
+     await refusalOf(await control(cmd({ setpointTempC: 23 }))) === 'no_change');
+  ok('an override longer than the maximum is refused',
+     await refusalOf(await control(cmd({ durationS: 86_400 }))) === 'duration_too_long');
+  ok('an unknown zone is a 404 that says nothing about other tenants',
+     (await control(cmd({ zoneId: randomUUID() }))).status === 404);
+
+  // A dry run answers with the whole envelope applied, so an operator learns
+  // about a faulted AHU before committing — and queues nothing.
+  const dry = await control(cmd({ dryRun: true }));
+  const dryBody = await dry.json() as { allowed: boolean; previousTempC: number };
+  const beforeQueue = await (await fetch(`${BASE}/control/commands`,
+    { headers: { authorization: `Bearer ${controlKey}` } })).json() as { total: number };
+  ok('a dry run evaluates everything and queues nothing',
+     dry.status === 200 && dryBody.allowed && dryBody.previousTempC === 23
+       && beforeQueue.total === 0,
+     `allowed=${dryBody.allowed} queued=${beforeQueue.total}`);
+
+  const issued = await control(cmd());
+  const issuedBody = await issued.json() as { command: { id: string; state: string } };
+  ok('a command inside the envelope is accepted and queued',
+     issued.status === 202 && issuedBody.command.state === 'pending',
+     `HTTP ${issued.status} state=${issuedBody.command?.state}`);
+
+  ok('a second command for the same zone is refused while one is in flight',
+     await refusalOf(await control(cmd({ setpointTempC: 24.0 }))) === 'command_in_flight');
+
+  // Scope separation, and the reason it exists: the telemetry key belongs to
+  // the same physical gateway, and must not thereby move setpoints.
+  const telemetryKeyClaim = await fetch(`${BASE}/control/dispatch/claim`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${deviceKey}` },
+    body: '{}',
+  });
+  ok('a key that may post telemetry may not collect commands',
+     telemetryKeyClaim.status === 403, `HTTP ${telemetryKeyClaim.status}`);
+
+  const claim = async () => (await fetch(`${BASE}/control/dispatch/claim`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${gatewayKey}` },
+    body: JSON.stringify({ gateway: 'smoke-gateway', limit: 10 }),
+  })).json() as Promise<{ commands: Array<{ id: string }>; withheld: number }>;
+
+  const claimed = await claim();
+  ok('the gateway collects it by pulling, never by being pushed to',
+     claimed.commands.length === 1 && claimed.commands[0]!.id === issuedBody.command.id);
+
+  const secondClaim = await claim();
+  ok('a second gateway poll gets nothing — the lease is held',
+     secondClaim.commands.length === 0);
+
+  const report = async (id: string, body: unknown) => fetch(`${BASE}/control/dispatch/result`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${gatewayKey}` },
+    body: JSON.stringify({ commandId: id, ...(body as object) }),
+  });
+  ok('a failure report without a detail is refused — "it did not work" is not a record',
+     (await report(issuedBody.command.id, { outcome: 'failed' })).status === 400);
+
+  const applied = await report(issuedBody.command.id, { outcome: 'applied' });
+  ok('reporting applied settles the command',
+     applied.status === 200
+       && ((await applied.json()) as { command: { state: string } }).command.state === 'applied');
+  ok('reporting the same command twice is a 409, not a silent success',
+     (await report(issuedBody.command.id, { outcome: 'applied' })).status === 409);
+
+  // The feedback gate: §55's rule for DRAWING a zone, applied to ACTING on it.
+  // A flagged reading is refused immediately; staleness needs three missed
+  // intervals, which this suite has no time for.
+  const ctlSensor = (await withTenant({ tenantId: TENANT }, (db) =>
+    db.query<{ id: string }>(
+      `SELECT id FROM sensors WHERE zone_id = $1 AND metric = 'temperature_c' LIMIT 1`,
+      [ctlZone.id]))).rows[0]!;
+  await withTenant({ tenantId: TENANT }, (db) => db.query(
+    `INSERT INTO telemetry (time, tenant_id, sensor_id, value, quality)
+     VALUES (now(), $1, $2, -273, 2)`, [TENANT, ctlSensor.id]));
+  await settings({ minIntervalS: 0 }, ADMIN_USER);
+  // Read once: a Response body is a stream, and reading it twice throws.
+  const badFeedbackRefusal = await refusalOf(await control(cmd({ setpointTempC: 24.8 })));
+  ok('a zone whose reading the map would refuse to paint is a zone control refuses to command',
+     badFeedbackRefusal === 'feedback_unusable', `refusal=${badFeedbackRefusal}`);
+
+  await owner.query(
+    `DELETE FROM telemetry WHERE sensor_id = $1 AND quality = 2`, [ctlSensor.id]);
+  await owner.query('DELETE FROM control_commands WHERE tenant_id = $1', [TENANT]);
+  await owner.query(
+    `UPDATE control_settings SET enabled = false WHERE tenant_id = $1`, [TENANT]);
 
   console.log('\n[10] Graceful shutdown');
   // Put known rows in the buffer and signal before they can be flushed on the

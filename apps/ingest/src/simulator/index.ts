@@ -1,5 +1,8 @@
 import { withTenant } from '@dtwin/db';
 import { activeTenants } from '../tenants.ts';
+import { claimForGateway, reportResult } from '../control/service.ts';
+import { activeOverrides } from '../control/store.ts';
+import { log } from '../log.ts';
 import type { Config } from '../config.ts';
 import type { RegisteredSensor, SensorRegistry } from '../registry.ts';
 import {
@@ -62,6 +65,7 @@ export class DeviceSimulator {
   #state = new Map<string, SensorState>();
   #faults = new Map<string, Fault>();
   #timer: NodeJS.Timeout | null = null;
+  #commandTimer: NodeJS.Timeout | null = null;
   #emitted = 0;
 
   constructor(
@@ -75,7 +79,45 @@ export class DeviceSimulator {
       this.#ctx.set(tenant.id, await loadSimContext(tenant.id));
     }
     await this.#resumeCounters();
+    await this.pollCommands();
     this.#timer ??= setInterval(() => this.tick(), this.config.SIM_TICK_MS);
+    this.#commandTimer ??= setInterval(
+      () => { void this.pollCommands(); }, this.config.CONTROL_POLL_MS);
+  }
+
+  /**
+   * Act as the building's gateway.
+   *
+   * In this stack the device simulator IS the building, so it is also the thing
+   * that collects supervisory commands and applies them — through the same
+   * `claimForGateway` / `reportResult` the HTTP dispatch routes call, not a
+   * private path beside them. A real BMS gateway would poll those routes over
+   * the network instead; the lifecycle it drives is identical, which is the
+   * only reason this is worth doing in-process at all.
+   *
+   * It also refreshes the override map, so an override that has expired stops
+   * applying without anything having to revert it.
+   */
+  async pollCommands(): Promise<void> {
+    for (const [tenantId, ctx] of this.#ctx) {
+      try {
+        const { commands } = await claimForGateway(tenantId, 'device-simulator', 25);
+        for (const command of commands) {
+          // A real gateway writes to a BMS point here and reports what the
+          // equipment said. This one has nothing to write to, so it reports
+          // applied — and says so, rather than implying a confirmation it
+          // never received.
+          await reportResult(tenantId, command.id, 'applied',
+            'applied by the in-process device simulator');
+        }
+        const overrides = await activeOverrides(tenantId);
+        ctx.overrides = new Map(overrides.map((o) => [o.zoneId, o.setpointTempC]));
+      } catch (err) {
+        // A simulator that cannot reach the control tables is still a
+        // simulator that can generate telemetry.
+        log.error('simulator.command_poll_failed', err, { tenantId });
+      }
+    }
   }
 
   /**
@@ -128,6 +170,10 @@ export class DeviceSimulator {
     if (this.#timer) {
       clearInterval(this.#timer);
       this.#timer = null;
+    }
+    if (this.#commandTimer) {
+      clearInterval(this.#commandTimer);
+      this.#commandTimer = null;
     }
   }
 
@@ -252,6 +298,28 @@ function noise(scale: number): number {
   return (Math.random() - 0.5) * 2 * scale;
 }
 
+/**
+ * The setpoint the equipment is actually working to.
+ *
+ * A supervisory override wins over the zone's designed setpoint, which is the
+ * whole point of supervisory control: the equipment obeys, and the zone then
+ * moves. `setpoint_temp_c` telemetry reports the commanded value too, so the
+ * loop is visible from outside — the dashboard sees the setpoint change and
+ * then watches the temperature follow it.
+ *
+ * Expiry needs no code here. The override map is rebuilt from the database on
+ * every gateway poll, and one that has lapsed is simply absent from the new
+ * map, so the designed setpoint applies again (§62).
+ */
+export function effectiveSetpointC(
+  overrides: Map<string, number>,
+  zoneId: string | null,
+  designedC: number | undefined,
+): number {
+  const override = zoneId === null ? undefined : overrides.get(zoneId);
+  return override ?? designedC ?? 23;
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
@@ -268,7 +336,7 @@ function generate(
   const equip = sensor.equipmentId ? ctx.equipment.get(sensor.equipmentId) : undefined;
   const occ = occupancyFraction(ctx, zone, hour, dayType);
   const outdoor = outdoorTempC(hour);
-  const setpoint = zone?.setpointC ?? 23;
+  const setpoint = effectiveSetpointC(ctx.overrides, sensor.zoneId, zone?.setpointC);
 
   // How hard the air side is working: baseline ventilation plus occupancy plus
   // whatever the envelope is letting in.

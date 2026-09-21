@@ -48,15 +48,22 @@ const KEYS = [
     note: 'the Python worker\'s credential for POST /internal/sim-event',
   },
   {
-    kind: 'service', name: 'web-proxy', scopes: ['sim:run'],
-    // apps/web reads SIM_API_KEY when it proxies to the simulation worker.
+    kind: 'service', name: 'web-proxy', scopes: ['sim:run', 'control:write'],
+    // apps/web reads SIM_API_KEY when it proxies to the simulation worker and
+    // when it relays an operator's control command to ingest. `control:write`
+    // says this service may act for the tenant's users; the acting user still
+    // travels in a header and their ROLE is looked up in the database.
     env: 'SIM_API_KEY',
-    note: "the web service's credential for the simulation worker",
+    note: "the web service's credential for the worker and for control",
   },
   {
-    kind: 'device', name: 'dev-gateway', scopes: ['ingest:write'],
+    kind: 'device', name: 'dev-gateway', scopes: ['ingest:write', 'control:dispatch'],
+    // Two scopes because a gateway does two things, and they are deliberately
+    // separable: a key that may post telemetry does not thereby get to move a
+    // building's setpoints (docs/decisions.md §62). This one holds both
+    // because in this stack one device does both jobs.
     env: null,
-    note: 'present this as `authorization: Bearer …` to POST /ingest',
+    note: 'present this as `authorization: Bearer …` to POST /ingest and /control/dispatch/*',
   },
 ] as const;
 

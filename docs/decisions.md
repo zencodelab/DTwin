@@ -1769,3 +1769,148 @@ must not reach a log file, where it outlives every rotation.
 **Still not done:** the web service logs through Next.js's own output rather
 than this, so the first hop of a trace is thinner than the other two; and
 neither the worker nor the web service exposes `/metrics`.
+
+---
+
+## 62. The twin is allowed to act, and every part of that is a refusal
+
+Everything before this reads the building. This is the first thing that writes
+to it, and the difference is not one of degree: **a wrong number on a dashboard
+is read by someone who can disbelieve it; a wrong setpoint is obeyed.**
+
+So the design is mostly made of refusals, and the interesting decisions are
+about *which* refusals and *where* they live.
+
+### An override with an expiry, not an edit to the baseline
+
+`thermal_profiles.setpoint_temp_c` is the building's designed setpoint and
+nothing in the control path ever writes to it. A command is a temporary
+override that lapses at `effective_until`, after which the zone is back on its
+baseline **because nothing is overriding it any more** — no revert command, no
+cleanup job, no service that has to still be alive.
+
+That is the deadman, and it is the property the whole design rests on. The
+failure worth building around is not a bad command; it is a good command
+followed by a dead optimiser, holding every zone at 19 °C through a weekend
+with nobody able to say why. An override that expires cannot do that. A row
+that edited the profile could.
+
+*Verified against the running stack:* an override applied at t+10 s, held for
+its 20 s, and the zone was back to its designed 23.0 °C by t+35 s with nothing
+having reverted it.
+
+### Commands are pulled, never pushed
+
+CLAUDE.md has said since the beginning that devices push over `POST /ingest`
+and the WebSocket is subscribe-only. Control could have been the exception —
+and the exception would have meant an inbound connection to a building.
+
+A BMS gateway sits behind the building's firewall and accepts nothing inbound;
+it already reaches out to post telemetry, so it reaches out for its work too.
+`POST /control/dispatch/claim` hands it commands and it reports back. The
+deliberate asymmetry survives: **everything still enters through a request the
+building itself made**, and controlling a building needs no open port on the
+building's side.
+
+Claims take a lease with `FOR UPDATE SKIP LOCKED`, the same mechanism as the
+notification outbox (§51). At-least-once is the honest limit, which is why the
+commandable quantity is a **setpoint — a level, not an increment**. Applying
+the same level twice is harmless; applying the same "+1 K" twice is not. That
+is not an accident of the design, it is why the design commands levels.
+
+### Three facts, from three sources, none of which can forge the others
+
+| Fact | Source |
+|---|---|
+| this *service* may act for this tenant | the API key's `control:write` scope |
+| the acting *user* is this one | the `x-acting-user` header the web service sets from its session |
+| that user's *role* permits commanding | looked up in `tenant_members`, in the database |
+
+A proxy asserting "this user is an operator" would be the simulation worker
+trusting `X-Tenant-Id` all over again. And `control:dispatch` is a separate
+scope from `ingest:write` on purpose: one physical gateway holds both, but **a
+key that may post telemetry must not thereby be able to move a building's
+setpoints.**
+
+`viewer` cannot command. This is the first time a role in this project has
+meant anything — until now every member of a tenant could do everything a
+member could do — and it is the obvious place to start: a read-only role that
+moves setpoints is not read-only.
+
+The demo tenant cannot command either, and for a better reason than
+configuration: it has no user behind it, `requested_by` is a foreign key to
+`users`, and **a control action nobody is accountable for is not one anyone
+should accept.**
+
+### The envelope is a pure function, and it runs twice
+
+`evaluate(request, context)` reads nothing and writes nothing, so all 32 of its
+cases are exercised without a database, a gateway or a building. It runs once
+when a person asks — so they are told no while they are still there to be told
+— and **again when a gateway claims the command**, because the world moves in
+between. A command validated four minutes ago against a healthy AHU must not
+reach one that has since faulted. The second evaluation is the one that
+matters; the first is the courtesy.
+
+A command failing re-evaluation is *released*, not failed: the condition may
+clear before it expires, and a transient fault should not consume an operator's
+intent.
+
+The checks are ordered authority → capability → interlocks → value → rate,
+because the first failure is what the operator is shown and it should name the
+real problem. Interlocks precede the value check so a dead sensor is reported
+as a dead sensor, rather than the operator being told their number is fine and
+meeting the interlock on the next attempt.
+
+### The interlock that matters: you may not act on a reading you would not draw
+
+§55 established that only a good, fresh reading may colour a zone. Control
+applies **the same rule to acting**, and that is why the freshness predicate
+moved into `@dtwin/types` where both import it. A map that greys a zone because
+its sensor is dead, beside a control path that would happily command that zone
+anyway, is a system disagreeing with itself about what it knows — and the half
+that acts is the half that matters. A control loop closed over a dead sensor is
+how a building gets frozen.
+
+`degraded` equipment is deliberately still commandable: it is running and doing
+its job less well, and refusing would withdraw supervisory control exactly when
+the building needs help. `maintenance` blocks, because somebody is working on
+it and a setpoint moving under a technician's hands is how people get hurt.
+
+### Off by default, and the envelope is per tenant
+
+`control_settings.enabled` defaults to **false**. Notifications are off by
+default so a development database does not call someone's webhook; control is
+off by default because an outward-*acting* capability must never switch itself
+on merely because a service booted and a table existed. The kill switch is read
+on every claim and never cached — one that needs a restart is not a kill
+switch.
+
+The limits are per tenant rather than global because "how far may the twin move
+a setpoint" is a question about a building, and §14 says the register governs:
+a server room and an open-plan floor do not share an envelope. And setting the
+limits is an owner-or-admin authority while commanding within them is an
+operator's — collapsing those would make the envelope advisory.
+
+### What this is not
+
+**There is no BMS.** Commands are applied by the device simulator, which is
+this stack's simulated building, going through the same `claimForGateway` /
+`reportResult` the HTTP routes call rather than a private path beside them. A
+real gateway would poll those routes over the network and write to a real
+point. The lifecycle is real, the audit trail is real, the envelope is real;
+the equipment is not. It says so when it reports: *"applied by the in-process
+device simulator."*
+
+**It is not closed-loop optimisation.** Nothing yet decides *what* the setpoint
+should be — a person does, and the twin's job here is to refuse the unsafe
+ones, record the rest, and let them lapse. An optimiser writing to this surface
+is the obvious next thing and is a different decision: it would need the
+model-versus-meter comparison that §60 says is still missing, because an
+optimiser that cannot tell whether its last move helped is not optimising.
+
+*Found while building it:* my own dev testing left an applied override on a
+zone, and the smoke suite then measured every step from 24.5 °C instead of the
+designed 23 °C — four refusals that should have fired did not, and three
+commands that should not have existed were accepted. The section now owns its
+zone before commanding it, exactly as the telemetry checks own their window.

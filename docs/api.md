@@ -81,6 +81,32 @@ whose body is `{"error":"internal error"}` and nothing more. Authentication
 runs **before** the body is read, so an unauthenticated caller is refused
 without the service parsing its payload.
 
+### Supervisory control
+
+The only surface that writes to the building
+([§62](decisions.md#62-the-twin-is-allowed-to-act-and-every-part-of-that-is-a-refusal)).
+Off until a tenant switches it on.
+
+| Method and path | Auth scope | Input | Current response |
+|---|---|---|---|
+| `POST /control/commands` | `control:write` + `x-acting-user` | `SetpointCommandRequest` | 202 `{command}`; `dryRun: true` gives 200 with the resolved window and queues nothing; **409 `{error, refusal}`** when the envelope refuses (a closed set of reasons, each naming a rule); 403 for a role that may not command; 404 for an unknown zone |
+| `GET /control/commands` | `control:write` | — | `{commands, total, limit, truncated}` |
+| `POST /control/commands/cancel` | `control:write` + `x-acting-user` | `{commandId}` | 200 `{command}`; 409 if it is no longer cancellable — deliberately indistinguishable from an id that does not exist |
+| `GET /control/settings` | `control:write` | — | the tenant's envelope; created disabled on first read |
+| `POST /control/settings` | `control:write` + `x-acting-user` | `ControlSettingsUpdate` | 200; **403 unless the acting user is an owner or admin** — commanding within the envelope and setting the envelope are different authorities |
+| `POST /control/dispatch/claim` | `control:dispatch` | `{gateway?, limit?}` | `{commands, withheld}`. Commands are **pulled**: a gateway accepts no inbound connection, so it collects its work over the channel it already opens outward. Claims take a lease; `withheld` counts commands the envelope refused at dispatch and released |
+| `POST /control/dispatch/result` | `control:dispatch` | `{commandId, outcome, detail?}` | 200 `{command}`; `detail` is required on a failure; 409 if it was not dispatched or is already settled |
+
+`control:dispatch` is separate from `ingest:write` on purpose: one physical
+gateway holds both, and a key that may post telemetry must not thereby move a
+building's setpoints.
+
+The `refusal` codes are `control_disabled`, `forbidden_role`,
+`equipment_unavailable`, `feedback_unusable`, `outside_envelope`,
+`step_too_large`, `no_change`, `command_in_flight`, `too_soon`,
+`duration_too_long`, `no_baseline`. Each implies its remedy; none is a generic
+"rejected".
+
 ### Request ids
 
 Every route accepts `X-Request-Id` and returns it. A value of up to 64
@@ -163,6 +189,8 @@ Sources: [Next.js routes](../apps/web/app/api).
 | `POST /api/auth/logout` | — | Deletes the session and clears the cookie |
 | `POST /api/auth/tenant` | `{tenantId}` | Switches the session to another tenant the user belongs to |
 | `GET /api/ws-ticket` | — | `{ticket}` — a 60-second signed ticket for the ingest socket |
+| `GET /api/control` | — | `{settings, commands, total, limit, truncated}`, proxied to ingest. **403 with an explanation when the session has no user behind it** — the demo tenant can read the building and command nothing, because a command is recorded against a person |
+| `POST /api/control` | `SetpointCommandRequest` | Proxies to ingest and passes the refusal through verbatim, status and all |
 | `GET /api/heatmap` | Required `buildingId`; `metric=temperature_c`, `hours=1` defaults | `{zones}` with values, setpoints and deadbands; missing data is null |
 | `GET /api/zones/{id}` | Zone UUID | `{readings, equipment, maintenance, profile}` |
 | `GET /api/sensors/{id}/history` | `resolution=5m` and `hours=6` defaults | `{buckets}`; resolution allows `5m`, `1h`, `1d` |
