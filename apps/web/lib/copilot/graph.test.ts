@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { CommandSpec, CopilotBackend, ZoneSummary } from './backend.ts';
-import { MAX_TURNS, buildCopilotGraph, decide, sendMessage, type ModelCaller } from './graph.ts';
+import {
+  DEFAULT_MODEL, MAX_TURNS, buildCopilotGraph, decide, resolveModel, sendMessage, type ModelCaller,
+} from './graph.ts';
 import { MAX_PLAN_COMMANDS, TOOL_NAMES, runTool } from './tools.ts';
 
 // ---------------------------------------------------------------- fixtures
@@ -230,6 +232,15 @@ describe('the copilot graph', () => {
     expect(a.messages).toHaveLength(2);
     expect(b.messages).toHaveLength(2);
     expect(JSON.stringify(b.messages)).not.toContain('thread A');
+  });
+});
+
+describe('resolveModel', () => {
+  it('treats a blank COPILOT_MODEL as unset — the first real request failed on model: ""', () => {
+    expect(resolveModel({ COPILOT_MODEL: '' })).toBe(DEFAULT_MODEL);
+    expect(resolveModel({ COPILOT_MODEL: '   ' })).toBe(DEFAULT_MODEL);
+    expect(resolveModel({})).toBe(DEFAULT_MODEL);
+    expect(resolveModel({ COPILOT_MODEL: 'claude-sonnet-5' })).toBe('claude-sonnet-5');
   });
 });
 

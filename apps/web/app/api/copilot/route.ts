@@ -4,13 +4,13 @@ import { z } from 'zod';
 import { currentTenant, currentViewer, unauthorized } from '@/lib/tenant';
 import { realBackend } from '@/lib/copilot/backend';
 import {
-  buildCopilotGraph, decide, hasModelCredential, realModelCaller, sendMessage,
+  buildCopilotGraph, decide, hasModelCredential, realModelCaller, resolveModel, sendMessage,
   type CopilotGraph,
 } from '@/lib/copilot/graph';
 
 export const dynamic = 'force-dynamic';
 
-const MODEL = process.env.COPILOT_MODEL ?? 'claude-opus-5';
+const MODEL = resolveModel();
 
 /**
  * The copilot, one graph per signed-in user.

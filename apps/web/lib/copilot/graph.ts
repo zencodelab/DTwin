@@ -287,6 +287,22 @@ export function realModelCaller(): ModelCaller {
   return (params) => client!.messages.create(params);
 }
 
+export const DEFAULT_MODEL = 'claude-opus-5';
+
+/**
+ * The model to call, from the environment.
+ *
+ * `||`, not `??`. An `.env` file with `COPILOT_MODEL=` and nothing after the
+ * equals sign yields an EMPTY STRING, which `??` passes straight through —
+ * and the API then refuses `model: ""`. That is precisely how the first real
+ * request against this copilot failed: the example env file shipped the
+ * variable blank, "defaults to claude-opus-5" in the comment, and the default
+ * never applied. Blank means unset here.
+ */
+export function resolveModel(env: Record<string, string | undefined> = process.env): string {
+  return env.COPILOT_MODEL?.trim() || DEFAULT_MODEL;
+}
+
 export function hasModelCredential(): boolean {
   return Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
 }
