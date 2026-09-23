@@ -34,8 +34,8 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **290 checks, all passing** (`db` 70, `ingest` 138, `sim` 56,
-`web` 26), plus **321 unit tests** (237 vitest, 84 pytest). CI runs types,
+Suites total **292 checks, all passing** (`db` 70, `ingest` 138, `sim` 56,
+`web` 28), plus **333 unit tests** (249 vitest, 84 pytest). CI runs types,
 lint and unit tests in one job and the four smoke suites against a real
 timescaledb-ha:pg17 in another, and is green.
 
@@ -151,6 +151,14 @@ Do not "optimise" it back to COPY.
   refuse to paint is a zone control must refuse to command (§55). `enabled`
   defaults to false and the kill switch is read on every claim, never cached.
   `control:dispatch` is deliberately separate from `ingest:write`.
+- **The copilot proposes; a person approves** (`docs/decisions.md` §63,
+  `apps/web/lib/copilot/`). It is a LangGraph.js graph whose `apply` node has
+  one incoming edge, from an `interrupt()` — that edge list IS the safety
+  property. Its four tools are `list_zones`, `control_envelope`,
+  `dry_run_setpoint`, `propose_plan`; a test asserts that list verbatim.
+  Never add a tool that writes anything other than a dry run, and never let
+  the agent call `/control/commands` without `dryRun` outside the `apply`
+  node. The model call is the Anthropic SDK directly, not a chat wrapper.
 - **Alerts are never coalesced or shed.** Telemetry has a successor; an alert
   does not. That includes the SOCKET: `Fanout.send(…, { mustDeliver: true })`
   closes a client too backlogged to take the frame rather than skipping it, and

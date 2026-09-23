@@ -191,6 +191,8 @@ Sources: [Next.js routes](../apps/web/app/api).
 | `GET /api/ws-ticket` | — | `{ticket}` — a 60-second signed ticket for the ingest socket |
 | `GET /api/control` | — | `{settings, commands, total, limit, truncated}`, proxied to ingest. **403 with an explanation when the session has no user behind it** — the demo tenant can read the building and command nothing, because a command is recorded against a person |
 | `POST /api/control` | `SetpointCommandRequest` | Proxies to ingest and passes the refusal through verbatim, status and all |
+| `GET /api/copilot` | — | `{available, model, reason}`. 401 for an unattributable session |
+| `POST /api/copilot` | `{threadId, message}` or `{threadId, decision}` | One turn of the supervisory-control copilot ([§63](decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural)). Returns `{messages, pendingPlan, outcomes, notice}`; a non-null `pendingPlan` means the run is suspended on a LangGraph `interrupt()` awaiting `decision: "approved" \| "declined"`. **403** for the demo session (a plan is approved *by* someone) and for a `viewer`; **503** with an explanation when no model credential is configured; the model's own errors are logged server-side and returned as a bare 502 |
 | `GET /api/heatmap` | Required `buildingId`; `metric=temperature_c`, `hours=1` defaults | `{zones}` with values, setpoints and deadbands; missing data is null |
 | `GET /api/zones/{id}` | Zone UUID | `{readings, equipment, maintenance, profile}` |
 | `GET /api/sensors/{id}/history` | `resolution=5m` and `hours=6` defaults | `{buckets}`; resolution allows `5m`, `1h`, `1d` |

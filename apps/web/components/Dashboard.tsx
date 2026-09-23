@@ -6,6 +6,7 @@ import { topics as topicFor, type SpatialTree, type Topic, type AlertWithContext
 import type { ZoneVisual } from './three/BuildingCanvas';
 import { AlertList } from './panels/AlertList';
 import { Legend } from './panels/Legend';
+import { CopilotPanel } from './panels/CopilotPanel';
 import { ScenarioPanel } from './panels/ScenarioPanel';
 import { ZonePanel } from './panels/ZonePanel';
 import { ViewerMenu } from './ViewerMenu';
@@ -93,6 +94,9 @@ export function Dashboard({
     alerts: AlertWithContext[]; requestedAt: number | null; total: number; truncated: boolean;
   }>({ alerts: [], requestedAt: null, total: 0, truncated: false });
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Zones a copilot plan would change, while the operator is deciding.
+  const [highlightedZoneIds, setHighlightedZoneIds] = useState<ReadonlySet<string>>(() => new Set());
+  const highlight = useCallback((ids: string[]) => setHighlightedZoneIds(new Set(ids)), []);
   const isDark = useIsDark();
 
   // Subscribe to the floor in frame, not the whole building: the server fans
@@ -463,6 +467,7 @@ export function Dashboard({
           visuals={visuals}
           focusedFloorId={focusedFloorId}
           selectedZoneId={selectedZoneId}
+          highlightedZoneIds={highlightedZoneIds}
           onSelectZone={setSelectedZoneId}
           onSelectFloor={setFocusedFloorId}
           showEquipment={showEquipment}
@@ -548,6 +553,12 @@ export function Dashboard({
               </p>
             )}
             <AlertList alerts={alerts} onSelectZone={selectZoneFromAlert} />
+
+            <h2 className="px-4 pb-1 pt-5 text-[11px] font-semibold uppercase tracking-wider"
+                style={{ color: 'var(--text-muted)' }}>
+              Copilot
+            </h2>
+            <CopilotPanel onHighlight={highlight} />
 
             <h2 className="px-4 pb-1 pt-5 text-[11px] font-semibold uppercase tracking-wider"
                 style={{ color: 'var(--text-muted)' }}>

@@ -1914,3 +1914,73 @@ zone, and the smoke suite then measured every step from 24.5 °C instead of the
 designed 23 °C — four refusals that should have fired did not, and three
 commands that should not have existed were accepted. The section now owns its
 zone before commanding it, exactly as the telemetry checks own their window.
+
+---
+
+## 63. The copilot proposes; a person approves; the graph makes that structural
+
+§62 let the twin act, and left one thing deliberately undone: nothing decided
+*what* a setpoint should be. An operator typed a number. This adds a copilot —
+an LLM agent that reads the building, checks candidate overrides against the
+safety envelope, and puts a plan in front of the operator — and the design is
+almost entirely about what it is **not allowed** to do.
+
+**The agent is a caller of `/control/commands`, not a new authority.** Every
+dry run and every issued command goes to ingest with the signed-in user's
+`x-acting-user`, through the same `evaluate()` a human's click goes through,
+the same number of times. There is no privileged agent path. What the model
+can do is bounded by four tools; what the four tools can do is bounded by what
+that person could do by hand.
+
+**Three of the four tools only read.** `list_zones`, `control_envelope`,
+`dry_run_setpoint`, `propose_plan`. There is no tool to switch control on, to
+change the envelope, to cancel, or to apply. `propose_plan` queues nothing: it
+re-dry-runs every command server-side — because the model may have skipped
+one and the world may have moved — and if any is refused, the *model* is told
+and the operator is never shown a plan containing a command that cannot be
+applied. A unit test asserts the tool list verbatim, because the whole safety
+argument rests on it.
+
+**Nothing reaches equipment without a human pressing Approve, and that is a
+fact about the edge list.** The graph is `agent ⇄ tools`, then `confirm`, then
+`apply`. `confirm` is a LangGraph `interrupt()`: the run suspends, the plan is
+handed back over HTTP, and the run resumes only when a later request carries
+`Command({ resume: 'approved' })`. `apply` has exactly one incoming edge, from
+`confirm`. You can read the property off the graph without reading the prompt.
+That is what LangGraph buys here — a hand-written loop would express the same
+thing as a convention; the graph expresses it as structure, and the
+checkpointer lets the suspended run outlive the request that started it.
+
+**The model call is the Anthropic SDK directly, inside a graph node.** Not a
+chat-model wrapper. The wrapper would sit between this code and the current
+request surface — adaptive thinking, strict tool schemas, the `refusal` stop
+reason — and the graph gains nothing from it. LangGraph is here for the shape
+of the run, not the shape of the request. A `refusal` stop reason acts on
+nothing: the content can be cut off mid tool call, and a half-formed command
+is worse than none.
+
+**Attribution says both names.** An approved command is recorded with
+`requested_by` = the person who approved it, and a `reason` prefixed
+`copilot (operator-approved):`. The audit trail shows who decided and that a
+model proposed. The demo session cannot use the copilot for the reason it
+cannot command: there is nobody to record.
+
+**Bounded in every direction.** Ten model turns per request, twelve commands
+per plan, no zone twice in one plan, threads namespaced by user so nobody can
+resume — and approve — someone else's suspended plan by guessing an id.
+
+**Tool results are data.** Zone names and equipment tags come from a database
+and could be typed by anyone with write access to it. The system prompt says so
+and nothing interpolates them into an instruction.
+
+**Honest limits.** The checkpointer is in memory: a suspended plan survives
+across HTTP requests but not a restart of the web process, and not across
+replicas — a Postgres checkpointer is the next step. Without
+`ANTHROPIC_API_KEY` the panel says so and everything else works, the same
+posture as email without a transport. Refusal fallbacks (`fallbacks: "default"`)
+are deliberately not enabled: a refusal on a building-control assistant is the
+safe outcome, and enabling an untested beta parameter on a path that cannot be
+exercised without a credential risks a 400 on first real use. The graph is
+proven with a scripted fake model — twelve tests, no network — which covers
+everything except the one thing a fake cannot: whether the real model
+proposes sensible plans. That needs a key, and a person watching.

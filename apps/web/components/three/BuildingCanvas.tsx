@@ -38,6 +38,8 @@ interface Props {
   visuals: Map<string, ZoneVisual>;
   focusedFloorId: string | null;
   selectedZoneId: string | null;
+  /** Zones a pending copilot plan would change. Drawn with an amber glow. */
+  highlightedZoneIds: ReadonlySet<string>;
   onSelectZone: (zoneId: string | null) => void;
   onSelectFloor: (floorId: string | null) => void;
   showEquipment: boolean;
@@ -45,7 +47,7 @@ interface Props {
 }
 
 export function BuildingCanvas({
-  tree, visuals, focusedFloorId, selectedZoneId,
+  tree, visuals, focusedFloorId, selectedZoneId, highlightedZoneIds,
   onSelectZone, onSelectFloor, showEquipment, isDark,
 }: Props) {
   const bounds = useMemo(
@@ -104,6 +106,7 @@ export function BuildingCanvas({
             dimmed={focusedFloorId !== null && focusedFloorId !== floor.id}
             focused={focusedFloorId === floor.id}
             selectedZoneId={selectedZoneId}
+            highlightedZoneIds={highlightedZoneIds}
             onSelectZone={onSelectZone}
             onSelectFloor={onSelectFloor}
           />
@@ -131,13 +134,14 @@ export function BuildingCanvas({
 }
 
 function FloorGroup({
-  floor, visuals, dimmed, focused, selectedZoneId, onSelectZone, onSelectFloor,
+  floor, visuals, dimmed, focused, selectedZoneId, highlightedZoneIds, onSelectZone, onSelectFloor,
 }: {
   floor: Floor;
   visuals: Map<string, ZoneVisual>;
   dimmed: boolean;
   focused: boolean;
   selectedZoneId: string | null;
+  highlightedZoneIds: ReadonlySet<string>;
   onSelectZone: (id: string | null) => void;
   onSelectFloor: (id: string | null) => void;
 }) {
@@ -162,6 +166,7 @@ function FloorGroup({
           dimmed={dimmed}
           showLabel={focused}
           selected={selectedZoneId === zone.id}
+          highlighted={highlightedZoneIds.has(zone.id)}
           onSelect={select}
         />
       ))}
@@ -186,7 +191,7 @@ function setHovered(hovered: boolean): void {
 }
 
 const ZoneMesh = memo(function ZoneMesh({
-  zone, height, visual, dimmed, showLabel, selected, onSelect,
+  zone, height, visual, dimmed, showLabel, selected, highlighted, onSelect,
 }: {
   zone: Zone;
   height: number;
@@ -194,6 +199,8 @@ const ZoneMesh = memo(function ZoneMesh({
   dimmed: boolean;
   showLabel: boolean;
   selected: boolean;
+  /** Part of a plan awaiting approval: the zone the operator is deciding about. */
+  highlighted: boolean;
   /**
    * Takes the zone id rather than closing over it, so the parent can pass one
    * callback for every zone. An inline `() => onSelect(zone.id)` in the parent
@@ -248,8 +255,8 @@ const ZoneMesh = memo(function ZoneMesh({
           opacity={dimmed ? 0.12 : 0.92}
           roughness={0.75}
           metalness={0.05}
-          emissive={selected ? color : '#000000'}
-          emissiveIntensity={selected ? 0.35 : 0}
+          emissive={highlighted ? STATUS.warning : selected ? color : '#000000'}
+          emissiveIntensity={highlighted ? 0.55 : selected ? 0.35 : 0}
         />
       </mesh>
 
@@ -258,9 +265,9 @@ const ZoneMesh = memo(function ZoneMesh({
       <lineSegments>
         <edgesGeometry args={[geometry]} />
         <lineBasicMaterial
-          color={selected ? '#ffffff' : '#000000'}
+          color={highlighted ? STATUS.warning : selected ? '#ffffff' : '#000000'}
           transparent
-          opacity={dimmed ? 0.1 : selected ? 0.9 : 0.35}
+          opacity={dimmed ? 0.1 : highlighted || selected ? 0.9 : 0.35}
         />
       </lineSegments>
 
@@ -294,6 +301,7 @@ const ZoneMesh = memo(function ZoneMesh({
   && prev.dimmed === next.dimmed
   && prev.showLabel === next.showLabel
   && prev.selected === next.selected
+  && prev.highlighted === next.highlighted
   && prev.onSelect === next.onSelect
   && sameVisual(prev.visual, next.visual));
 

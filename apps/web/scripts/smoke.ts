@@ -224,7 +224,26 @@ async function main(): Promise<void> {
     ok('and the write path refuses it before any zone is looked up',
        controlWrite.status === 403, `HTTP ${controlWrite.status}`);
 
-    console.log('\n[8] Sign-in limits');
+    console.log('\n[8] Copilot');
+    // Same accountability gate as control, one layer up: the copilot proposes
+    // commands that are recorded against whoever approves them, so a session
+    // with nobody behind it gets the door, not the model (decisions.md §63).
+    const copilotRead = await fetch(`${BASE}/api/copilot`);
+    const copilotReadBody = await copilotRead.json() as { error?: string };
+    ok('the copilot is closed to an unattributable session, and says why',
+       copilotRead.status === 403 && (copilotReadBody.error ?? '').includes('recorded against a person'),
+       `HTTP ${copilotRead.status}`);
+    const copilotWrite = await fetch(`${BASE}/api/copilot`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ threadId: 'smoke', message: 'pre-cool everything' }),
+    });
+    const copilotBody = await copilotWrite.json() as { error?: string };
+    ok('and says why, before any model is called',
+       copilotWrite.status === 403 && (copilotBody.error ?? '').includes('recorded against a person'),
+       `HTTP ${copilotWrite.status}`);
+
+    console.log('\n[9] Sign-in limits');
     // Addresses nobody has, fresh each run: the limiter is keyed on what was
     // typed, so an invented address exercises it exactly as a real one would —
     // which is the property that stops the 429 becoming an enumeration oracle.

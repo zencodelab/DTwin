@@ -26,3 +26,8 @@ models/*.gltf
 # material about talking to interviewers, and this repository is public.
 # See ../DTwin-interview/. Ignored here so it cannot wander back in.
 interview/
+
+# The interview pack. Afsal chose "public repo, interview pack excluded" on
+# 2026-09-20 and it was removed from history for that reason; it has been
+# moved around since and landed here on 2026-09-24. It must never be pushed.
+dtv/

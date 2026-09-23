@@ -216,6 +216,16 @@ claim and never cached, queued commands then lapse untouched, and applied
 overrides run out on their own clocks
 ([§62](decisions.md#62-the-twin-is-allowed-to-act-and-every-part-of-that-is-a-refusal)).
 
+The **copilot** needs `ANTHROPIC_API_KEY` on the web service (or an
+`ANTHROPIC_AUTH_TOKEN` / `ant auth login` profile; the SDK resolves them in
+that order). Without one, the panel says so and nothing else is affected. It
+proposes and never applies: every command it issues went through the operator's
+Approve and is recorded against that person with a `copilot (operator-approved):`
+reason prefix, so `GET /control/commands` distinguishes them. Its suspended
+plans live in web-process memory — a restart forgets a plan awaiting approval,
+and nothing is issued for it
+([§63](decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural)).
+
 Logs are JSON, one object per line, with a stable `event` and named fields
 ([§61](decisions.md#61-one-request-id-three-services-and-an-event-name-that-is-not-prose)).
 `LOG_FORMAT=text` is for a terminal. Every request carries an `x-request-id`,
