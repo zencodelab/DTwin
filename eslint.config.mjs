@@ -63,14 +63,14 @@ export default tseslint.config(
   {
     // The video renderer: a plain CommonJS Node script, run with NODE_PATH
     // pointing at playwright-core rather than as part of any workspace.
-    // `window` appears only inside page.evaluate callbacks, which run in the
-    // browser.
+    // `window` and `document` appear only inside page.evaluate callbacks,
+    // which run in the browser.
     files: ['video/*.js'],
     languageOptions: {
       sourceType: 'commonjs',
       globals: {
         require: 'readonly', __dirname: 'readonly', process: 'readonly',
-        console: 'readonly', window: 'readonly',
+        console: 'readonly', window: 'readonly', document: 'readonly',
       },
     },
     rules: { '@typescript-eslint/no-require-imports': 'off' },
