@@ -237,7 +237,13 @@ const naive = Math.max(...good.map(r => r.value)) - Math.min(...good.map(r => r.
 ok('naive max-min would have been wrong', Math.abs(naive - totalDelta) > 1000,
    `naive = ${naive.toFixed(0)} vs counter_agg = ${totalDelta.toFixed(0)}`);
 
-const tempHist = await withTenant(A, (db) => getSensorHistory(db, tempSensor.id, '1h', from, to));
+// From `windowStart`, not `from`: the query keeps whole buckets, so the hour
+// bucket that CONTAINS `from` is excluded — and the fixture's second flagged
+// stretch reaches back to now-304 min, which sits in that bucket whenever the
+// suite starts at :01–:03 past the hour. CI ran at :03 and counted 39. A window
+// that reaches past the whole fixture makes the count a fact about the rollup
+// rather than about the runner's clock.
+const tempHist = await withTenant(A, (db) => getSensorHistory(db, tempSensor.id, '1h', windowStart, to));
 ok('gauge sensor history has buckets', tempHist.length > 0, `${tempHist.length} buckets`);
 ok('gauge delta is null (not a counter)', tempHist[0]?.deltaValue === null);
 ok('gauge avg is in range', (tempHist[0]?.avgValue ?? 0) > 20 && (tempHist[0]?.avgValue ?? 0) < 26,
@@ -255,7 +261,7 @@ ok('and kept out of min, max and mean',
      || (b.minValue! > 20 && b.maxValue! < 26 && b.avgValue > 20 && b.avgValue < 26)),
    `lowest hourly min = ${Math.min(...tempHist.map((b) => b.minValue ?? Infinity)).toFixed(2)}`);
 
-const fiveMin = await withTenant(A, (db) => getSensorHistory(db, tempSensor.id, '5m', from, to));
+const fiveMin = await withTenant(A, (db) => getSensorHistory(db, tempSensor.id, '5m', windowStart, to));
 const allBad = fiveMin.filter((b) => b.sampleCount > 0 && b.badQualityCount === b.sampleCount);
 ok('a bucket holding only flagged samples has no mean at all, rather than a wrong one',
    allBad.length >= 1 && allBad.every((b) => b.avgValue === null && b.minValue === null),
