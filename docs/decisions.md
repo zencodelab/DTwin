@@ -812,11 +812,23 @@ aggregate rebuild.
 tenant.** One gateway with a clock skewed into the future would blank the
 history view for *every tenant sharing that hypertable*, silently, with no
 error anywhere and the data sitting in the table the whole time. The quality
-gate checks that a value is plausible; nothing checks that a timestamp is.
-`assessQuality` should reject or clamp a reading dated beyond a small tolerance
-ahead of the server's clock, the same way it rejects a temperature of -273.
-That is not built — this decision records the hazard and the reason, and the
-fix belongs on the ingest path where the timestamp arrives.
+gate checks that a value is plausible, and when this was first written nothing
+checked that a timestamp was.
+
+**Built since** (20 Sep, `70628f4`), on the ingest path where the timestamp
+arrives. `Pipeline.ingestRaw` refuses any reading dated more than
+`INGEST_MAX_CLOCK_SKEW_MS` (default 60 s) ahead of the server's clock and
+counts it in the `futureDated` field of the `POST /ingest` response. It
+**refuses** rather than flags, and that is the one exception to how every other
+bad reading is handled. A temperature of −273 is stored with a quality code,
+because "the sensor reported −273 for six hours" is itself a diagnosis. A future
+timestamp is not a fact about the sensor; it is damage to the database, and a
+flag would not stop the damage — only not writing the row does. It is not in
+`assessQuality`, which judges values, for the same reason.
+
+*Verified* by the ingest smoke suite: a reading dated an hour ahead is refused
+(`accepted 0, futureDated 1`), and one five seconds ahead is accepted, because a
+few seconds of gateway clock skew is normal.
 
 ## 47. A run is admitted, cancellable and reaped — but still not queued
 
@@ -2010,6 +2022,19 @@ posture as email without a transport. Refusal fallbacks (`fallbacks: "default"`)
 are deliberately not enabled: a refusal on a building-control assistant is the
 safe outcome, and enabling an untested beta parameter on a path that cannot be
 exercised without a credential risks a 400 on first real use. The graph is
-proven with a scripted fake model — twelve tests, no network — which covers
+proven with seventeen tests and no network — a scripted fake model for the
+run's behaviour, the compiled edge list for its structure — which covers
 everything except the one thing a fake cannot: whether the real model
-proposes sensible plans. That needs a key, and a person watching.
+proposes sensible plans.
+
+**One real run has since been recorded** (24 Sep, [`video/`](../video/)). The
+first real request had failed before reaching the model: a blank
+`COPILOT_MODEL` in `.env` became `model: ""` (see `resolveModel`). The recorded
+run used `claude-opus-5` against the development stack, asked to pre-cool the
+Level 3 offices. It read the zones and the envelope, dry-ran a 2 K drop on the
+four offices, proposed them, and suspended at `confirm` 42 s in. On approval it
+issued four commands, which the gateway applied within six seconds. That shows
+the path works end to end with the real model. It is still a single run, and
+the capture script approved it rather than a person reviewing the plan, so it
+says nothing about whether the model's plans are generally good. That needs an
+evaluation set, not a demo.
