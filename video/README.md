@@ -7,7 +7,9 @@ operator's request to the setpoints on the live map.
 
 | File | What it is |
 |---|---|
-| `dtwin-copilot-full-cc.mp4` | **Full video, first 25 s sped up, silent, captions burned in — 2:50** (not committed) |
+| `dtwin-copilot-full-cc-music.mp4` | **Full video, intro sped up, captions burned in, background music — 2:50** (not committed) |
+| `dtwin-copilot-full-cc.mp4` | Same, silent (not committed) |
+| `music_bed.py` · `to_mp4_music.sh` | **Background music** — see below |
 | `dtwin-copilot-short-cc.mp4` | Silent 1:40 cut, captions burned in (not committed) |
 | `dtwin-copilot-short.mp4` | Silent 1:40 cut, no captions (not committed) |
 | `dtwin-copilot-short-narrated.mp4` | 1:40 cut with narration (not committed) |
@@ -184,3 +186,38 @@ python3 cut_audio_captions.py full.json          # dtwin-copilot-full.srt / .vtt
 NODE_PATH=<dir with playwright-core> node render_cut.js full.json dtwin-copilot-full-cc.webm --burn
 ./to_mp4.sh dtwin-copilot-full-cc.webm dtwin-copilot-full-cc.mp4
 ```
+
+## Background music
+
+The bed is two Apple Loops from the GarageBand library, tiled to the length of
+the render by `music_bed.py`:
+
+| Loop | Gain | Why |
+|---|---|---|
+| `Legend Synth Drone` | 1.0 | the steadiest loop in the library (level varies ~10% across 250 ms windows), sustained not percussive, and its last second is at the same level as its first, so it repeats without a bump |
+| `Legend Dark Synth Pad` | 0.5 | same family, so same key and the same 23.9 s length — adds movement to the drone and stays in sync when tiled |
+
+The choice was measured, not heard: fourteen pad/drone candidates were
+converted and scored on level steadiness, crest factor and start-vs-end level.
+Each loop gets a 100 ms equal-power crossfade of its tail into its head before
+tiling, then the mix is faded in over 1.5 s, out over 5 s, and normalised to a
+−9 dBFS peak (about −18 dBFS RMS) — background level for a video whose content
+is the captions.
+
+**Licence.** The loops stay in `/Library/Audio/Apple Loops` and are referenced
+from there; nothing is copied into the repository. Apple's GarageBand/Logic
+licence permits using its loops in your own soundtracks and distributing the
+result, and does not permit redistributing the loops themselves. The MP3s in
+`~/Music` are ripped commercial songs and were not considered.
+
+```bash
+cd video
+python3 music_bed.py --length 170.2 --out audio/music-full.wav \
+  "/Library/Audio/Apple Loops/Apple/01 Hip Hop/Legend Synth Drone.caf:1.0" \
+  "/Library/Audio/Apple Loops/Apple/01 Hip Hop/Legend Dark Synth Pad.caf:0.5"
+./to_mp4_music.sh dtwin-copilot-full-cc.webm "$PWD/audio/music-full.wav" dtwin-copilot-full-cc-music.mp4
+```
+
+`--peak` sets the level, and any afconvert-readable file works as a loop, so a
+different track is one command. `to_mp4_music.sh` keeps two channels where the
+narration script kept one.
