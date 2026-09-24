@@ -17,6 +17,7 @@ operator's request to the setpoints on the live map.
 | `gen_audio.py` | Narration → one WAV per line, with its measured length |
 | `timeline.py` | Measured lengths → scene windows → `timeline.js` / `timeline.json` |
 | `assemble_audio.py` | Per-line WAVs → `audio/narration.wav`, each at its line's start |
+| `make_captions.py` | Narration + timeline → `dtwin-copilot.srt` / `.vtt`, each cue timed against `say` renders of the line so far |
 | `db_snapshot.sh` | The audit-trail rows and Level 3 temperatures → `db.json` |
 | `render.js` | Frames → WebM master |
 | `assets/` | The Level 3 screenshot, and Inter (SIL OFL 1.1 — `inter-OFL.txt`) |
@@ -63,6 +64,7 @@ python3 make_data.py
 python3 gen_audio.py            # macOS `say`, Samantha, rate 165
 python3 timeline.py
 python3 assemble_audio.py
+python3 make_captions.py        # captions; product names shown as written, not as spoken
 
 # 3. Picture and mux (~6 min)
 NODE_PATH=<dir containing playwright-core> node render.js

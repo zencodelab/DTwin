@@ -9,7 +9,7 @@ A Digital Twin platform for one commercial building. npm-workspaces monorepo,
 not a monorepo build system — three apps, two shared packages, no Turborepo.
 
 Read [docs/decisions.md](docs/decisions.md) before changing the data model. It
-records 62 decisions where the obvious choice is wrong for building analytics,
+records 63 decisions where the obvious choice is wrong for building analytics,
 each with the reasoning and, where it was checked, the evidence. (It said "ten"
 for far longer than it was true — if you add an ADR, fix this number.)
 
@@ -162,6 +162,9 @@ Do not "optimise" it back to COPY.
   **The diagram is generated** (`npm run copilot:graph`; README and ADR 63
   embed it; the panel draws it live from `/api/copilot/graph`) — never hand-
   draw it, and never edit the embedded Mermaid by hand.
+  **`video/` holds a narrated explainer of one real run** — rendered from a
+  recording (`video/run.json`), not a screen capture; `video/README.md` says
+  what is recreated and how to re-make it. The MP4s are gitignored.
 - **Alerts are never coalesced or shed.** Telemetry has a successor; an alert
   does not. That includes the SOCKET: `Fanout.send(…, { mustDeliver: true })`
   closes a client too backlogged to take the frame rather than skipping it, and

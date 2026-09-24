@@ -218,3 +218,15 @@ models/       GLTF/GLB building assets
 - **`npm run smoke -w @dtwin/ingest` refuses to run alongside a live ingest
   service**, because two device simulators writing the same meters make its
   assertions meaningless.
+
+## Rights
+
+© Afsal A Azeez. **All rights reserved.**
+
+This repository is public so the work can be read and reviewed. That is not a
+grant of a licence: no permission is given to copy, modify, redistribute or use
+it, in whole or in part, in any other project, commercial or otherwise.
+
+There is deliberately no `LICENSE` file — under copyright law the absence of one
+means all rights are reserved, not that the code is free to take. If you want to
+use any of it, ask.

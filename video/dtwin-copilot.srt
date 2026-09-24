@@ -1,0 +1,250 @@
+1
+00:00:01,412 --> 00:00:03,252
+This is the copilot in DTwin,
+
+2
+00:00:03,292 --> 00:00:05,512
+a digital twin for a commercial building.
+
+3
+00:00:05,552 --> 00:00:07,606
+It proposes setpoint changes.
+
+4
+00:00:07,646 --> 00:00:09,276
+A person approves them.
+
+5
+00:00:11,464 --> 00:00:13,427
+The twin doesn't only watch the building.
+
+6
+00:00:13,467 --> 00:00:16,971
+It writes back to it. Every
+override expires on its own,
+
+7
+00:00:17,011 --> 00:00:19,922
+the gateway pulls commands
+instead of having them pushed,
+
+8
+00:00:19,962 --> 00:00:24,523
+and a safety envelope checks each one
+at request, and again at dispatch.
+
+9
+00:00:26,514 --> 00:00:28,945
+The copilot is a LangGraph state machine.
+
+10
+00:00:28,985 --> 00:00:31,109
+This diagram isn't drawn by hand.
+
+11
+00:00:31,149 --> 00:00:34,083
+It's generated from the compiled
+graph's own edge list,
+
+12
+00:00:34,123 --> 00:00:37,186
+the same list the app
+serves, and the tests read.
+
+13
+00:00:40,791 --> 00:00:42,482
+Here's the whole safety argument.
+
+14
+00:00:42,522 --> 00:00:45,415
+Apply, the only node
+that touches equipment,
+
+15
+00:00:45,455 --> 00:00:48,190
+has exactly one way in, from confirm.
+
+16
+00:00:48,230 --> 00:00:49,802
+And confirm is an interrupt:
+
+17
+00:00:49,842 --> 00:00:52,780
+the run stops there,
+and waits for a person.
+
+18
+00:00:53,451 --> 00:00:55,400
+A test walks the graph from the start,
+
+19
+00:00:55,440 --> 00:00:57,467
+refuses to pass through confirm,
+
+20
+00:00:57,507 --> 00:00:59,614
+and proves that apply is unreachable.
+
+21
+00:01:02,586 --> 00:01:05,943
+Now, a real run, recorded
+on the development stack.
+
+22
+00:01:05,983 --> 00:01:10,589
+The operator asks to pre-cool the Level 3
+offices before the afternoon peak.
+
+23
+00:01:10,629 --> 00:01:12,407
+The agent reads every zone,
+
+24
+00:01:12,447 --> 00:01:15,551
+and the control envelope,
+before anything else.
+
+25
+00:01:17,533 --> 00:01:20,664
+All four offices have good
+sensors and healthy equipment.
+
+26
+00:01:20,704 --> 00:01:23,762
+So it dry-runs a two
+kelvin drop for four hours,
+
+27
+00:01:23,802 --> 00:01:26,431
+the largest single step
+the envelope allows.
+
+28
+00:01:26,471 --> 00:01:28,087
+Four out of four allowed.
+
+29
+00:01:30,279 --> 00:01:31,810
+Then it proposes the plan.
+
+30
+00:01:31,850 --> 00:01:35,547
+The server dry-runs every command
+again before the operator sees it,
+
+31
+00:01:35,587 --> 00:01:37,465
+and the run suspends at confirm.
+
+32
+00:01:37,505 --> 00:01:40,555
+Forty-two seconds in,
+the state is checkpointed,
+
+33
+00:01:40,595 --> 00:01:42,348
+and nothing has been applied.
+
+34
+00:01:45,363 --> 00:01:46,792
+The operator approves.
+
+35
+00:01:46,832 --> 00:01:49,879
+That's a new request,
+resuming the suspended run.
+
+36
+00:01:49,919 --> 00:01:52,988
+Only now does the graph
+take the edge into apply.
+
+37
+00:01:56,150 --> 00:01:59,522
+Apply uses the same control
+endpoint a human click does,
+
+38
+00:01:59,562 --> 00:02:03,022
+as the approving user, marked
+as proposed by the copilot.
+
+39
+00:02:03,062 --> 00:02:05,359
+The envelope checks each command again,
+
+40
+00:02:05,399 --> 00:02:08,464
+and the gateway collected
+all four within six seconds.
+
+41
+00:02:11,871 --> 00:02:14,507
+On the live map, the four offices now sit
+
+42
+00:02:14,547 --> 00:02:16,850
+about two kelvin under
+their design setpoint.
+
+43
+00:02:16,890 --> 00:02:18,657
+The corridor and the meeting room,
+
+44
+00:02:18,697 --> 00:02:21,001
+which weren't in the plan, stay in band.
+
+45
+00:02:21,041 --> 00:02:25,156
+In four hours the overrides lapse,
+and nothing has to undo them.
+
+46
+00:02:27,927 --> 00:02:30,977
+Decline takes the other
+branch, and nothing is issued.
+
+47
+00:02:31,017 --> 00:02:32,580
+The model has four tools.
+
+48
+00:02:32,620 --> 00:02:35,622
+Three only read,
+and the fourth only proposes.
+
+49
+00:02:35,662 --> 00:02:37,030
+None of them can write.
+
+50
+00:02:39,666 --> 00:02:42,284
+And what it isn't.
+The checkpointer is in memory,
+
+51
+00:02:42,324 --> 00:02:44,754
+so a restart forgets a suspended plan.
+
+52
+00:02:44,794 --> 00:02:46,689
+The gateway here is a simulator,
+
+53
+00:02:46,729 --> 00:02:48,905
+not a real building management system.
+
+54
+00:02:48,945 --> 00:02:50,760
+And it proposes setpoints.
+
+55
+00:02:50,800 --> 00:02:52,837
+It doesn't optimise the building.
+
+56
+00:02:55,420 --> 00:02:59,252
+DTwin. The copilot
+proposes. A person approves.
+
