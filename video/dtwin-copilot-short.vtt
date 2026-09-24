@@ -1,0 +1,108 @@
+WEBVTT
+
+00:00:00.314 --> 00:00:02.745
+The copilot is a LangGraph state machine.
+
+00:00:02.785 --> 00:00:04.909
+This diagram isn't drawn by hand.
+
+00:00:04.949 --> 00:00:07.883
+It's generated from the compiled
+graph's own edge list,
+
+00:00:07.923 --> 00:00:10.986
+the same list the app
+serves, and the tests read.
+
+00:00:14.591 --> 00:00:16.282
+Here's the whole safety argument.
+
+00:00:16.322 --> 00:00:19.215
+Apply, the only node
+that touches equipment,
+
+00:00:19.255 --> 00:00:21.990
+has exactly one way in, from confirm.
+
+00:00:22.030 --> 00:00:23.602
+And confirm is an interrupt:
+
+00:00:23.642 --> 00:00:26.580
+the run stops there,
+and waits for a person.
+
+00:00:27.251 --> 00:00:29.200
+A test walks the graph from the start,
+
+00:00:29.240 --> 00:00:31.267
+refuses to pass through confirm,
+
+00:00:31.307 --> 00:00:33.414
+and proves that apply is unreachable.
+
+00:00:35.889 --> 00:00:37.420
+Then it proposes the plan.
+
+00:00:37.460 --> 00:00:41.157
+The server dry-runs every command
+again before the operator sees it,
+
+00:00:41.197 --> 00:00:43.075
+and the run suspends at confirm.
+
+00:00:43.115 --> 00:00:46.165
+Forty-two seconds in,
+the state is checkpointed,
+
+00:00:46.205 --> 00:00:47.958
+and nothing has been applied.
+
+00:00:50.973 --> 00:00:52.402
+The operator approves.
+
+00:00:52.442 --> 00:00:55.489
+That's a new request,
+resuming the suspended run.
+
+00:00:55.529 --> 00:00:58.598
+Only now does the graph
+take the edge into apply.
+
+00:01:01.760 --> 00:01:05.132
+Apply uses the same control
+endpoint a human click does,
+
+00:01:05.172 --> 00:01:08.632
+as the approving user, marked
+as proposed by the copilot.
+
+00:01:08.672 --> 00:01:10.969
+The envelope checks each command again,
+
+00:01:11.009 --> 00:01:14.074
+and the gateway collected
+all four within six seconds.
+
+00:01:16.976 --> 00:01:19.594
+And what it isn't.
+The checkpointer is in memory,
+
+00:01:19.634 --> 00:01:22.064
+so a restart forgets a suspended plan.
+
+00:01:22.104 --> 00:01:23.999
+The gateway here is a simulator,
+
+00:01:24.039 --> 00:01:26.215
+not a real building management system.
+
+00:01:26.255 --> 00:01:28.070
+And it proposes setpoints.
+
+00:01:28.110 --> 00:01:30.147
+It doesn't optimise the building.
+
+00:01:32.730 --> 00:01:36.562
+DTwin. The copilot
+proposes. A person approves.
+

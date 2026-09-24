@@ -1,0 +1,18 @@
+{
+  "name": "short",
+  "comment": "60-90s-target cut for the LinkedIn feed. Three contiguous windows, so only two seams. Each window opens 0.3 s before its first spoken line, so the scene is already drawn (opening on the scene boundary instead gave a near-black first frame) and no speech is clipped; each ends on a scene's tail hold rather than mid-sentence. Keeps the graph-is-generated claim, the whole safety argument and its test, the suspend/approve/apply arc, the limits and the end card. Drops the intro, 'writes back', the zone read, the first dry run, the live map and the decline branch - all still in the full version.",
+  "windows": [
+    [
+      26.2,
+      61.78
+    ],
+    [
+      89.97,
+      131.06
+    ],
+    [
+      159.36,
+      183.03
+    ]
+  ]
+}

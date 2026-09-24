@@ -3,12 +3,14 @@
 A narrated walkthrough of the supervisory-control copilot: the LangGraph, the
 safety property it rests on, and **one real run** end to end, from the
 operator's request to the setpoints on the live map.
-1920×1080, 30 fps, ~3:03.
+1920×1080, 30 fps. Full version ~3:03; a 1:40 cut for the feed, below.
 
 | File | What it is |
 |---|---|
-| `dtwin-copilot-narrated.mp4` | **H.264 + narration — use this one** (not committed) |
-| `dtwin-copilot.mp4` | Silent H.264 (not committed) |
+| `dtwin-copilot-short-narrated.mp4` | **The 1:40 cut — use this one for a feed** (not committed) |
+| `dtwin-copilot-narrated.mp4` | Full 3:03, H.264 + narration (not committed) |
+| `dtwin-copilot.mp4` | Silent H.264, full length (not committed) |
+| `cut.json` · `render_cut.js` · `cut_audio_captions.py` | **The short cut** — see below |
 | `scene.html` | **The source.** Deterministic: `window.seek(ms)` draws any instant |
 | `capture.ts` | Records a real run of the real graph, node by node → `run.json` |
 | `run.json` · `graph.json` · `db.json` | The recording: transcript + timings, the graph's own edge list, the resulting database rows |
@@ -82,3 +84,42 @@ The pipeline is the one the Markaba AI workflow video used
 (`MarketPlace/video/`): no ffmpeg install (the renderer uses the one in
 Playwright's cache, VP8 only), VLC for the MP4 step, audio muxed during that
 transcode rather than afterwards.
+
+## The short cut
+
+3:03 is long for a social feed. `cut.json` defines a **1:40** version as three
+contiguous windows of the same timeline:
+
+| Window | Keeps | Source |
+|---|---|---|
+| 1 | the graph is generated, and the whole safety argument with its test | 26.20 → 61.78 |
+| 2 | proposes → suspends at `confirm` → approved → applied | 89.97 → 131.06 |
+| 3 | the limits, and the end card | 159.36 → 183.03 |
+
+Dropped: the intro, "it writes back", the zone read, the first dry run, the live
+map, and the decline branch.
+
+**Nothing is re-synthesised and `scene.html` is not touched.** That is the point
+of doing it this way: the file references every line id from `s00` to `s12`, so
+deleting scenes from `narration.py` would leave it reading `L.s03b.start` of
+`undefined`. Instead the timeline stays whole and `render_cut.js` simply
+photographs fewer instants of it — `window.seek(ms)` is deterministic, so the
+frames are identical to the ones the full render produces.
+`cut_audio_captions.py` does the same arithmetic for sound and text, reusing the
+per-line WAVs and the existing cues, so the cut cannot drift from what was said.
+
+Each window **opens 0.3 s before its first spoken line**: by then the scene has
+finished its lead-in and is fully drawn, and no speech is clipped. Opening on
+the scene boundary instead produced a near-black first frame — a poor thumbnail
+and a poor first second on autoplay.
+
+```bash
+cd video
+python3 cut_audio_captions.py                       # audio/narration-short.wav + dtwin-copilot-short.srt/.vtt
+NODE_PATH=<dir with playwright-core> node render_cut.js cut.json
+./to_mp4_narrated.sh dtwin-copilot-short.webm "$PWD/audio/narration-short.wav" \
+  dtwin-copilot-short-narrated.mp4
+```
+
+To change what the cut keeps, edit the windows in `cut.json` and re-run both —
+they read the same file, so the picture and the sound cannot disagree.
