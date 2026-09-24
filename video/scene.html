@@ -1,0 +1,912 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DTwin copilot</title>
+<!--
+  The video's source. Deterministic: nothing plays in real time. window.seek(ms)
+  computes every element's state from the clock alone, and render.js calls it
+  once per frame. Timings come from timeline.js (generated from the measured
+  narration); every number shown comes from data.js (the recorded run, the
+  graph's own edge list and the database rows). See README.md.
+-->
+<style>
+@font-face { font-family: Inter; src: url(assets/inter.woff2) format('woff2'); font-weight: 100 900; }
+:root {
+  --page: #0d0d0d; --surface: #1a1a19; --surface2: #222220; --text: #ffffff;
+  --text2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+  --border: rgba(255,255,255,0.1); --accent: #3987e5; --amber: #fab219;
+  --good: #35b535; --critical: #e0514a;
+  --mono: 'SF Mono', Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--page); }
+#stage {
+  position: relative; width: 1920px; height: 1080px; overflow: hidden;
+  font-family: Inter, system-ui, sans-serif; color: var(--text);
+  background:
+    radial-gradient(ellipse at 50% 40%, rgba(57,135,229,0.07), transparent 60%),
+    linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 48px 48px,
+    linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 48px 48px,
+    var(--page);
+  -webkit-font-smoothing: antialiased;
+}
+.layer { position: absolute; inset: 0; opacity: 0; }
+.mono { font-family: var(--mono); }
+.kicker { font-size: 18px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--amber); font-weight: 600; }
+.h1 { font-size: 64px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.08; }
+.h2 { font-size: 48px; font-weight: 700; letter-spacing: -0.015em; line-height: 1.1; }
+.lede { font-size: 27px; color: var(--text2); line-height: 1.45; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+}
+.tag { display: inline-block; font-size: 13px; font-weight: 700; letter-spacing: 0.12em;
+  padding: 4px 9px; border-radius: 6px; text-transform: uppercase; }
+
+/* chrome */
+#brand { position: absolute; left: 64px; top: 44px; font-size: 22px; font-weight: 700; opacity: 0; }
+#brand span { color: var(--muted); font-weight: 500; }
+#chapter { position: absolute; right: 64px; top: 46px; font-size: 18px; color: var(--muted);
+  letter-spacing: 0.08em; opacity: 0; }
+#chapter b { color: var(--amber); font-weight: 700; margin-right: 12px; }
+#realbadge { position: absolute; left: 64px; bottom: 34px; font-size: 16px; color: var(--muted); opacity: 0; }
+#realbadge b { color: var(--good); font-weight: 700; letter-spacing: 0.12em; margin-right: 10px; }
+#progress { position: absolute; left: 0; bottom: 0; height: 4px; background: var(--amber); width: 0; opacity: 0.8; }
+
+/* title */
+#L-title .wrap { position: absolute; left: 160px; top: 290px; width: 1600px; }
+#L-title .h1 { font-size: 112px; margin: 26px 0 34px; }
+#L-title .h1 div { will-change: transform; }
+#L-title .h1 .amb { color: var(--amber); }
+#L-title .lede { font-size: 32px; max-width: 1300px; }
+
+/* context */
+#L-context .head { position: absolute; left: 160px; top: 200px; width: 1600px; }
+#L-context .cards { position: absolute; left: 160px; top: 470px; display: flex; gap: 40px; }
+#L-context .card { width: 506px; padding: 40px 38px 42px; }
+#L-context .card .num { font-size: 16px; color: var(--amber); font-weight: 700; letter-spacing: 0.14em; }
+#L-context .card h3 { font-size: 34px; margin: 18px 0 16px; font-weight: 700; letter-spacing: -0.01em; }
+#L-context .card p { font-size: 23px; color: var(--text2); line-height: 1.45; margin: 0; }
+#L-context .foot { position: absolute; left: 160px; top: 890px; font-size: 18px; color: var(--muted); }
+
+/* graph svg */
+#gwrap { position: absolute; left: 0; top: 0; width: 900px; height: 540px; transform-origin: 0 0; opacity: 0; }
+#graph { width: 900px; height: 540px; overflow: visible; }
+#graph text { font-family: Inter, sans-serif; }
+.nlabel { font-size: 21px; font-weight: 600; fill: #fff; }
+.nsub { font-size: 13px; fill: var(--muted); font-family: var(--mono) !important; }
+
+/* graph scene */
+#L-graph .head { position: absolute; left: 90px; top: 150px; }
+#L-graph .json { position: absolute; left: 90px; top: 330px; width: 760px; padding: 26px 28px; }
+#L-graph .json .cap { font-size: 16px; color: var(--muted); margin-bottom: 14px; }
+#L-graph .json .cap b { color: var(--accent); font-weight: 600; }
+#L-graph pre { margin: 0; font-family: var(--mono); font-size: 16.5px; line-height: 1.62; color: var(--text2); }
+#L-graph pre .ln { display: block; border-radius: 4px; padding: 0 6px; margin: 0 -6px; }
+#L-graph .legend { position: absolute; left: 960px; top: 880px; font-size: 19px; color: var(--muted); display: flex; gap: 38px; }
+#L-graph .legend i { display: inline-block; width: 38px; vertical-align: middle; margin-right: 10px; border-top: 2px solid var(--text2); }
+#L-graph .legend i.d { border-top-style: dashed; }
+#L-graph .legend i.box { width: 26px; height: 18px; border: 2px dashed var(--amber); border-radius: 4px; }
+
+/* safety */
+#L-safety .head { position: absolute; left: 160px; top: 140px; width: 1600px; }
+#L-safety .test { position: absolute; left: 1010px; top: 250px; width: 850px; padding: 26px 28px 22px; }
+#L-safety .test .cap { font-size: 16px; color: var(--muted); margin-bottom: 12px; }
+#L-safety pre { margin: 0; font-family: var(--mono); font-size: 15.2px; line-height: 1.6; color: var(--text2); white-space: pre; }
+#L-safety .res { margin-top: 18px; font-family: var(--mono); font-size: 19px; color: var(--good); }
+#L-safety .res span { color: var(--muted); }
+.kw { color: #7fb0f0; } .st { color: #e6c07b; } .cm { color: var(--muted); }
+
+/* run */
+#L-run .panel { position: absolute; left: 930px; top: 118px; width: 930px; height: 880px; overflow: hidden; }
+#L-run .phead { position: absolute; left: 0; right: 0; top: 0; height: 92px; padding: 22px 28px;
+  border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; background: var(--surface); z-index: 2; }
+#L-run .phead .t1 { font-size: 15px; letter-spacing: 0.16em; color: var(--muted); font-weight: 700; }
+#L-run .phead .t2 { font-size: 20px; margin-top: 6px; color: var(--text2); }
+#L-run .clock { text-align: right; }
+#L-run .clock .v { font-family: var(--mono); font-size: 30px; font-weight: 600; }
+#L-run .clock .s { font-size: 15px; color: var(--muted); margin-top: 2px; }
+#L-run .view { position: absolute; left: 0; right: 0; top: 92px; bottom: 0; overflow: hidden;
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 46px); mask-image: linear-gradient(180deg, transparent 0, #000 46px); }
+#L-run .feed { position: absolute; left: 28px; right: 28px; top: 20px; }
+.ent { overflow: hidden; }
+.ent > .in { padding-bottom: 12px; }
+.bub { border-radius: 10px; padding: 13px 17px; font-size: 20px; line-height: 1.45; border: 1px solid var(--border); max-width: 88%; }
+.bub.user { margin-left: auto; background: var(--grid); }
+.bub.ai { background: var(--surface2); }
+.who { font-size: 13px; color: var(--muted); letter-spacing: 0.12em; font-weight: 700; margin-bottom: 6px; }
+.act { font-family: var(--mono); font-size: 17px; color: var(--muted); line-height: 1.5; }
+.act .fn { color: var(--accent); }
+.act .ok { color: var(--good); }
+.act .rs { color: var(--text2); }
+.plan { border: 1.5px solid var(--amber); background: rgba(250,178,25,0.07); border-radius: 12px; padding: 18px 20px; font-size: 18px; }
+.plan .sum { font-weight: 600; font-size: 19px; line-height: 1.45; margin-bottom: 12px; }
+.plan table { width: 100%; border-collapse: collapse; font-size: 18px; }
+.plan td { padding: 4px 10px 4px 0; font-variant-numeric: tabular-nums; }
+.plan .note { color: var(--muted); font-size: 15px; margin-top: 10px; line-height: 1.45; }
+.plan .btns { display: flex; gap: 12px; margin-top: 14px; }
+.btn { border-radius: 8px; padding: 9px 18px; font-size: 18px; font-weight: 600; border: 1.5px solid var(--border); color: var(--text2); }
+.btn.approve { border-color: var(--amber); color: var(--amber); }
+.stamp { font-size: 16px; color: var(--amber); margin-top: 12px; font-weight: 600; opacity: 0; }
+#cursor { position: absolute; left: 0; top: 0; width: 34px; height: 34px; opacity: 0; z-index: 9; filter: drop-shadow(0 3px 6px rgba(0,0,0,.6)); }
+#resume { position: absolute; left: 64px; top: 740px; width: 820px; padding: 20px 24px; opacity: 0; }
+#resume .l1 { font-family: var(--mono); font-size: 18px; color: var(--text2); }
+#resume .l2 { font-family: var(--mono); font-size: 19px; color: var(--amber); margin-top: 10px; }
+#resume .l0 { font-size: 15px; color: var(--muted); letter-spacing: .12em; font-weight: 700; margin-bottom: 10px; }
+#dbcard { position: absolute; left: 50px; top: 712px; width: 850px; padding: 18px 22px 16px; opacity: 0; }
+#dbcard .cap { font-size: 15px; color: var(--muted); letter-spacing: .12em; font-weight: 700; margin-bottom: 8px; }
+#dbcard .cap span { font-family: var(--mono); letter-spacing: 0; font-weight: 500; color: var(--accent); margin-left: 8px; }
+#dbcard table { width: 100%; border-collapse: collapse; font-size: 17px; font-variant-numeric: tabular-nums; }
+#dbcard th { text-align: left; font-weight: 500; color: var(--muted); font-size: 14px; padding: 4px 8px 6px 0; border-bottom: 1px solid var(--border); }
+#dbcard td { padding: 5px 8px 5px 0; }
+#dbcard .reason { font-family: var(--mono); font-size: 14px; color: var(--text2); margin-top: 10px; }
+
+/* map */
+#L-map .frame { position: absolute; left: 160px; top: 108px; width: 1600px; height: 900px; overflow: hidden;
+  border-radius: 16px; border: 1px solid rgba(255,255,255,0.14); box-shadow: 0 30px 90px rgba(0,0,0,0.6); }
+#L-map .shot { position: absolute; left: 0; top: 0; width: 1920px; height: 1200px; transform-origin: 0 0; }
+#L-map .shot img { width: 1920px; height: 1200px; display: block; }
+#L-map .shade { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(13,13,13,.0) 72%, rgba(13,13,13,.8)); }
+#L-map .banner { position: absolute; left: 50%; bottom: 100px; transform: translateX(-50%); padding: 18px 30px; font-size: 26px; white-space: nowrap; }
+#L-map .banner b { color: var(--amber); }
+.callout { position: absolute; padding: 10px 16px; border-radius: 10px; font-size: 23px; white-space: nowrap;
+  background: rgba(20,20,19,0.92); border: 1.5px solid var(--accent); box-shadow: 0 8px 26px rgba(0,0,0,.5); }
+.callout .z { font-weight: 700; margin-right: 8px; }
+.callout .d { font-family: var(--mono); color: #86b6ef; }
+.callout.grey { border-color: #6d6c67; }
+.callout.grey .d { color: var(--text2); }
+.callout.amb { border-color: var(--amber); }
+
+/* decline */
+#L-decline .head { position: absolute; left: 90px; top: 140px; }
+#L-decline .tools { position: absolute; left: 1010px; top: 250px; width: 850px; padding: 26px 30px 24px; }
+#L-decline .tools .cap { font-size: 16px; color: var(--muted); letter-spacing: .12em; font-weight: 700; margin-bottom: 8px; }
+#L-decline .row { display: flex; align-items: center; gap: 18px; padding: 15px 0; border-bottom: 1px solid var(--border); }
+#L-decline .row .n { font-family: var(--mono); font-size: 21px; width: 250px; color: var(--accent); }
+#L-decline .row .tg { width: 132px; }
+#L-decline .row .x { font-size: 18px; color: var(--text2); flex: 1; line-height: 1.35; }
+.read { background: rgba(57,135,229,.16); color: #86b6ef; }
+.prop { background: rgba(250,178,25,.16); color: var(--amber); }
+#L-decline .code { font-family: var(--mono); font-size: 15px; color: var(--text2); margin-top: 18px; line-height: 1.5; }
+
+/* limits */
+#L-limits .head { position: absolute; left: 160px; top: 170px; }
+#L-limits .rows { position: absolute; left: 160px; top: 330px; width: 1600px; }
+#L-limits .lrow { display: flex; gap: 34px; padding: 34px 0; border-bottom: 1px solid var(--border); }
+#L-limits .lrow .k { width: 560px; font-size: 32px; font-weight: 700; }
+#L-limits .lrow .v { flex: 1; font-size: 25px; color: var(--text2); line-height: 1.45; }
+
+/* end */
+#L-end .wrap { position: absolute; left: 0; right: 0; top: 250px; text-align: center; }
+#L-end .big { font-size: 150px; font-weight: 800; letter-spacing: -0.03em; }
+#L-end .tag2 { font-size: 44px; font-weight: 600; margin-top: 8px; }
+#L-end .tag2 .amb { color: var(--amber); }
+#L-end .stack { margin-top: 52px; font-size: 22px; color: var(--text2); }
+#L-end .links { margin-top: 36px; font-family: var(--mono); font-size: 26px; color: var(--accent); }
+#L-end .links .sub { color: var(--muted); font-family: Inter; font-size: 21px; margin-top: 14px; }
+#L-end .links code { font-family: var(--mono); color: var(--text2); }
+#L-end .by { margin-top: 44px; font-size: 22px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="stage">
+
+  <!-- ===================== title ===================== -->
+  <div class="layer" id="L-title">
+    <div class="wrap">
+      <div class="kicker" id="t-k">DTwin · Supervisory-control copilot</div>
+      <div class="h1"><div id="t-1">The copilot proposes.</div><div id="t-2" class="amb">A person approves.</div></div>
+      <div class="lede" id="t-s">A LangGraph.js agent for a building digital twin — shown through one real run, recorded on 24&nbsp;September&nbsp;2026.</div>
+    </div>
+  </div>
+
+  <!-- ===================== context ===================== -->
+  <div class="layer" id="L-context">
+    <div class="head">
+      <div class="kicker">Live operations, not just a model</div>
+      <div class="h2" style="margin-top:22px">A twin that writes back to the building.</div>
+    </div>
+    <div class="cards">
+      <div class="card" id="c-1"><div class="num">01</div><h3>Overrides expire</h3><p>Every command holds for a window, then lapses on its own. A dead optimiser cannot hold a building.</p></div>
+      <div class="card" id="c-2"><div class="num">02</div><h3>Pulled, never pushed</h3><p>The gateway reaches out for commands. There is no inbound connection into the building.</p></div>
+      <div class="card" id="c-3"><div class="num">03</div><h3>Checked twice</h3><p>A pure safety envelope judges each command when it is requested, and again when the gateway collects it.</p></div>
+    </div>
+    <div class="foot" id="c-f">docs/decisions.md §62 · supervisory control</div>
+  </div>
+
+  <!-- ===================== graph (persistent svg) ===================== -->
+  <div id="gwrap"><svg id="graph" viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="ah-m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#898781"/></marker>
+      <marker id="ah-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3987e5"/></marker>
+      <marker id="ah-y" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#fab219"/></marker>
+      <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6"/></filter>
+    </defs>
+    <g id="g-edges"></g>
+    <g id="g-nodes"></g>
+    <g id="g-extra"></g>
+    <circle id="token-glow" r="16" fill="#3987e5" filter="url(#glow)" opacity="0"/>
+    <circle id="token" r="8" fill="#fff" opacity="0"/>
+  </svg></div>
+
+  <div class="layer" id="L-graph">
+    <div class="head">
+      <div class="kicker">The graph</div>
+      <div class="h2" style="margin-top:16px">Generated, not drawn.</div>
+    </div>
+    <div class="json card">
+      <div class="cap"><b>GET /api/copilot/graph</b> &nbsp;←&nbsp; compiled.getGraphAsync()</div>
+      <pre id="jsonpre"></pre>
+    </div>
+    <div class="legend" id="g-legend">
+      <div><i></i>always</div>
+      <div><i class="d"></i>conditional — decided at run time</div>
+      <div><i class="box"></i>interrupt — waits</div>
+    </div>
+  </div>
+
+  <!-- ===================== safety ===================== -->
+  <div class="layer" id="L-safety">
+    <div class="head" id="s-head">
+      <div class="kicker">The safety property</div>
+      <div class="h2" style="margin-top:16px">One way in.</div>
+    </div>
+    <div class="test card" id="s-test">
+      <div class="cap">apps/web/lib/copilot/graph.test.ts — asserted against the compiled graph, not the picture</div>
+      <pre id="testpre"></pre>
+      <div class="res" id="s-res">✓ has no path from the start to apply that skips confirm <span>· 17 passed</span></div>
+    </div>
+  </div>
+
+  <!-- ===================== run ===================== -->
+  <div class="layer" id="L-run">
+    <div class="panel card">
+      <div class="phead">
+        <div><div class="t1">COPILOT</div><div class="t2">signed in as afsal@dtwin.local · owner</div></div>
+        <div class="clock"><div class="v" id="clk">0.0 s</div><div class="s" id="clks">graph time, as recorded</div></div>
+      </div>
+      <div class="view"><div class="feed" id="feed"></div></div>
+    </div>
+    <div class="card" id="resume">
+      <div class="l0">APPROVAL IS A NEW REQUEST</div>
+      <div class="l1">POST /api/copilot &nbsp;{ threadId, decision: 'approved' }</div>
+      <div class="l2">graph.invoke(new Command({ resume: 'approved' }), config)</div>
+    </div>
+    <div class="card" id="dbcard">
+      <div class="cap">THE AUDIT TRAIL<span>control_commands</span></div>
+      <table><thead><tr><th>zone</th><th>setpoint</th><th>requested by</th><th>state</th><th>applied</th><th>lapses</th></tr></thead><tbody id="dbrows"></tbody></table>
+      <div class="reason" id="dbreason"></div>
+    </div>
+    <svg id="cursor" viewBox="0 0 24 24"><path d="M3 2 L3 20 L8 15 L11.5 22.5 L14.5 21 L11 13.8 L18 13.8 Z" fill="#fff" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/></svg>
+  </div>
+
+  <!-- ===================== map ===================== -->
+  <div class="layer" id="L-map">
+    <div class="frame"><div class="shot" id="m-shot">
+      <img id="m-img" src="assets/app-level3.png" alt="">
+    </div>
+    <div class="shade"></div></div>
+    <div class="banner card" id="m-banner">Overrides lapse at <b>04:29 UTC</b> — back to 23.0 °C with nothing to undo them.</div>
+  </div>
+
+  <!-- ===================== decline ===================== -->
+  <div class="layer" id="L-decline">
+    <div class="head">
+      <div class="kicker">The other branch</div>
+      <div class="h2" style="margin-top:16px">Decline issues nothing.</div>
+    </div>
+    <div class="tools card" id="d-tools">
+      <div class="cap">THE MODEL'S WHOLE VOCABULARY — FOUR TOOLS</div>
+      <div class="row" id="d-r0"><div class="n">list_zones</div><div class="tg"><span class="tag read">reads</span></div><div class="x">zones, good &amp; recent temperatures, equipment status</div></div>
+      <div class="row" id="d-r1"><div class="n">control_envelope</div><div class="tg"><span class="tag read">reads</span></div><div class="x">the tenant's limits</div></div>
+      <div class="row" id="d-r2"><div class="n">dry_run_setpoint</div><div class="tg"><span class="tag read">reads</span></div><div class="x">asks the envelope — queues nothing</div></div>
+      <div class="row" id="d-r3"><div class="n">propose_plan</div><div class="tg"><span class="tag prop">proposes</span></div><div class="x">puts a plan in front of a person — applies nothing</div></div>
+      <div class="code" id="d-code"><span class="kw">expect</span>(TOOL_NAMES).<span class="kw">toEqual</span>([<span class="st">'list_zones'</span>, <span class="st">'control_envelope'</span>, <span class="st">'dry_run_setpoint'</span>, <span class="st">'propose_plan'</span>]);</div>
+    </div>
+  </div>
+
+  <!-- ===================== limits ===================== -->
+  <div class="layer" id="L-limits">
+    <div class="head"><div class="kicker">Honest limits</div><div class="h2" style="margin-top:16px">What it isn't.</div></div>
+    <div class="rows">
+      <div class="lrow" id="l-0"><div class="k">The checkpointer is in memory</div><div class="v">A restart forgets a suspended plan. A Postgres checkpointer is the next step.</div></div>
+      <div class="lrow" id="l-1"><div class="k">The gateway is a simulator</div><div class="v">Commands are pulled and applied by the device simulator. There is no building management system on the other end.</div></div>
+      <div class="lrow" id="l-2"><div class="k">It proposes; it doesn't optimise</div><div class="v">Nothing decides what the setpoint should be. That needs the energy model validated against a measured building first — and it is analytically verified, not validated.</div></div>
+    </div>
+  </div>
+
+  <!-- ===================== end ===================== -->
+  <div class="layer" id="L-end">
+    <div class="wrap">
+      <div class="big" id="e-1">DTwin</div>
+      <div class="tag2" id="e-2">The copilot proposes. <span class="amb">A person approves.</span></div>
+      <div class="stack" id="e-3">LangGraph.js · Claude Opus 5 · Next.js + react-three-fiber · Node ingest · FastAPI physics · PostGIS + TimescaleDB</div>
+      <div class="links" id="e-4">github.com/zencodelab/DTwin<div class="sub"><code>npm run copilot:graph</code> prints this graph from the code</div></div>
+      <div class="by" id="e-5">Afsal A Azeez</div>
+    </div>
+  </div>
+
+  <!-- chrome -->
+  <div id="brand">DTwin <span>· copilot</span></div>
+  <div id="chapter"></div>
+  <div id="realbadge"><b>REAL RUN</b>development stack · 24 Sep 2026 · claude-opus-5 · graph timings as recorded</div>
+  <div id="progress"></div>
+</div>
+
+<script src="timeline.js"></script>
+<script src="data.js"></script>
+<script>
+(() => {
+'use strict';
+const $ = (s) => document.querySelector(s);
+const SVGNS = 'http://www.w3.org/2000/svg';
+const S = Object.fromEntries(TL.scenes.map((s) => [s.id, s]));
+const L = TL.lines;
+const cl = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const p = (t, a, d) => (d <= 0 ? (t >= a ? 1 : 0) : cl((t - a) / d));
+const o3 = (x) => 1 - Math.pow(1 - x, 3);
+const io3 = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+const lt = (id, f) => L[id].start + L[id].dur * f;
+const lerp = (a, b, k) => a + (b - a) * k;
+const sceneVis = (t, id, fin = 0.5, fout = 0.45) =>
+  Math.min(p(t, S[id].start, fin), 1 - p(t, S[id].end - fout, fout));
+const inScenes = (t, a, b) => t >= S[a].start && t < S[b].end;
+function appear(el, t, at, d = 0.55, rise = 16) {
+  const k = o3(p(t, at, d));
+  el.style.opacity = k;
+  el.style.transform = `translateY(${(1 - k) * rise}px)`;
+  return k;
+}
+
+/* ------------------------------------------------------------ the recorded data */
+const RUN = window.RUN, GRAPH = window.GRAPH, DB = window.DB;
+const blocks = [];
+for (const m of RUN.messages) {
+  if (typeof m.content === 'string') { blocks.push({ role: m.role, type: 'text', text: m.content }); continue; }
+  for (const b of m.content) blocks.push({ role: m.role, ...b });
+}
+const aiTexts = blocks.filter((b) => b.role === 'assistant' && b.type === 'text' && b.text.trim()).map((b) => b.text);
+const toolUses = blocks.filter((b) => b.type === 'tool_use');
+const zonesJson = blocks.find((b) => b.type === 'tool_result' && typeof b.content === 'string' && b.content.startsWith('[{'));
+const zones = JSON.parse(zonesJson.content);
+const zoneName = Object.fromEntries(zones.map((z) => [z.id, z.name]));
+const envelope = RUN.events.find((e) => e.verb === 'settings').result;
+const dryRuns = RUN.events.filter((e) => e.verb === 'dryRun');
+const issues = RUN.events.filter((e) => e.verb === 'issue');
+const modelDry = toolUses.filter((u) => u.name === 'dry_run_setpoint');
+const proposal = toolUses.find((u) => u.name === 'propose_plan').input;
+const recheck = dryRuns.slice(modelDry.length);            // propose_plan's own dry runs
+const nodeEvents = RUN.events.filter((e) => e.kind === 'node');
+const tOf = (phase, node, nth = 0) => nodeEvents.filter((e) => e.phase === phase && e.node === node)[nth].t / 1000;
+
+/* ------------------------------------------------------------ graph geometry */
+const POS = {
+  __start__: [90, 70], agent: [280, 210], tools: [580, 210], confirm: [580, 350],
+  apply: [580, 480], declined: [800, 350], __end__: [90, 350],
+};
+const SUB = { agent: 'claude-opus-5', tools: '4 tools', confirm: 'interrupt()', apply: 'issues commands', declined: 'issues nothing' };
+const LABEL = { __start__: 'start', __end__: 'end' };
+const isTerm = (n) => n === '__start__' || n === '__end__';
+const size = (n) => (isTerm(n) ? [124, 46] : [156, 60]);
+function exitPt(n, dx, dy) {
+  const [cx, cy] = POS[n], [w, h] = size(n);
+  const k = Math.min((w / 2) / Math.abs(dx || 1e-9), (h / 2) / Math.abs(dy || 1e-9));
+  return [cx + dx * k, cy + dy * k];
+}
+function edgePath(s, t) {
+  const [ax, ay] = POS[s], [bx, by] = POS[t];
+  if (s === 'declined' && t === 'agent') {           // over the top, clear of every other edge
+    const c1 = [835, 95], c2 = [330, 60];
+    const a = exitPt(s, c1[0] - ax, c1[1] - ay), b = exitPt(t, c2[0] - bx, c2[1] - by);
+    return `M${a} C${c1} ${c2} ${b[0]},${b[1] - 3}`;
+  }
+  const pair = GRAPH.edges.some((e) => e.source === t && e.target === s);
+  if (pair) {
+    const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy);
+    const off = 34, c = [(ax + bx) / 2 - dy / len * off, (ay + by) / 2 + dx / len * off];
+    const a = exitPt(s, c[0] - ax, c[1] - ay), b = exitPt(t, c[0] - bx, c[1] - by);
+    const bb = [b[0] + (c[0] - b[0]) * 0.04, b[1] + (c[1] - b[1]) * 0.04];
+    return `M${a} Q${c} ${bb}`;
+  }
+  const a = exitPt(s, bx - ax, by - ay), b = exitPt(t, ax - bx, ay - by);
+  const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const bb = [b[0] - (b[0] - a[0]) / len * 3, b[1] - (b[1] - a[1]) / len * 3];
+  return `M${a} L${bb}`;
+}
+
+const gE = $('#g-edges'), gN = $('#g-nodes'), gX = $('#g-extra');
+const mk = (tag, attrs, parent) => {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  if (parent) parent.appendChild(el);
+  return el;
+};
+const EDGES = GRAPH.edges.map((e, i) => {
+  const key = `${e.source}>${e.target}`;
+  const d = edgePath(e.source, e.target);
+  const g = mk('g', {}, gE);
+  const mask = mk('mask', { id: `m${i}`, maskUnits: 'userSpaceOnUse', x: -100, y: -100, width: 1100, height: 740 }, g);
+  const mp = mk('path', { d, stroke: '#fff', 'stroke-width': 26, fill: 'none' }, mask);
+  const base = mk('path', { d, fill: 'none', stroke: '#898781', 'stroke-width': 2,
+    'stroke-dasharray': e.conditional ? '7 6' : 'none', 'marker-end': 'url(#ah-m)', mask: `url(#m${i})` }, g);
+  const hot = mk('path', { d, fill: 'none', stroke: '#3987e5', 'stroke-width': 3.2, 'marker-end': 'url(#ah-a)', opacity: 0 }, g);
+  const len = base.getTotalLength();
+  mp.setAttribute('stroke-dasharray', `${len + 30} ${len + 30}`);
+  return { ...e, key, i, d, g, mp, base, hot, len };
+});
+const E = Object.fromEntries(EDGES.map((e) => [e.key, e]));
+const guarded = E['confirm>apply'];
+guarded.hot.setAttribute('stroke', '#fab219');
+guarded.hot.setAttribute('marker-end', 'url(#ah-y)');
+const onlyWayIn = mk('text', { x: 598, y: 420, 'font-size': 17, 'font-weight': 600, fill: '#fab219', opacity: 0 }, gX);
+onlyWayIn.textContent = 'the only way in';
+
+const NODES = Object.fromEntries(GRAPH.nodes.map((n) => {
+  const [cx, cy] = POS[n], [w, h] = size(n);
+  const g = mk('g', { transform: `translate(${cx},${cy})` }, gN);
+  const glow = mk('rect', { x: -w / 2 - 6, y: -h / 2 - 6, width: w + 12, height: h + 12, rx: isTerm(n) ? h / 2 + 6 : 16,
+    fill: '#3987e5', filter: 'url(#glow)', opacity: 0 }, g);
+  const rect = mk('rect', { x: -w / 2, y: -h / 2, width: w, height: h, rx: isTerm(n) ? h / 2 : 11,
+    fill: '#1a1a19', stroke: n === 'confirm' ? '#fab219' : 'rgba(255,255,255,0.22)', 'stroke-width': n === 'confirm' ? 2 : 1.5,
+    'stroke-dasharray': n === 'confirm' ? '6 5' : 'none' }, g);
+  const label = mk('text', { class: 'nlabel', 'text-anchor': 'middle', y: SUB[n] ? -2 : 7 }, g);
+  label.textContent = LABEL[n] ?? n;
+  if (isTerm(n)) label.setAttribute('style', 'font-size:18px;font-weight:500;fill:#c3c2b7');
+  let sub = null;
+  if (SUB[n]) { sub = mk('text', { class: 'nsub', 'text-anchor': 'middle', y: 19 }, g); sub.textContent = SUB[n]; }
+  return [n, { n, g, glow, rect, label, sub }];
+}));
+// extra graph-space labels
+const suspended = mk('g', { opacity: 0 }, gX);
+mk('rect', { x: 612, y: 392, width: 196, height: 54, rx: 9, fill: 'rgba(250,178,25,0.12)', stroke: '#fab219', 'stroke-width': 1.3 }, suspended);
+const sus1 = mk('text', { x: 626, y: 414, 'font-size': 16, 'font-weight': 700, fill: '#fab219' }, suspended); sus1.textContent = 'SUSPENDED';
+const sus2 = mk('text', { x: 626, y: 434, 'font-size': 14, fill: '#c3c2b7' }, suspended); sus2.textContent = 'state checkpointed';
+const blockedX = mk('g', { opacity: 0 }, gX);
+mk('circle', { cx: 580 + 78, cy: 350 - 30, r: 15, fill: '#e0514a' }, blockedX);
+const bx = mk('text', { x: 658, y: 326, 'font-size': 20, 'font-weight': 800, fill: '#fff', 'text-anchor': 'middle' }, blockedX); bx.textContent = '×';
+const unreach = mk('text', { x: 580, y: 536, 'font-size': 17, 'font-weight': 600, fill: '#e0514a', 'text-anchor': 'middle', opacity: 0 }, gX);
+unreach.textContent = 'unreachable without confirm';
+const nothingIssued = mk('text', { x: 800, y: 405, 'font-size': 17, 'font-weight': 600, fill: '#c3c2b7', 'text-anchor': 'middle', opacity: 0 }, gX);
+nothingIssued.textContent = 'nothing issued';
+const token = $('#token'), tokenGlow = $('#token-glow');
+
+/* ------------------------------------------------------------ JSON + test text */
+const pad = (s, n) => s + ' '.repeat(Math.max(0, n - s.length));
+const jsonLines = [];
+jsonLines.push({ html: '{', edge: null });
+const nq = GRAPH.nodes.map((n) => `<span class="st">"${n}"</span>`);
+jsonLines.push({ html: `  <span class="st">"nodes"</span>: [${nq.slice(0, 4).join(', ')},`, edge: 'nodes' });
+jsonLines.push({ html: `            ${nq.slice(4).join(', ')}],`, edge: 'nodes' });
+jsonLines.push({ html: '  <span class="st">"edges"</span>: [', edge: null });
+GRAPH.edges.forEach((e, i) => {
+  const src = pad(`"${e.source}",`, 12), tgt = pad(`"${e.target}"`, 10);
+  jsonLines.push({ html: `    { source: <span class="st">${src}</span> target: <span class="st">${tgt}</span>${e.conditional ? ' conditional: <span class="kw">true</span>' : ''} }${i < GRAPH.edges.length - 1 ? ',' : ''}`, edge: i });
+});
+jsonLines.push({ html: '  ]', edge: null }, { html: '}', edge: null });
+$('#jsonpre').innerHTML = jsonLines.map((l, i) => `<span class="ln" id="jl${i}">${l.html}</span>`).join('');
+
+const testSrc = [
+  `it(<span class="st">'has no path from the start to apply that skips confirm'</span>, <span class="kw">async</span> () => {`,
+  `  <span class="kw">const</span> g = <span class="kw">await</span> compiled.getGraphAsync();`,
+  `  <span class="kw">const</span> next = <span class="kw">new</span> Map&lt;string, string[]&gt;();`,
+  `  <span class="kw">for</span> (<span class="kw">const</span> e <span class="kw">of</span> g.edges) next.set(e.source, [...(next.get(e.source) ?? []), e.target]);`,
+  `  <span class="cm">// Depth-first from __start__, refusing to step through confirm:</span>`,
+  `  <span class="cm">// apply must be unreachable.</span>`,
+  `  <span class="kw">const</span> seen = <span class="kw">new</span> Set&lt;string&gt;();`,
+  `  <span class="kw">const</span> stack = [<span class="st">'__start__'</span>];`,
+  `  <span class="kw">while</span> (stack.length) {`,
+  `    <span class="kw">const</span> n = stack.pop()!;`,
+  `    <span class="kw">if</span> (seen.has(n) || n === <span class="st">'confirm'</span>) <span class="kw">continue</span>;`,
+  `    seen.add(n);`,
+  `    <span class="kw">for</span> (<span class="kw">const</span> m <span class="kw">of</span> next.get(n) ?? []) stack.push(m);`,
+  `  }`,
+  `  expect(seen.has(<span class="st">'apply'</span>)).toBe(<span class="kw">false</span>);`,
+  `});`,
+];
+$('#testpre').innerHTML = testSrc.join('\n');
+
+// The DFS the test performs, replayed against the real edge list.
+const dfs = (() => {
+  const next = new Map();
+  for (const e of GRAPH.edges) next.set(e.source, [...(next.get(e.source) ?? []), e.target]);
+  const seen = [], stack = ['__start__'], order = [];
+  while (stack.length) {
+    const n = stack.pop();
+    if (seen.includes(n)) continue;
+    if (n === 'confirm') { order.push({ n, blocked: true }); continue; }
+    seen.push(n); order.push({ n, blocked: false });
+    for (const m of next.get(n) ?? []) stack.push(m);
+  }
+  return order;
+})();
+
+/* ------------------------------------------------------------ the transcript */
+const fmt1 = (x) => Number(x).toFixed(1);
+const hours = (s) => `${s / 3600} h`;
+const feed = $('#feed');
+const entries = [];
+function entry(html, at, extra = {}) {
+  const wrap = document.createElement('div'); wrap.className = 'ent';
+  const inner = document.createElement('div'); inner.className = 'in'; inner.innerHTML = html;
+  wrap.appendChild(inner); feed.appendChild(wrap);
+  const e = { wrap, inner, at, h: 0, ...extra }; entries.push(e); return e;
+}
+const envTxt = `${envelope.enabled ? 'enabled' : 'disabled'} · ±${envelope.maxDeviationK} K · ${envelope.maxStepK} K max step · ${envelope.minIntervalS / 60} min apart · ≤ ${envelope.maxDurationS / 3600} h`;
+const E_user = entry(`<div class="who" style="text-align:right">OPERATOR</div><div class="bub user">${RUN.request}</div>`, lt('s04', 0.26));
+const E_a1 = entry(`<div class="who">COPILOT</div><div class="bub ai">${aiTexts[0]}</div>`, lt('s04', 0.63));
+const E_t1 = entry(`<div class="act">· <span class="fn">list_zones</span>() <span class="rs r">→ ${zones.length} zones, readings, setpoints, equipment</span></div>
+  <div class="act">· <span class="fn">control_envelope</span>() <span class="rs r2">→ ${envTxt}</span></div>`, lt('s04', 0.79));
+const E_a2 = entry(`<div class="who">COPILOT</div><div class="bub ai">${aiTexts[1]}</div>`, lt('s05', 0.10));
+const E_dr = entry(modelDry.map((u, i) =>
+  `<div class="act dr" data-i="${i}">· <span class="fn">dry_run_setpoint</span> ${zoneName[u.input.zoneId]} → ${fmt1(u.input.setpointTempC)} °C, ${hours(u.input.durationS)} <span class="ok r">✓ allowed</span></div>`).join(''),
+  lt('s05', 0.38));
+const E_pp = entry(`<div class="act">· <span class="fn">propose_plan</span> ${proposal.commands.length} commands <span class="rs r">→ server re-checks every one: </span><span class="ok r2">${recheck.filter((r) => r.result.allowed).length} / ${recheck.length} allowed</span></div>`, lt('s06', 0.12));
+const planRows = proposal.commands.map((c, i) => {
+  const v = recheck[i].result;
+  return `<tr><td style="font-weight:600">${zoneName[c.zoneId]}</td><td>${fmt1(v.previousTempC)} → ${fmt1(c.setpointTempC)} °C</td><td style="color:var(--text2)">${Math.round(v.durationS / 60)} min</td><td style="color:var(--good)">allowed</td></tr>`;
+}).join('');
+const E_plan = entry(`<div class="plan" id="plancard"><div class="sum">${proposal.summary}</div><table>${planRows}</table>
+  <div class="note">Each override lapses on its own when its window ends. Every command is re-checked by the envelope at the moment it is issued, and again when the gateway collects it.</div>
+  <div class="btns"><div class="btn approve" id="approveBtn">Approve ${proposal.commands.length} commands</div><div class="btn">Decline</div></div>
+  <div class="stamp" id="stamp">✓ approved by afsal@dtwin.local</div></div>`, lt('s06', 0.60));
+const E_out = entry(issues.map((ev, i) =>
+  `<div class="act oc" data-i="${i}">· ${zoneName[ev.command.zoneId]} → ${fmt1(ev.command.setpointTempC)} °C: <span class="ok">${ev.result.state}</span> <span class="rs">${ev.result.commandId.slice(0, 8)}</span></div>`).join(''),
+  lt('s08', 0.06));
+const E_a4 = entry(`<div class="who">COPILOT</div><div class="bub ai">${aiTexts[aiTexts.length - 1]}</div>`, lt('s08', 0.70));
+
+/* DB rows */
+$('#dbrows').innerHTML = DB.commands.map((c, i) =>
+  `<tr><td style="font-weight:600">${c.zone}</td><td>${fmt1(c.previous)} → ${fmt1(c.setpoint)} °C</td><td class="mono" style="font-size:15px;color:var(--text2)">${c.requested_by}</td>
+   <td class="st8" data-i="${i}"></td><td style="color:var(--text2)">+${c.applied_after_s} s</td><td style="color:var(--text2)">${c.until_utc} UTC</td></tr>`).join('');
+$('#dbreason').textContent = `reason: '${DB.commands[0].reason}'`;
+
+/* map callouts — positions in screenshot pixels (image drawn at 1920×1200) */
+const T3 = Object.fromEntries(DB.level3.map((z) => [z.zone, z]));
+const shot = $('#m-shot');
+const svgM = mk('svg', { width: 1920, height: 1200, style: 'position:absolute;left:0;top:0;overflow:visible' }, shot);
+const CALL = [
+  { z: 'OFF-303', at: [802, 418], box: [470, 250], cls: '' },
+  { z: 'OFF-300', at: [619, 468], box: [245, 395], cls: '' },
+  { z: 'OFF-301', at: [768, 530], box: [360, 690], cls: '' },
+  { z: 'OFF-305', at: [1131, 520], box: [1150, 700], cls: '' },
+  { z: 'MEE-304', at: [950, 452], box: [1040, 250], cls: 'grey' },
+  { z: 'COR-302', at: [948, 612], box: [980, 790], cls: 'grey' },
+  { z: 'graph', at: [1716, 360], box: [1250, 585], cls: 'amb' },
+];
+const callouts = CALL.map((c) => {
+  const div = document.createElement('div'); div.className = `callout ${c.cls}`;
+  if (c.z === 'graph') div.innerHTML = '<span class="z">The same graph, in the app</span><span class="d" style="color:#fab219">Show how it works</span>';
+  else {
+    const z = T3[c.z], dk = z.temp - z.design;
+    div.innerHTML = `<span class="z">${c.z}</span><span class="d">${fmt1(z.temp)} °C · ${dk >= 0 ? '+' : '−'}${Math.abs(dk).toFixed(1)} K</span>${c.cls === 'grey' ? ' <span style="color:var(--muted);font-size:19px">not in plan</span>' : ''}`;
+  }
+  div.style.left = c.box[0] + 'px'; div.style.top = c.box[1] + 'px';
+  shot.appendChild(div);
+  const line = mk('line', { stroke: c.cls === 'grey' ? '#8a8984' : c.cls === 'amb' ? '#fab219' : '#86b6ef', 'stroke-width': 2.4 }, svgM);
+  const dot = mk('circle', { cx: c.at[0], cy: c.at[1], r: 7, fill: c.cls === 'grey' ? '#c3c2b7' : c.cls === 'amb' ? '#fab219' : '#86b6ef' }, svgM);
+  return { ...c, div, line, dot };
+});
+
+/* ------------------------------------------------------------ schedules */
+// Graph placement: [time, x, y, scale, opacity]
+const GK = [
+  [S.graph.start, 930, 250, 1.0, 0], [S.graph.start + 0.6, 930, 250, 1.0, 1],
+  [S.safety.start + 0.2, 930, 250, 1.0, 1], [S.safety.start + 1.3, 470, 262, 1.1, 1],
+  [L.s03b.start - 0.9, 470, 262, 1.1, 1], [L.s03b.start + 0.2, 70, 262, 1.0, 1],
+  [S.read.start + 0.1, 70, 262, 1.0, 1], [S.read.start + 1.1, 40, 196, 0.94, 1],
+  [S.map.start - 0.5, 40, 196, 0.94, 1], [S.map.start, 40, 196, 0.94, 0],
+  [S.decline.start, 70, 262, 1.0, 0], [S.decline.start + 0.6, 70, 262, 1.0, 1],
+  [S.limits.start - 0.45, 70, 262, 1.0, 1], [S.limits.start, 70, 262, 1.0, 0],
+];
+function graphPlace(t) {
+  if (t <= GK[0][0]) return GK[0].slice(1);
+  for (let i = 0; i < GK.length - 1; i++) {
+    const a = GK[i], b = GK[i + 1];
+    if (t < b[0]) { const k = io3(p(t, a[0], b[0] - a[0])); return [1, 2, 3, 4].map((j) => lerp(a[j], b[j], k)); }
+  }
+  return GK[GK.length - 1].slice(1);
+}
+
+// The run: token moves along the real path, timed to the narration.
+const MOVES = [
+  ['__start__>agent', lt('s04', 0.40), lt('s04', 0.50)],
+  ['agent>tools', lt('s04', 0.70), lt('s04', 0.78)],
+  ['tools>agent', lt('s05', 0) - 0.35, lt('s05', 0.06)],
+  ['agent>tools', lt('s05', 0.30), lt('s05', 0.37)],
+  ['tools>agent', lt('s06', 0) - 0.35, lt('s06', 0.04)],
+  ['agent>tools', lt('s06', 0.14), lt('s06', 0.20)],
+  ['tools>confirm', lt('s06', 0.52), lt('s06', 0.61)],
+  ['confirm>apply', lt('s07', 0.58), lt('s07', 0.90)],
+  ['apply>agent', lt('s08', 0.55), lt('s08', 0.63)],
+  ['agent>__end__', lt('s08', 0.80), lt('s08', 0.88)],
+];
+const DMOVES = [
+  ['confirm>declined', lt('s10', 0.02), lt('s10', 0.12)],
+  ['declined>agent', lt('s10', 0.14), lt('s10', 0.30)],
+  ['agent>__end__', lt('s10', 0.32), lt('s10', 0.40)],
+];
+// Graph time shown on the clock, from the recording: [video t, recorded s]
+const r = (ph, n, k = 0) => tOf(ph, n, k);
+const CK = [
+  [lt('s04', 0.40), 0], [lt('s04', 0.62), r('propose', 'agent', 0)],
+  [lt('s04', 0.78), r('propose', 'agent', 0)], [lt('s04', 0.93), r('propose', 'tools', 0)],
+  [lt('s05', 0.02), r('propose', 'tools', 0)], [lt('s05', 0.28), r('propose', 'agent', 1)],
+  [lt('s05', 0.38), r('propose', 'agent', 1)], [lt('s05', 0.84), r('propose', 'tools', 1)],
+  [lt('s06', 0.02), r('propose', 'tools', 1)], [lt('s06', 0.13), r('propose', 'agent', 2)],
+  [lt('s06', 0.20), r('propose', 'agent', 2)], [lt('s06', 0.52), r('propose', '__interrupt__', 0)],
+  [lt('s07', 0.30), r('propose', '__interrupt__', 0)], [lt('s07', 0.32), r('resume', 'confirm', 0)],
+  [lt('s07', 0.90), r('resume', 'confirm', 0)], [lt('s08', 0.30), r('resume', 'apply', 0)],
+  [lt('s08', 0.63), r('resume', 'apply', 0)], [lt('s08', 0.74), r('resume', 'agent', 0)],
+];
+function clockAt(t) {
+  if (t <= CK[0][0]) return 0;
+  for (let i = 0; i < CK.length - 1; i++) {
+    const a = CK[i], b = CK[i + 1];
+    if (t < b[0]) return lerp(a[1], b[1], p(t, a[0], b[0] - a[0]));
+  }
+  return CK[CK.length - 1][1];
+}
+function moveState(t, moves) {
+  let at = null, moving = null, done = [];
+  for (const [key, a, b] of moves) {
+    if (t >= b) { at = key.split('>')[1]; done.push(key); }
+    else if (t >= a) { moving = { key, k: io3(p(t, a, b - a)) }; break; }
+    else break;
+  }
+  return { at, moving, done };
+}
+const CHAPTERS = {
+  context: ['01', 'The twin writes back'], graph: ['02', 'The graph'], safety: ['03', 'The safety property'],
+  read: ['04', 'A real run'], dry: ['04', 'A real run'], propose: ['04', 'A real run'], approve: ['04', 'A real run'],
+  apply: ['04', 'A real run'], map: ['05', 'On the building'], decline: ['06', 'The other branch'], limits: ['07', 'Limits'],
+};
+
+/* ------------------------------------------------------------ one frame */
+function render(t) {
+  // scene layers
+  for (const id of ['title', 'context', 'graph', 'safety', 'map', 'decline', 'limits', 'end']) {
+    $(`#L-${id}`).style.opacity = sceneVis(t, id);
+  }
+  const runVis = Math.min(p(t, S.read.start, 0.6), 1 - p(t, S.apply.end - 0.45, 0.45));
+  $('#L-run').style.opacity = runVis;
+
+  // chrome
+  const scene = TL.scenes.find((s) => t >= s.start && t < s.end) ?? TL.scenes[TL.scenes.length - 1];
+  const chromeOn = !['title', 'end'].includes(scene.id);
+  $('#brand').style.opacity = chromeOn ? Math.min(p(t, S.context.start, 0.6), 1 - p(t, S.end.start - 0.4, 0.4)) : 0;
+  const ch = CHAPTERS[scene.id];
+  const chEl = $('#chapter');
+  if (ch) { chEl.innerHTML = `<b>${ch[0]}</b>${ch[1]}`; chEl.style.opacity = Math.min(p(t, scene.start, 0.5), 1 - p(t, scene.end - 0.35, 0.35), 1); }
+  else chEl.style.opacity = 0;
+  $('#realbadge').style.opacity = Math.min(p(t, S.read.start, 0.6), 1 - p(t, S.map.end - 0.45, 0.45));
+  $('#progress').style.width = `${(t / TL.total) * 100}%`;
+
+  // title
+  appear($('#t-k'), t, 0.3); appear($('#t-1'), t, 0.7, 0.7, 30); appear($('#t-2'), t, lt('s00', 0.55), 0.7, 30); appear($('#t-s'), t, lt('s00', 0.75), 0.7);
+  // context
+  appear($('#c-1'), t, lt('s01', 0.24)); appear($('#c-2'), t, lt('s01', 0.47)); appear($('#c-3'), t, lt('s01', 0.72)); appear($('#c-f'), t, lt('s01', 0.9));
+
+  // graph placement
+  const [gx, gy, gs, go] = graphPlace(t);
+  const gw = $('#gwrap');
+  gw.style.opacity = go; gw.style.transform = `translate(${gx}px, ${gy}px) scale(${gs})`;
+
+  // --- graph build (scene "graph"): nodes, then edges in edge-list order
+  const building = t < S.safety.start;
+  const nodeIn = (n, i) => building ? o3(p(t, lt('s02', 0.04 + i * 0.045), 0.35)) : 1;
+  const edgeIn = (e) => building ? io3(p(t, lt('s02', 0.40 + e.i * 0.062), 0.55)) : 1;
+  // json highlighting
+  jsonLines.forEach((l, i) => {
+    const el = document.getElementById(`jl${i}`);
+    let on = 0;
+    if (l.edge === 'nodes') on = p(t, lt('s02', 0.04), 0.3) * (1 - p(t, lt('s02', 0.38), 0.3));
+    else if (typeof l.edge === 'number') { const a = lt('s02', 0.40 + l.edge * 0.062); on = p(t, a, 0.15) * (1 - p(t, a + 0.9, 0.4)); }
+    el.style.background = `rgba(57,135,229,${0.22 * on})`;
+    el.style.color = on > 0.5 ? '#fff' : '';
+  });
+  appear($('#g-legend'), t, lt('s02', 0.99), 0.6);
+
+  // --- per-node and per-edge emphasis
+  const inSafety = t >= S.safety.start && t < S.safety.end;
+  const safetyDim = inSafety ? o3(p(t, lt('s03', 0.10), 0.6)) * (1 - p(t, L.s03b.start - 0.9, 0.6)) : 0;
+  const inDfs = inSafety && t >= L.s03b.start - 0.3;
+  const inRun = inScenes(t, 'read', 'apply');
+  const inDecline = t >= S.decline.start && t < S.decline.end;
+  const run = moveState(t, MOVES), dec = moveState(t, DMOVES);
+
+  GRAPH.nodes.forEach((n, i) => {
+    const N = NODES[n];
+    let op = nodeIn(n, i), glow = 0, gcol = '#3987e5', stroke = null;
+    if (safetyDim && n !== 'apply' && n !== 'confirm') op *= 1 - 0.72 * safetyDim;
+    if (inSafety && !inDfs && (n === 'apply' || n === 'confirm')) {
+      glow = 0.55 * o3(p(t, lt('s03', n === 'apply' ? 0.16 : 0.60), 0.5)) * (1 - p(t, L.s03b.start - 0.9, 0.5)); gcol = '#fab219';
+    }
+    if (inDfs) {
+      const step = dfs.findIndex((d) => d.n === n);
+      const at = step < 0 ? null : lt('s03b', 0.12 + step * 0.13);
+      if (at !== null && !dfs[step].blocked) { glow = 0.6 * p(t, at, 0.25); gcol = '#3987e5'; }
+      if (n === 'apply' || n === 'declined') op *= 1 - 0.65 * p(t, lt('s03b', 0.75), 0.4);
+    }
+    if (inRun) {
+      const act = run.moving ? null : run.at;
+      if (n === act) { glow = 0.55 + 0.15 * Math.sin(t * 5); gcol = (n === 'confirm' || n === 'apply') ? '#fab219' : n === '__end__' ? '#898781' : '#3987e5'; }
+    }
+    if (inDecline) {
+      if (n === 'apply') op *= 0.3;
+      const act = dec.moving ? null : dec.at;
+      if (n === act) { glow = 0.55; gcol = n === '__end__' ? '#898781' : '#3987e5'; }
+      if (n === 'confirm' && t < lt('s10', 0.02)) { glow = 0.5; gcol = '#fab219'; }
+    }
+    N.g.style.opacity = op;
+    N.glow.setAttribute('opacity', glow); N.glow.setAttribute('fill', gcol);
+  });
+
+  EDGES.forEach((e) => {
+    const k = edgeIn(e);
+    e.mp.setAttribute('stroke-dashoffset', (e.len + 30) * (1 - k));
+    let baseOp = 1, hot = 0;
+    if (safetyDim) baseOp = e === guarded ? 1 : 1 - 0.75 * safetyDim;
+    if (inSafety && !inDfs && e === guarded) hot = o3(p(t, lt('s03', 0.36), 0.6)) * (1 - p(t, L.s03b.start - 0.9, 0.5));
+    if (inDfs) {
+      const s = dfs.findIndex((d) => d.n === e.source), tt = dfs.findIndex((d) => d.n === e.target);
+      if (s >= 0 && !dfs[s].blocked && tt >= 0) hot = 0.8 * p(t, lt('s03b', 0.12 + tt * 0.13), 0.25);
+      if (['confirm', 'apply', 'declined'].includes(e.source)) baseOp = 1 - 0.7 * p(t, lt('s03b', 0.75), 0.4);
+    }
+    if (inRun) {
+      if (run.done.includes(e.key)) hot = e === guarded ? 1 : 0.55;
+      if (run.moving && run.moving.key === e.key) hot = e === guarded ? 1 : 0.9;
+    }
+    if (inDecline) {
+      if (e === guarded) baseOp = 0.25;
+      if (dec.done.includes(e.key) || (dec.moving && dec.moving.key === e.key)) hot = 0.9;
+    }
+    e.base.style.opacity = baseOp;
+    e.hot.setAttribute('opacity', hot);
+    e.hot.setAttribute('stroke', e === guarded ? '#fab219' : '#3987e5');
+  });
+
+  // graph-space labels
+  const wayIn = inSafety ? o3(p(t, lt('s03', 0.40), 0.5)) * (1 - p(t, L.s03b.start - 0.9, 0.4))
+    : inRun ? (run.done.includes('confirm>apply') || (run.moving && run.moving.key === 'confirm>apply') ? 1 : 0.0) : 0;
+  onlyWayIn.setAttribute('opacity', wayIn);
+  const susp = inRun && run.at === 'confirm' && !run.moving ? o3(p(t, lt('s06', 0.62), 0.4)) : 0;
+  suspended.setAttribute('opacity', susp);
+  blockedX.setAttribute('opacity', inDfs ? o3(p(t, lt('s03b', 0.12 + dfs.findIndex((d) => d.blocked) * 0.13), 0.3)) : 0);
+  unreach.setAttribute('opacity', inDfs ? o3(p(t, lt('s03b', 0.78), 0.4)) : 0);
+  nothingIssued.setAttribute('opacity', inDecline ? o3(p(t, lt('s10', 0.12), 0.4)) : 0);
+
+  // token
+  const mv = inRun ? run.moving : inDecline ? dec.moving : null;
+  if (mv) {
+    const e = E[mv.key], pt = e.base.getPointAtLength(e.len * mv.k);
+    const col = e === guarded ? '#fab219' : '#3987e5';
+    token.setAttribute('cx', pt.x); token.setAttribute('cy', pt.y); token.setAttribute('opacity', 1);
+    tokenGlow.setAttribute('cx', pt.x); tokenGlow.setAttribute('cy', pt.y); tokenGlow.setAttribute('opacity', 0.9); tokenGlow.setAttribute('fill', col);
+  } else { token.setAttribute('opacity', 0); tokenGlow.setAttribute('opacity', 0); }
+
+  // safety text
+  appear($('#s-head'), t, S.safety.start + 0.3);
+  $('#s-head').style.opacity = Math.min(parseFloat($('#s-head').style.opacity), 1 - p(t, L.s03b.start - 0.9, 0.5));
+  appear($('#s-test'), t, L.s03b.start - 0.4, 0.6, 24);
+  appear($('#s-res'), t, lt('s03b', 0.86), 0.4, 6);
+
+  // --- run panel
+  if (runVis > 0) {
+    let total = 0;
+    for (const e of entries) {
+      const k = o3(p(t, e.at, 0.5));
+      e.wrap.style.height = `${e.h * k}px`;
+      e.inner.style.opacity = k;
+      total += e.h * k;
+    }
+    const view = 880 - 92 - 30;
+    feed.style.transform = `translateY(${-Math.max(0, total - view)}px)`;
+    // staged bits inside entries
+    E_t1.inner.querySelector('.r').style.opacity = p(t, lt('s04', 0.88), 0.4);
+    E_t1.inner.querySelector('.r2').style.opacity = p(t, lt('s04', 0.93), 0.4);
+    E_dr.inner.querySelectorAll('.dr').forEach((el, i) => {
+      el.style.opacity = p(t, lt('s05', 0.38 + i * 0.06), 0.3);
+      el.querySelector('.r').style.opacity = p(t, lt('s05', 0.56 + i * 0.075), 0.3);
+    });
+    E_pp.inner.querySelector('.r').style.opacity = p(t, lt('s06', 0.22), 0.3);
+    E_pp.inner.querySelector('.r2').style.opacity = p(t, lt('s06', 0.44), 0.3);
+    E_out.inner.querySelectorAll('.oc').forEach((el, i) => { el.style.opacity = p(t, lt('s08', 0.06 + i * 0.06), 0.3); });
+
+    // clock
+    const c = clockAt(t);
+    $('#clk').textContent = `${c.toFixed(1)} s`;
+    const where = run.moving ? run.moving.key.split('>')[1] : run.at;
+    const status = !where ? 'graph time, as recorded'
+      : where === 'confirm' && t < lt('s07', 0.30) ? 'suspended — waits as long as the person takes'
+      : where === 'agent' ? 'agent · model call' : where === 'tools' ? 'tools · reading the building'
+      : where === 'confirm' ? 'resumed on a new request' : where === 'apply' ? 'apply · issuing commands'
+      : where === '__end__' ? 'done' : 'graph time, as recorded';
+    $('#clks').textContent = status;
+    $('#clk').style.color = where === 'confirm' || where === 'apply' ? '#fab219' : '#fff';
+
+    // approve: cursor, click, stamp
+    const btn = document.getElementById('approveBtn');
+    const cur = $('#cursor');
+    const cIn = p(t, lt('s07', 0.0), 0.3) * (1 - p(t, lt('s07', 0.45), 0.3));
+    cur.style.opacity = cIn;
+    if (cIn > 0 && btn) {
+      const r = btn.getBoundingClientRect();
+      const tx = r.left + r.width * 0.55, ty = r.top + r.height * 0.55;
+      const k = io3(p(t, lt('s07', 0.0), lt('s07', 0.14) - lt('s07', 0.0)));
+      const x = lerp(1500, tx, k), y = lerp(1010, ty, k);
+      const press = p(t, lt('s07', 0.15), 0.08) * (1 - p(t, lt('s07', 0.23), 0.1));
+      cur.style.transform = `translate(${x - 6}px, ${y - 4}px) scale(${1 - 0.15 * press})`;
+    }
+    if (btn) {
+      const on = p(t, lt('s07', 0.16), 0.1);
+      btn.style.background = `rgba(250,178,25,${0.95 * on})`;
+      btn.style.color = on > 0.5 ? '#111' : '';
+    }
+    const stamp = document.getElementById('stamp');
+    if (stamp) stamp.style.opacity = p(t, lt('s07', 0.24), 0.3);
+
+    // resume chip & DB card
+    const rs = $('#resume');
+    rs.style.opacity = Math.min(o3(p(t, lt('s07', 0.24), 0.5)), 1 - p(t, S.apply.start + 0.2, 0.5));
+    rs.style.transform = `translateY(${(1 - o3(p(t, lt('s07', 0.24), 0.5))) * 18}px)`;
+    const dk = appear($('#dbcard'), t, lt('s08', 0.20), 0.6, 20);
+    document.querySelectorAll('#dbrows tr').forEach((tr, i) => {
+      tr.style.opacity = p(t, lt('s08', 0.26 + i * 0.05), 0.3);
+      const td = tr.querySelector('.st8');
+      const applied = t >= lt('s08', 0.80 + i * 0.03);
+      td.innerHTML = applied ? '<span style="color:var(--good);font-weight:600">applied</span>' : '<span style="color:var(--text2)">pending</span>';
+    });
+    $('#dbreason').style.opacity = p(t, lt('s08', 0.45), 0.4);
+  }
+
+  // --- map
+  if (sceneVis(t, 'map') > 0) {
+    const k = p(t, S.map.start, S.map.end - S.map.start);
+    const s0 = 1600 / 1920, S2 = s0 * (1 + 0.045 * io3(k)), P = [760, 480];
+    shot.style.transform = `translate(${P[0] * s0 - P[0] * S2}px, ${P[1] * s0 - P[1] * S2}px) scale(${S2})`;
+    callouts.forEach((c, i) => {
+      const at = c.z === 'graph' ? lt('s09', 0.86) : c.cls === 'grey' ? lt('s09', 0.40 + (i - 4) * 0.07) : lt('s09', 0.08 + i * 0.06);
+      const a = o3(p(t, at, 0.45));
+      c.div.style.opacity = a;
+      const r = c.div.getBoundingClientRect(), sr = shot.getBoundingClientRect(), sc = sr.width / 1920;
+      const bx = (r.left - sr.left) / sc, by = (r.top - sr.top) / sc, bw = r.width / sc, bh = r.height / sc;
+      const ex = cl(c.at[0], bx, bx + bw), ey = cl(c.at[1], by, by + bh);
+      c.line.setAttribute('x1', ex); c.line.setAttribute('y1', ey);
+      c.line.setAttribute('x2', lerp(ex, c.at[0], a)); c.line.setAttribute('y2', lerp(ey, c.at[1], a));
+      c.line.setAttribute('opacity', a); c.dot.setAttribute('opacity', p(t, at + 0.35, 0.2));
+    });
+    appear($('#m-banner'), t, lt('s09', 0.70), 0.6, 18);
+    $('#m-banner').style.transform += ' translateX(-50%)';
+  }
+
+  // --- decline
+  appear($('#d-tools'), t, lt('s10', 0.36), 0.6, 20);
+  for (let i = 0; i < 4; i++) appear($(`#d-r${i}`), t, lt('s10', 0.42 + i * 0.07), 0.4, 8);
+  appear($('#d-code'), t, lt('s10', 0.78), 0.5, 8);
+
+  // --- limits
+  appear($('#l-0'), t, lt('s11', 0.10)); appear($('#l-1'), t, lt('s11', 0.44)); appear($('#l-2'), t, lt('s11', 0.76));
+
+  // --- end
+  appear($('#e-1'), t, S.end.start + 0.2, 0.7, 24); appear($('#e-2'), t, lt('s12', 0.30), 0.6);
+  appear($('#e-3'), t, lt('s12', 0.85), 0.6); appear($('#e-4'), t, lt('s12', 1.0) + 0.2, 0.6); appear($('#e-5'), t, lt('s12', 1.0) + 0.6, 0.6);
+}
+
+/* measure entry heights once, everything laid out and visible */
+function measure() {
+  $('#L-run').style.opacity = 1;
+  for (const e of entries) { e.wrap.style.height = 'auto'; e.inner.style.opacity = 1; }
+  for (const e of entries) e.h = e.inner.getBoundingClientRect().height;
+  $('#L-run').style.opacity = 0;
+}
+
+window.seek = (ms) => render(ms / 1000);
+window.DURATION = TL.total;
+window.READY = Promise.all([document.fonts.ready, new Promise((res) => {
+  const img = $('#m-img'); if (img.complete) res(); else img.onload = res;
+})]).then(() => { measure(); render(0); return true; });
+})();
+</script>
+</body>
+</html>

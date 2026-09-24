@@ -71,6 +71,11 @@ graph TD;
 	classDef last fill:#bfb6fc;
 ```
 
+[`video/`](video/) holds a narrated walkthrough of this graph and one real run
+through it — request, dry runs, suspension, approval, the audit trail and the
+live map — rendered from the recording, not screen-captured. The rendered MP4
+is not committed; `video/README.md` says how to make it.
+
 ## Stack
 
 | Layer | Choice |

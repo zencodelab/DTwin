@@ -31,3 +31,9 @@ interview/
 # 2026-09-20 and it was removed from history for that reason; it has been
 # moved around since and landed here on 2026-09-24. It must never be pushed.
 dtv/
+
+# Explainer video: rendered outputs and generated audio (sources are tracked)
+video/*.webm
+video/*.mp4
+video/audio/
+video/__pycache__/
