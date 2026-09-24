@@ -7,7 +7,8 @@ operator's request to the setpoints on the live map.
 
 | File | What it is |
 |---|---|
-| `dtwin-copilot-short.mp4` | **Silent 1:40 cut — the one being posted** (not committed) |
+| `dtwin-copilot-short-cc.mp4` | **Silent 1:40 cut, captions burned in — the one being posted** (not committed) |
+| `dtwin-copilot-short.mp4` | Silent 1:40 cut, no captions (not committed) |
 | `dtwin-copilot-short-narrated.mp4` | 1:40 cut with narration (not committed) |
 | `dtwin-copilot-narrated.mp4` | Full 3:03, H.264 + narration (not committed) |
 | `dtwin-copilot.mp4` | Silent H.264, full length (not committed) |
@@ -121,13 +122,28 @@ NODE_PATH=<dir with playwright-core> node render_cut.js cut.json
 ./to_mp4.sh dtwin-copilot-short.webm dtwin-copilot-short.mp4            # silent
 ./to_mp4_narrated.sh dtwin-copilot-short.webm "$PWD/audio/narration-short.wav" \
   dtwin-copilot-short-narrated.mp4                                      # narrated
+
+# silent, captions burned into the frames (the posted version):
+NODE_PATH=<dir with playwright-core> node render_cut.js cut.json \
+  dtwin-copilot-short-cc.webm --burn
+./to_mp4.sh dtwin-copilot-short-cc.webm dtwin-copilot-short-cc.mp4
 ```
 
-Both are kept. The **silent** cut is the one being posted — the narration is a
-synthetic macOS voice, and no voice reads better than an obviously synthetic
-one. The captions carry the argument instead, so with the silent version they
-stop being an accessibility nicety and become the content: a viewer whose
-captions are off sees the pictures and none of the reasoning.
+`--burn` draws the cut's own `.srt` into each frame, and `--preview 1.5,52,96`
+writes PNGs at those cut times instead of a video, so placement can be checked
+without paying for a full render. The caption sits 58 px from the bottom, below
+everything the scenes draw — checked at the opening JSON panel, the graph with
+its test, and the copilot panel's buttons.
+
+All of these are kept. The one being posted is **silent with captions burned
+in** — the narration is a synthetic macOS voice, and no voice reads better than
+an obviously synthetic one.
+
+With no audio track the captions stop being an accessibility nicety and become
+the content, which is why they are burned in rather than shipped as a sidecar:
+an `.srt` is a toggle, and a viewer whose captions are off would get the
+pictures and none of the reasoning. **Do not attach the `.srt` alongside the
+burned version** — they would double up on screen.
 
 To change what the cut keeps, edit the windows in `cut.json` and re-run both —
 they read the same file, so the picture and the sound cannot disagree.
