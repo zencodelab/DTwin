@@ -1,0 +1,34 @@
+{
+  "name": "full",
+  "comment": "The full 3:03 with the first 25.70 s sped up. Silent, captions burned in. Title card 0-10.65 at 2.5x (it is a static two-line card), the 'writes back' scene 10.65-25.70 at 1.75x (a heading, then three cards whose own text carries the point). In both, the .srt's cues are replaced by one caption per scene: at these speeds the original eight would flash by at 30-50 characters per second, and the on-screen headings already say the same words. Everything from 25.70 s on is unchanged.",
+  "windows": [
+    {
+      "start": 0.0,
+      "end": 10.65,
+      "speed": 2.5,
+      "captions": [
+        [
+          1.41,
+          10.4,
+          "This is the copilot in DTwin,\na digital twin for a commercial building."
+        ]
+      ]
+    },
+    {
+      "start": 10.65,
+      "end": 25.7,
+      "speed": 1.75,
+      "captions": [
+        [
+          11.46,
+          19.9,
+          "The twin doesn't only watch the building.\nIt writes back to it."
+        ]
+      ]
+    },
+    [
+      25.7,
+      183.03
+    ]
+  ]
+}

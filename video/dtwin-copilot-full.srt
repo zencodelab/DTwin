@@ -1,0 +1,225 @@
+1
+00:00:00,564 --> 00:00:04,160
+This is the copilot in DTwin,
+a digital twin for a commercial building.
+
+2
+00:00:04,723 --> 00:00:09,546
+The twin doesn't only watch the building.
+It writes back to it.
+
+3
+00:00:13,674 --> 00:00:16,105
+The copilot is a LangGraph state machine.
+
+4
+00:00:16,145 --> 00:00:18,269
+This diagram isn't drawn by hand.
+
+5
+00:00:18,309 --> 00:00:21,243
+It's generated from the compiled
+graph's own edge list,
+
+6
+00:00:21,283 --> 00:00:24,346
+the same list the app
+serves, and the tests read.
+
+7
+00:00:27,951 --> 00:00:29,642
+Here's the whole safety argument.
+
+8
+00:00:29,682 --> 00:00:32,575
+Apply, the only node
+that touches equipment,
+
+9
+00:00:32,615 --> 00:00:35,350
+has exactly one way in, from confirm.
+
+10
+00:00:35,390 --> 00:00:36,962
+And confirm is an interrupt:
+
+11
+00:00:37,002 --> 00:00:39,940
+the run stops there,
+and waits for a person.
+
+12
+00:00:40,611 --> 00:00:42,560
+A test walks the graph from the start,
+
+13
+00:00:42,600 --> 00:00:44,627
+refuses to pass through confirm,
+
+14
+00:00:44,667 --> 00:00:46,774
+and proves that apply is unreachable.
+
+15
+00:00:49,746 --> 00:00:53,103
+Now, a real run, recorded
+on the development stack.
+
+16
+00:00:53,143 --> 00:00:57,749
+The operator asks to pre-cool the Level 3
+offices before the afternoon peak.
+
+17
+00:00:57,789 --> 00:00:59,567
+The agent reads every zone,
+
+18
+00:00:59,607 --> 00:01:02,711
+and the control envelope,
+before anything else.
+
+19
+00:01:04,693 --> 00:01:07,824
+All four offices have good
+sensors and healthy equipment.
+
+20
+00:01:07,864 --> 00:01:10,922
+So it dry-runs a two
+kelvin drop for four hours,
+
+21
+00:01:10,962 --> 00:01:13,591
+the largest single step
+the envelope allows.
+
+22
+00:01:13,631 --> 00:01:15,247
+Four out of four allowed.
+
+23
+00:01:17,439 --> 00:01:18,970
+Then it proposes the plan.
+
+24
+00:01:19,010 --> 00:01:22,707
+The server dry-runs every command
+again before the operator sees it,
+
+25
+00:01:22,747 --> 00:01:24,625
+and the run suspends at confirm.
+
+26
+00:01:24,665 --> 00:01:27,715
+Forty-two seconds in,
+the state is checkpointed,
+
+27
+00:01:27,755 --> 00:01:29,508
+and nothing has been applied.
+
+28
+00:01:32,523 --> 00:01:33,952
+The operator approves.
+
+29
+00:01:33,992 --> 00:01:37,039
+That's a new request,
+resuming the suspended run.
+
+30
+00:01:37,079 --> 00:01:40,148
+Only now does the graph
+take the edge into apply.
+
+31
+00:01:43,310 --> 00:01:46,682
+Apply uses the same control
+endpoint a human click does,
+
+32
+00:01:46,722 --> 00:01:50,182
+as the approving user, marked
+as proposed by the copilot.
+
+33
+00:01:50,222 --> 00:01:52,519
+The envelope checks each command again,
+
+34
+00:01:52,559 --> 00:01:55,624
+and the gateway collected
+all four within six seconds.
+
+35
+00:01:59,031 --> 00:02:01,667
+On the live map, the four offices now sit
+
+36
+00:02:01,707 --> 00:02:04,010
+about two kelvin under
+their design setpoint.
+
+37
+00:02:04,050 --> 00:02:05,817
+The corridor and the meeting room,
+
+38
+00:02:05,857 --> 00:02:08,161
+which weren't in the plan, stay in band.
+
+39
+00:02:08,201 --> 00:02:12,316
+In four hours the overrides lapse,
+and nothing has to undo them.
+
+40
+00:02:15,087 --> 00:02:18,137
+Decline takes the other
+branch, and nothing is issued.
+
+41
+00:02:18,177 --> 00:02:19,740
+The model has four tools.
+
+42
+00:02:19,780 --> 00:02:22,782
+Three only read,
+and the fourth only proposes.
+
+43
+00:02:22,822 --> 00:02:24,190
+None of them can write.
+
+44
+00:02:26,826 --> 00:02:29,444
+And what it isn't.
+The checkpointer is in memory,
+
+45
+00:02:29,484 --> 00:02:31,914
+so a restart forgets a suspended plan.
+
+46
+00:02:31,954 --> 00:02:33,849
+The gateway here is a simulator,
+
+47
+00:02:33,889 --> 00:02:36,065
+not a real building management system.
+
+48
+00:02:36,105 --> 00:02:37,920
+And it proposes setpoints.
+
+49
+00:02:37,960 --> 00:02:39,997
+It doesn't optimise the building.
+
+50
+00:02:42,580 --> 00:02:46,412
+DTwin. The copilot
+proposes. A person approves.
+

@@ -5,7 +5,11 @@
 // scenes. That is the whole reason it is safe: dropping lines from
 // narration.py would leave scene.html reading `L.s03b.start` of undefined.
 //
-//   NODE_PATH=<dir with playwright-core> node render_cut.js cut.json [out.webm] [--burn] [--preview t1,t2,..]
+//   NODE_PATH=<dir with playwright-core> node render_cut.js plan.json [out.webm] [--burn] [--preview t1,t2,..]
+//
+// plan.json: { name, windows: [ [start, end, speed?] | { start, end, speed?, captions? }, ... ] }
+//   captions (object form only): omit = keep the .srt's cues in that window;
+//   false = none; [[srcStart, srcEnd, text], ...] = replace them (source times).
 //
 // --burn draws the cut's own .srt into the frames. That is for a SILENT post:
 // a sidecar .srt is a toggle, and with no audio track a viewer whose captions
@@ -84,13 +88,24 @@ const CAPTION_CSS = `
   }
 
   // Frame times: walk each window on the FPS grid.
+  // A window is [start, end] or [start, end, speed]. Speed > 1 samples the
+  // source timeline more sparsely, so that stretch plays faster; the output is
+  // still a uniform FPS. Only meaningful for a silent render — the narration
+  // cannot be time-stretched here, and cut_audio_captions.py refuses to place
+  // it when any window is sped up.
+  // Either form: [start, end, speed?] or { start, end, speed?, captions? }.
+  // `captions` is read by cut_audio_captions.py, not here.
+  const norm = (w) => (Array.isArray(w) ? { start: w[0], end: w[1], speed: w[2] ?? 1 } : { speed: 1, ...w });
   const times = [];
-  for (const [a, bnd] of PLAN.windows) {
+  for (const w of PLAN.windows.map(norm)) {
+    const { start: a, end: bnd, speed } = w;
     if (bnd > DUR + 1e-6) throw new Error(`window ends at ${bnd}s past the ${DUR}s timeline`);
-    for (let t = a; t < bnd - 1e-9; t += 1 / FPS) times.push(t);
+    if (!(speed > 0)) throw new Error(`bad speed ${speed} for window ${a}-${bnd}`);
+    for (let t = a; t < bnd - 1e-9; t += speed / FPS) times.push(t);
   }
   const N = times.length;
-  console.log(`${PLAN.windows.length} window(s), ${N} frames, ${(N / FPS).toFixed(2)}s (source ${DUR}s)`);
+  console.log(`${PLAN.windows.length} window(s) ${PLAN.windows.map(norm).map(({ start: a, end: b, speed: sp }) => `${a}-${b}${sp !== 1 ? `@${sp}x` : ''}`).join(' | ')}`);
+  console.log(`${N} frames, ${(N / FPS).toFixed(2)}s (source ${DUR}s)`);
 
   if (PREVIEW) {
     const dir = path.join(HERE, 'preview'); fs.mkdirSync(dir, { recursive: true });

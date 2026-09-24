@@ -7,12 +7,13 @@ operator's request to the setpoints on the live map.
 
 | File | What it is |
 |---|---|
-| `dtwin-copilot-short-cc.mp4` | **Silent 1:40 cut, captions burned in — the one being posted** (not committed) |
+| `dtwin-copilot-full-cc.mp4` | **Full video, first 25 s sped up, silent, captions burned in — 2:50** (not committed) |
+| `dtwin-copilot-short-cc.mp4` | Silent 1:40 cut, captions burned in (not committed) |
 | `dtwin-copilot-short.mp4` | Silent 1:40 cut, no captions (not committed) |
 | `dtwin-copilot-short-narrated.mp4` | 1:40 cut with narration (not committed) |
 | `dtwin-copilot-narrated.mp4` | Full 3:03, H.264 + narration (not committed) |
 | `dtwin-copilot.mp4` | Silent H.264, full length (not committed) |
-| `cut.json` · `render_cut.js` · `cut_audio_captions.py` | **The short cut** — see below |
+| `cut.json` · `full.json` · `render_cut.js` · `cut_audio_captions.py` | **The cuts** — see below |
 | `scene.html` | **The source.** Deterministic: `window.seek(ms)` draws any instant |
 | `capture.ts` | Records a real run of the real graph, node by node → `run.json` |
 | `run.json` · `graph.json` · `db.json` | The recording: transcript + timings, the graph's own edge list, the resulting database rows |
@@ -135,9 +136,10 @@ without paying for a full render. The caption sits 58 px from the bottom, below
 everything the scenes draw — checked at the opening JSON panel, the graph with
 its test, and the copilot panel's buttons.
 
-All of these are kept. The one being posted is **silent with captions burned
-in** — the narration is a synthetic macOS voice, and no voice reads better than
-an obviously synthetic one.
+All of these are kept. The posted version is **silent with captions burned
+in** (which file: see "The full version with a faster intro" below) — the
+narration is a synthetic macOS voice, and no voice reads better than an
+obviously synthetic one.
 
 With no audio track the captions stop being an accessibility nicety and become
 the content, which is why they are burned in rather than shipped as a sidecar:
@@ -147,3 +149,38 @@ burned version** — they would double up on screen.
 
 To change what the cut keeps, edit the windows in `cut.json` and re-run both —
 they read the same file, so the picture and the sound cannot disagree.
+
+## The full version with a faster intro
+
+`full.json` is the whole video with the first 25.70 s — the title card and the
+"writes back" scene — sped up. A window may carry a `speed`; the renderer then
+samples that stretch of the timeline more sparsely, so it plays faster at the
+same frame rate:
+
+| Window | Speed | Why |
+|---|---|---|
+| 0 → 10.65 (title) | **2.5×** | a static two-line card does not need ten seconds |
+| 10.65 → 25.70 (writes back) | **1.75×** | a heading, then three cards whose own text carries the point |
+| 25.70 → end | 1× | unchanged |
+
+Result: 2:50 instead of 3:03, silent, captions burned in.
+
+**Speeding up a scene speeds up its captions**, and those eight cues were
+already at the reading-speed ceiling (14–21 characters per second, being timed
+to speech). At 2× they would flash past at 30–50 cps. So a sped-up window can
+**replace** its cues: `"captions": [[srcStart, srcEnd, text], …]` in source
+time, remapped like any other cue. `full.json` gives each of the two scenes one
+caption held for the whole scene — the original words, merged — and lets the
+cards speak for themselves. `cut_audio_captions.py` prints a warning for any cue
+over 22 cps so this cannot regress silently.
+
+`speed` is for silent renders only. The per-line narration cannot be
+time-stretched here, and `cut_audio_captions.py` refuses to write an audio
+track for a plan with any sped-up window rather than produce a wrong one.
+
+```bash
+cd video
+python3 cut_audio_captions.py full.json          # dtwin-copilot-full.srt / .vtt (no audio — silent plan)
+NODE_PATH=<dir with playwright-core> node render_cut.js full.json dtwin-copilot-full-cc.webm --burn
+./to_mp4.sh dtwin-copilot-full-cc.webm dtwin-copilot-full-cc.mp4
+```
