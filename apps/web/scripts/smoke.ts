@@ -243,6 +243,19 @@ async function main(): Promise<void> {
        copilotWrite.status === 403 && (copilotBody.error ?? '').includes('recorded against a person'),
        `HTTP ${copilotWrite.status}`);
 
+    // The diagram the panel draws and the one the README embeds both come
+    // from this route, off the compiled graph. The one edge the safety
+    // argument rests on must be in it.
+    const graphRes = await fetch(`${BASE}/api/copilot/graph`);
+    const graphBody = await graphRes.json() as {
+      nodes: string[]; edges: Array<{ source: string; target: string }>; mermaid: string;
+    };
+    const intoApply = (graphBody.edges ?? []).filter((e) => e.target === 'apply').map((e) => e.source);
+    ok('the copilot graph is served from the compiled graph, and apply has one way in',
+       graphRes.status === 200 && intoApply.length === 1 && intoApply[0] === 'confirm'
+         && graphBody.mermaid.includes('confirm -.-> apply'),
+       `into apply: ${intoApply.join(',') || 'none'}`);
+
     console.log('\n[9] Sign-in limits');
     // Addresses nobody has, fresh each run: the limiter is keyed on what was
     // typed, so an invented address exercises it exactly as a real one would —

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type Anthropic from '@anthropic-ai/sdk';
 import { STATUS } from '@/lib/colors';
 import type { PlanForReview } from '@/lib/copilot/tools';
+import { GraphDiagram } from './GraphDiagram';
 
 /**
  * A conversation that ends in a decision, not an action.
@@ -92,6 +93,7 @@ export function CopilotPanel({ onHighlight }: { onHighlight: (zoneIds: string[])
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showGraph, setShowGraph] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -156,24 +158,56 @@ export function CopilotPanel({ onHighlight }: { onHighlight: (zoneIds: string[])
     void post({ message: text });
   };
 
-  if (availability.state === 'checking') {
-    return <p className="px-4 pb-3 text-xs" style={{ color: 'var(--text-muted)' }}>…</p>;
-  }
-  if (availability.state === 'unavailable') {
-    return (
-      <p className="px-4 pb-3 text-xs" style={{ color: 'var(--text-muted)' }}>
-        {availability.reason}
-        {availability.signIn && (
-          <> <a href="/login" style={{ color: STATUS.warning, textDecoration: 'underline' }}>Sign in</a></>
-        )}
-      </p>
-    );
-  }
-
   const entries = turn ? renderTranscript(turn.messages) : [];
   const plan = turn?.pendingPlan ?? null;
 
+  // Where the run is right now, for the diagram: suspended at confirm while a
+  // plan awaits a decision, at agent while the model is thinking.
+  const activeNode = plan ? 'confirm' : busy ? 'agent' : null;
+
+  const graphToggle = (
+    <div className="px-4 text-xs">
+      <button
+        type="button"
+        onClick={() => setShowGraph((v) => !v)}
+        className="mb-1"
+        style={{ color: 'var(--text-muted)', textDecoration: 'underline dotted' }}
+        aria-expanded={showGraph}
+      >
+        {showGraph ? 'Hide' : 'Show'} how it works
+      </button>
+      {showGraph && (
+        <div className="mb-2 rounded p-2" style={{ border: '1px solid var(--border)' }}>
+          <GraphDiagram activeNode={activeNode} />
+          <p style={{ color: 'var(--text-muted)', fontSize: 10, marginTop: 4 }}>
+            Drawn from the running LangGraph, not a picture of it. Dashed edges are conditional;
+            the dashed box is an interrupt that waits for you. <b>apply</b> has one way in.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+
+  if (availability.state === 'checking') {
+    return <>{graphToggle}<p className="px-4 pb-3 text-xs" style={{ color: 'var(--text-muted)' }}>…</p></>;
+  }
+  if (availability.state === 'unavailable') {
+    return (
+      <>
+        {graphToggle}
+        <p className="px-4 pb-3 text-xs" style={{ color: 'var(--text-muted)' }}>
+          {availability.reason}
+          {availability.signIn && (
+            <> <a href="/login" style={{ color: STATUS.warning, textDecoration: 'underline' }}>Sign in</a></>
+          )}
+        </p>
+      </>
+    );
+  }
+
   return (
+    <>
+    {graphToggle}
     <div className="flex flex-col px-4 pb-3 text-xs" style={{ gap: 8 }}>
       <div ref={transcriptRef} className="flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: 280 }}>
         {entries.length === 0 && (
@@ -299,5 +333,6 @@ export function CopilotPanel({ onHighlight }: { onHighlight: (zoneIds: string[])
       </form>
       <p style={{ color: 'var(--text-muted)', fontSize: 10 }}>{availability.model}</p>
     </div>
+    </>
   );
 }

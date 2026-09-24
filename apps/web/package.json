@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start -p 3000",
     "typecheck": "tsc --noEmit",
+    "copilot:graph": "tsx scripts/copilot-graph.ts",
     "smoke": "tsx scripts/smoke.ts"
   },
   "dependencies": {

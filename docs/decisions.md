@@ -1942,7 +1942,36 @@ applied. A unit test asserts the tool list verbatim, because the whole safety
 argument rests on it.
 
 **Nothing reaches equipment without a human pressing Approve, and that is a
-fact about the edge list.** The graph is `agent ⇄ tools`, then `confirm`, then
+fact about the edge list.** This is the compiled graph, drawn by LangGraph
+itself (`npm run copilot:graph`), not a sketch of it:
+
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	agent(agent)
+	tools(tools)
+	confirm(confirm)
+	apply(apply)
+	declined(declined)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> agent;
+	apply --> agent;
+	declined --> agent;
+	agent -.-> tools;
+	agent -.-> __end__;
+	tools -.-> confirm;
+	tools -.-> agent;
+	confirm -.-> apply;
+	confirm -.-> declined;
+	classDef default fill:#f2f0ff,line-height:1.2;
+	classDef first fill-opacity:0;
+	classDef last fill:#bfb6fc;
+```
+
+`apply` has one incoming edge and it is from `confirm`; `confirm` has one and
+it is from `tools`. A unit test asserts both from the drawn graph, so the
+diagram cannot describe a graph the code no longer has. The graph is `agent ⇄ tools`, then `confirm`, then
 `apply`. `confirm` is a LangGraph `interrupt()`: the run suspends, the plan is
 handed back over HTTP, and the run resumes only when a later request carries
 `Command({ resume: 'approved' })`. `apply` has exactly one incoming edge, from

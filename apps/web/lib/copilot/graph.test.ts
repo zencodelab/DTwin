@@ -287,3 +287,57 @@ describe("the copilot's vocabulary", () => {
     expect(zones.find((z) => z.name === 'SER-105')!.temperatureC).toBeNull();
   });
 });
+
+describe('the compiled graph, as LangGraph draws it', () => {
+  // These read the EDGE LIST of the compiled graph — the same object
+  // `npm run copilot:graph` renders. They are the safety argument, stated as
+  // a test rather than a sentence: if anyone adds a second way into `apply`,
+  // this fails before the diagram in the README gets a chance to lie.
+  const inert: CopilotBackend = {
+    listZones: async () => [],
+    settings: async () => ({ enabled: false, maxDeviationK: 0, maxStepK: 0, minIntervalS: 0,
+      defaultDurationS: 0, maxDurationS: 0, commandTtlS: 0 }),
+    dryRun: async () => ({ allowed: false, refusal: 'control_disabled', message: 'inert' }),
+    issue: async () => ({ ok: false, refusal: 'control_disabled', message: 'inert' }),
+  };
+  const compiled = buildCopilotGraph({
+    backend: inert, callModel: async () => { throw new Error('never'); }, model: 'none',
+  });
+
+  it('gives apply exactly one incoming edge, from confirm', async () => {
+    const g = await compiled.getGraphAsync();
+    const into = g.edges.filter((e) => e.target === 'apply').map((e) => e.source);
+    expect(into).toEqual(['confirm']);
+  });
+
+  it('gives confirm exactly one incoming edge, from tools', async () => {
+    const g = await compiled.getGraphAsync();
+    const into = g.edges.filter((e) => e.target === 'confirm').map((e) => e.source);
+    expect(into).toEqual(['tools']);
+  });
+
+  it('has no path from the start to apply that skips confirm', async () => {
+    const g = await compiled.getGraphAsync();
+    const next = new Map<string, string[]>();
+    for (const e of g.edges) next.set(e.source, [...(next.get(e.source) ?? []), e.target]);
+    // Depth-first from __start__, refusing to step through confirm: apply must
+    // be unreachable.
+    const seen = new Set<string>();
+    const stack = ['__start__'];
+    while (stack.length) {
+      const n = stack.pop()!;
+      if (seen.has(n) || n === 'confirm') continue;
+      seen.add(n);
+      for (const m of next.get(n) ?? []) stack.push(m);
+    }
+    expect(seen.has('apply')).toBe(false);
+    expect(seen.has('agent')).toBe(true);   // sanity: the walk did go somewhere
+  });
+
+  it('draws the same nodes the README embeds', async () => {
+    const g = await compiled.getGraphAsync();
+    const names = Object.keys(g.nodes).sort();
+    expect(names).toEqual(['__end__', '__start__', 'agent', 'apply', 'confirm', 'declined', 'tools']);
+    expect(g.drawMermaid()).toContain('confirm -.-> apply');
+  });
+});

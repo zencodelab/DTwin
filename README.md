@@ -14,8 +14,8 @@ definitions and smoke suites. **All four packages are tenant-scoped** —
 tenant-scoped queries, row-level security, API-key and WebSocket-ticket
 authentication in `packages/db` and `apps/ingest`; session-resolved tenancy in
 `apps/web`; and a context-bound scope in the Python worker. The stack builds and
-runs end to end. The suites total **292 checks, all passing**, plus
-**333 unit tests**, and [CI](.github/workflows/ci.yml) runs all of it on
+runs end to end. The suites total **293 checks, all passing**, plus
+**338 unit tests**, and [CI](.github/workflows/ci.yml) runs all of it on
 every push.
 
 The one defect the suite had been carrying is closed. `sim:<runId>` topics could
@@ -38,6 +38,38 @@ Start with the [documentation index](docs/README.md). It includes the
 [CTO assessment and proposed roadmap](docs/cto-assessment.md),
 [architecture](docs/architecture.md), [operations guide](docs/operations.md),
 and [API reference](docs/api.md), alongside the schema and design decisions.
+
+
+## The copilot's graph
+
+Generated from the compiled LangGraph (`npm run copilot:graph`), not drawn.
+The safety property is visible in the edges: `apply` has exactly one incoming
+edge, from `confirm`, and `confirm` is an `interrupt()` that suspends the run
+until a person approves ([ADR 63](docs/decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural)).
+
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	agent(agent)
+	tools(tools)
+	confirm(confirm)
+	apply(apply)
+	declined(declined)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> agent;
+	apply --> agent;
+	declined --> agent;
+	agent -.-> tools;
+	agent -.-> __end__;
+	tools -.-> confirm;
+	tools -.-> agent;
+	confirm -.-> apply;
+	confirm -.-> declined;
+	classDef default fill:#f2f0ff,line-height:1.2;
+	classDef first fill-opacity:0;
+	classDef last fill:#bfb6fc;
+```
 
 ## Stack
 

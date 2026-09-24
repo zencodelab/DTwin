@@ -24,6 +24,7 @@
     "smoke": "npm run smoke -w @dtwin/db && npm run smoke -w @dtwin/ingest && npm run smoke:sim && npm run smoke -w @dtwin/web",
     "sim:install": "cd apps/sim && uv venv --python 3.12 && uv pip install -r requirements.txt",
     "dev:sim": "cd apps/sim && LOG_FORMAT=${LOG_FORMAT:-text} .venv/bin/uvicorn app.main:app --port ${SIM_PORT:-8000}",
+    "copilot:graph": "npm run copilot:graph -w @dtwin/web",
     "smoke:sim": "cd apps/sim && .venv/bin/python -m app.smoke_test",
     "dev:web": "npm run dev -w @dtwin/web",
     "build": "npm run build -w @dtwin/web"
