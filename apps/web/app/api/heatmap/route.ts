@@ -45,17 +45,19 @@ export async function GET(request: Request) {
     // Setpoints ship with the overlay because the temperature scale is diverging
     // about each zone's own target — the colour is meaningless without it, and a
     // second round trip to fetch them would leave the first paint uncoloured.
-    const [rows, setpoints] = await Promise.all([
-      getZoneHeatmap(db, buildingId, metric, from, to),
-      db.query<{ id: string; setpointC: number; deadbandK: number }>(
-        `SELECT z.id, tp.setpoint_temp_c AS "setpointC", tp.deadband_k AS "deadbandK"
-           FROM zones z
-           JOIN floors f ON f.id = z.floor_id
-           JOIN thermal_profiles tp ON tp.id = z.thermal_profile_id
-          WHERE f.building_id = $1`,
-        [buildingId],
-      ),
-    ]);
+    //
+    // In turn, not Promise.all: both run on this transaction's one client,
+    // which executes one statement at a time anyway. Promise.all only leaned
+    // on pg's internal query queue, which pg 9 removes.
+    const rows = await getZoneHeatmap(db, buildingId, metric, from, to);
+    const setpoints = await db.query<{ id: string; setpointC: number; deadbandK: number }>(
+      `SELECT z.id, tp.setpoint_temp_c AS "setpointC", tp.deadband_k AS "deadbandK"
+         FROM zones z
+         JOIN floors f ON f.id = z.floor_id
+         JOIN thermal_profiles tp ON tp.id = z.thermal_profile_id
+        WHERE f.building_id = $1`,
+      [buildingId],
+    );
 
     const profileById = new Map(setpoints.rows.map((r) => [r.id, r]));
     return rows.map((z) => ({

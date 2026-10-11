@@ -101,71 +101,73 @@ export async function getSpatialTree(
   );
   if (building.rowCount === 0) return null;
 
-  const [floors, zones, equipment, sensors, services] = await Promise.all([
-    db.query<{ id: string }>(
-      `SELECT id, building_id AS "buildingId", level, name,
-              elevation_m AS "elevationM", floor_height_m AS "floorHeightM",
-              floor_area_m2 AS "floorAreaM2",
-              ST_AsGeoJSON(footprint)::json AS footprint,
-              gltf_node_id AS "gltfNodeId",
-              created_at AS "createdAt", updated_at AS "updatedAt"
-         FROM floors WHERE building_id = $1 ORDER BY level LIMIT $2`,
-      [buildingId, over('floors')],
-    ),
-    db.query<{ id: string; floorId: string }>(
-      `SELECT z.id, z.floor_id AS "floorId", z.name, z.zone_type AS "zoneType",
-              z.area_m2 AS "areaM2", z.volume_m3 AS "volumeM3",
-              z.design_occupancy AS "designOccupancy",
-              z.exterior_wall_area_m2 AS "exteriorWallAreaM2",
-              ST_AsGeoJSON(z.boundary)::json AS boundary,
-              z.gltf_node_id AS "gltfNodeId",
-              z.thermal_profile_id AS "thermalProfileId",
-              z.occupancy_schedule_id AS "occupancyScheduleId",
-              z.created_at AS "createdAt", z.updated_at AS "updatedAt"
-         FROM zones z JOIN floors f ON f.id = z.floor_id
-        WHERE f.building_id = $1 ORDER BY f.level, z.name LIMIT $2`,
-      [buildingId, over('zones')],
-    ),
-    db.query(
-      `SELECT id, building_id AS "buildingId", floor_id AS "floorId", zone_id AS "zoneId",
-              parent_equipment_id AS "parentEquipmentId", tag,
-              equipment_type AS "equipmentType", manufacturer, model,
-              serial_number AS "serialNumber", install_date AS "installDate",
-              rated_power_kw AS "ratedPowerKw", rated_airflow_cmh AS "ratedAirflowCmh",
-              status,
-              CASE WHEN position IS NULL THEN NULL
-                   ELSE json_build_object('x', ST_X(position), 'y', ST_Y(position),
-                                          'z', ST_Z(position)) END AS position,
-              gltf_node_id AS "gltfNodeId", metadata,
-              created_at AS "createdAt", updated_at AS "updatedAt"
-         FROM equipment WHERE building_id = $1 ORDER BY tag LIMIT $2`,
-      [buildingId, over('equipment')],
-    ),
-    db.query(
-      `SELECT s.id, s.external_id AS "externalId", s.name, s.metric, s.unit,
-              s.equipment_id AS "equipmentId", s.zone_id AS "zoneId",
-              s.min_plausible AS "minPlausible", s.max_plausible AS "maxPlausible",
-              s.is_cumulative AS "isCumulative",
-              s.sample_interval_s AS "sampleIntervalS",
-              s.is_active AS "isActive", s.last_seen_at AS "lastSeenAt",
-              s.created_at AS "createdAt", s.updated_at AS "updatedAt"
-         FROM sensors s
-         LEFT JOIN equipment e ON e.id = s.equipment_id
-         LEFT JOIN zones z     ON z.id = s.zone_id
-         LEFT JOIN floors f    ON f.id = z.floor_id
-        WHERE e.building_id = $1 OR f.building_id = $1
-        ORDER BY s.external_id LIMIT $2`,
-      [buildingId, over('sensors')],
-    ),
-    db.query(
-      `SELECT es.equipment_id AS "equipmentId", es.zone_id AS "zoneId",
-              es.role, es.load_fraction AS "loadFraction"
-         FROM equipment_zone_service es
-         JOIN equipment e ON e.id = es.equipment_id
-        WHERE e.building_id = $1 LIMIT $2`,
-      [buildingId, over('services')],
-    ),
-  ]);
+  // One after another, not Promise.all. All five run on this transaction's
+  // single client, which executes one statement at a time whatever the caller
+  // does: Promise.all bought no overlap, it only leaned on pg's internal query
+  // queue — deprecated, and removed in pg 9.
+  const floors = await db.query<{ id: string }>(
+    `SELECT id, building_id AS "buildingId", level, name,
+            elevation_m AS "elevationM", floor_height_m AS "floorHeightM",
+            floor_area_m2 AS "floorAreaM2",
+            ST_AsGeoJSON(footprint)::json AS footprint,
+            gltf_node_id AS "gltfNodeId",
+            created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM floors WHERE building_id = $1 ORDER BY level LIMIT $2`,
+    [buildingId, over('floors')],
+  );
+  const zones = await db.query<{ id: string; floorId: string }>(
+    `SELECT z.id, z.floor_id AS "floorId", z.name, z.zone_type AS "zoneType",
+            z.area_m2 AS "areaM2", z.volume_m3 AS "volumeM3",
+            z.design_occupancy AS "designOccupancy",
+            z.exterior_wall_area_m2 AS "exteriorWallAreaM2",
+            ST_AsGeoJSON(z.boundary)::json AS boundary,
+            z.gltf_node_id AS "gltfNodeId",
+            z.thermal_profile_id AS "thermalProfileId",
+            z.occupancy_schedule_id AS "occupancyScheduleId",
+            z.created_at AS "createdAt", z.updated_at AS "updatedAt"
+       FROM zones z JOIN floors f ON f.id = z.floor_id
+      WHERE f.building_id = $1 ORDER BY f.level, z.name LIMIT $2`,
+    [buildingId, over('zones')],
+  );
+  const equipment = await db.query(
+    `SELECT id, building_id AS "buildingId", floor_id AS "floorId", zone_id AS "zoneId",
+            parent_equipment_id AS "parentEquipmentId", tag,
+            equipment_type AS "equipmentType", manufacturer, model,
+            serial_number AS "serialNumber", install_date AS "installDate",
+            rated_power_kw AS "ratedPowerKw", rated_airflow_cmh AS "ratedAirflowCmh",
+            status,
+            CASE WHEN position IS NULL THEN NULL
+                 ELSE json_build_object('x', ST_X(position), 'y', ST_Y(position),
+                                        'z', ST_Z(position)) END AS position,
+            gltf_node_id AS "gltfNodeId", metadata,
+            created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM equipment WHERE building_id = $1 ORDER BY tag LIMIT $2`,
+    [buildingId, over('equipment')],
+  );
+  const sensors = await db.query(
+    `SELECT s.id, s.external_id AS "externalId", s.name, s.metric, s.unit,
+            s.equipment_id AS "equipmentId", s.zone_id AS "zoneId",
+            s.min_plausible AS "minPlausible", s.max_plausible AS "maxPlausible",
+            s.is_cumulative AS "isCumulative",
+            s.sample_interval_s AS "sampleIntervalS",
+            s.is_active AS "isActive", s.last_seen_at AS "lastSeenAt",
+            s.created_at AS "createdAt", s.updated_at AS "updatedAt"
+       FROM sensors s
+       LEFT JOIN equipment e ON e.id = s.equipment_id
+       LEFT JOIN zones z     ON z.id = s.zone_id
+       LEFT JOIN floors f    ON f.id = z.floor_id
+      WHERE e.building_id = $1 OR f.building_id = $1
+      ORDER BY s.external_id LIMIT $2`,
+    [buildingId, over('sensors')],
+  );
+  const services = await db.query(
+    `SELECT es.equipment_id AS "equipmentId", es.zone_id AS "zoneId",
+            es.role, es.load_fraction AS "loadFraction"
+       FROM equipment_zone_service es
+       JOIN equipment e ON e.id = es.equipment_id
+      WHERE e.building_id = $1 LIMIT $2`,
+    [buildingId, over('services')],
+  );
 
   enforce('floors', floors.rowCount);
   enforce('zones', zones.rowCount);
