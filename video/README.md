@@ -90,6 +90,19 @@ The pipeline is the one the Markaba AI workflow video used
 Playwright's cache, VP8 only), VLC for the MP4 step, audio muxed during that
 transcode rather than afterwards.
 
+## Getting `playwright-core` (needed by every render command below)
+
+It is **not** a dependency of this repo, and nothing on this Mac keeps a copy:
+the Chromium and ffmpeg it drives live in `~/Library/Caches/ms-playwright`, but
+the module itself has to be installed somewhere first. Outside the repo:
+
+```bash
+mkdir -p /tmp/pw && cd /tmp/pw && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --no-save playwright-core
+# then: NODE_PATH=/tmp/pw/node_modules node render_cut.js …
+```
+
+`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` matters — the cached browser is reused.
+
 ## The short cut
 
 3:03 is long for a social feed. `cut.json` defines a **1:40** version as three
