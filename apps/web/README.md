@@ -56,6 +56,29 @@ briefly grey; live values replace them as they arrive.
   restart.
 - **Scenarios** — runs the Python worker and compares end-use breakdown against
   the baseline over the same period, so the delta is attributable to the change.
+- **Copilot** — ask about the building in words: why, how much, what if, or
+  what to change ([§64](../../docs/decisions.md#64-the-copilot-investigates-in-parallel-answers-from-evidence-and-reaches-the-building-through-one-door)).
+  It streams NDJSON from `POST /api/copilot`: one status chip per task, reads
+  grouped by task, simulation progress merged with the socket's. In the
+  answer, every figure carries a citation chip that opens its evidence card,
+  a simulated figure is tinted and labelled *model estimate*, and the caveat
+  lines follow; an answer that could not be verified is replaced by the
+  evidence itself. A proposed plan is the loudest thing in the panel — each
+  command with its fresh dry-run verdict, a countdown to its expiry, a
+  *Simulated as …* badge only when its zones and setpoints match the run it
+  cites — and its zones are highlighted in the 3D view while it can still be
+  decided, and no longer once it has expired. Approve and Decline name the
+  plan's interrupt, id and hash; Stop appears while a run is on — during an
+  approved plan's commands too, where it keeps back those not yet sent — and
+  New conversation starts a fresh thread. Evidence cards carry their caveats
+  in the catalogue's fixed words, so the cards shown in place of an
+  unverified answer are never bare. The graph beside it is drawn from
+  `/api/copilot/graph` (laid out by `lib/copilot/layout.ts`, with the edges
+  that skip past nodes routed round the margins) and lights where the run is.
+  The panel stays mounted, hidden, while a zone is selected, so a run or a
+  pending plan survives the click; the thread id lives in `sessionStorage` and
+  `GET /api/copilot?threadId=` rehydrates it after a reload. The logic is
+  pure and tested in `lib/copilot-panel/`; the components only draw it.
 
 ## Notes
 

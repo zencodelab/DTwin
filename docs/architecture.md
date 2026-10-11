@@ -27,6 +27,9 @@ flowchart LR
     W -->|Spatial tree, history, alerts, tenant-scoped| DB
     W -->|Mints WS ticket| B
     W -->|Simulation HTTP proxy| S[Python worker :8000]
+    W -->|Copilot what-if runs, sim-only key| S
+    W -->|/control: proxy, copilot dry runs, approved commands; acting user| I
+    W -->|Copilot model calls| A[Anthropic API]
     S -->|Read inputs / write results| DB
     S -->|POST /internal/sim-event, service key| I
     I -->|Opt-in webhook notifications| N[External receiver]
@@ -35,18 +38,26 @@ flowchart LR
 The diagram shows the target logical connections. `apps/ingest` enforces every
 edge into it: `POST /ingest` and `POST /internal/sim-event` require an API key
 scoped to a tenant, and the WebSocket refuses every message but `auth`/`ping`
-until a signed ticket authenticates the connection. `apps/web` does not yet
-mint tickets or sessions — the `U`/session-cookie/ticket-minting edges above
-describe work not yet built; today's dashboard talks to ingest exactly as it
-did before this migration, unauthenticated, and its own database reads are
-still unscoped. See [multi-tenancy.md § Consequences elsewhere](multi-tenancy.md#consequences-elsewhere).
+until a signed ticket authenticates the connection. `apps/web` signs people in
+(`/login`, a session cookie), resolves the tenant from that session
+(`lib/tenant.ts`), runs its database reads under it (`withTenant`), and mints
+the one-minute WebSocket ticket the dashboard presents to ingest
+(`/api/ws-ticket`). See [multi-tenancy.md](multi-tenancy.md).
 Database and application ports are published by development Compose.
+
+The copilot adds three edges out of the web service, all from its own process
+([§64](decisions.md#64-the-copilot-investigates-in-parallel-answers-from-evidence-and-reaches-the-building-through-one-door)):
+model calls to the Anthropic API; ingest's `/control` routes, for dry runs and
+— only after a person approves — the commands themselves, carrying that
+person's `x-acting-user` exactly as a click would; and what-if runs on the
+worker with a key that can run simulations and nothing else. Its database
+reads are READ ONLY transactions under the session's tenant.
 
 ## Responsibilities and code map
 
 | Component | Owns | Primary code |
 |---|---|---|
-| `apps/web` | Server-rendered spatial tree, client-only 3D, history and alert reads, simulation proxy. **Not yet tenant-scoped or authenticated.** | [page](../apps/web/app/page.tsx), [dashboard](../apps/web/components/Dashboard.tsx), [routes](../apps/web/app/api) |
+| `apps/web` | Server-rendered spatial tree, client-only 3D, history and alert reads, simulation proxy, and the copilot (a LangGraph graph per signed-in user: specialists that never write to the building, a verified answer, and one approval-gated path to `/control`). Tenant from the session cookie; reads under that tenant | [page](../apps/web/app/page.tsx), [dashboard](../apps/web/components/Dashboard.tsx), [routes](../apps/web/app/api), [copilot](../apps/web/lib/copilot/graph.ts) |
 | `apps/ingest` | Device ingest, quality assessment, batching, subscriptions, alert evaluation, notifications, synthetic readings — all tenant-scoped; API-key and WebSocket-ticket authentication on every route | [server](../apps/ingest/src/server.ts), [auth](../apps/ingest/src/auth.ts), [pipeline](../apps/ingest/src/pipeline.ts), [rules](../apps/ingest/src/rules/index.ts), [tenant enumeration](../apps/ingest/src/tenants.ts) |
 | `apps/sim` | Weather assembly, solar geometry, zone heat balance, run status and results. **Not yet tenant-scoped** — every route still takes only a `buildingId` | [API](../apps/sim/app/main.py), [engine](../apps/sim/app/engine.py), [repository](../apps/sim/app/repository.py) |
 | `packages/types` | Zod contracts, inferred types, IDs, enums, WebSocket protocol, tenancy/identity contracts | [exports](../packages/types/src/index.ts), [tenancy](../packages/types/src/tenancy.ts) |

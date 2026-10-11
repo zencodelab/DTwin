@@ -1957,6 +1957,8 @@ argument rests on it.
 fact about the edge list.** This is the compiled graph, drawn by LangGraph
 itself (`npm run copilot:graph`), not a sketch of it:
 
+*Historical record: this is the v1 graph as generated on 24 Sep 2026; it is deliberately not regenerated — the current graph is in §64.*
+
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 graph TD;
@@ -2038,3 +2040,746 @@ the path works end to end with the real model. It is still a single run, and
 the capture script approved it rather than a person reviewing the plan, so it
 says nothing about whether the model's plans are generally good. That needs an
 evaluation set, not a demo.
+
+Extended by §64.
+
+---
+
+## 64. The copilot investigates in parallel, answers from evidence, and reaches the building through one door
+
+§63's copilot did one thing: it turned "pre-cool the Level 3 offices" into a
+plan for a person to approve. It could not say *why* a zone had been warm
+since nine, *which* floor used most energy last week, or *what* a 1 K setpoint
+change would cost in comfort — the questions an operator asks before asking
+for a setpoint. This extends it to those questions and keeps the property §63
+rests on: nothing reaches the building until a person approves a plan they
+have seen.
+
+### Context: what v1 got wrong, and what the data cannot say
+
+Reviewing v1 against its own claims reproduced five defects:
+
+- **The turn ceiling was per thread.** §63 says "ten model turns per
+  request"; the counter was a summing channel in the thread's checkpoint that
+  nothing reset, so a conversation spent it once and "per request" was false.
+- **A backend throw bricked the thread.** A tool whose service threw escaped
+  the graph, and the next message on that thread failed too.
+- **A double Approve issued the plan twice.**
+- **Most of each response was never rendered.** The JSON answer carried the
+  model's transcript, and 65% of its bytes (measured in the design review)
+  were tool results the panel did not show.
+- **Selecting a zone orphaned the thread.** The dashboard unmounted the panel,
+  and with it the only copy of the thread id; a pending plan became
+  unreachable.
+
+The seeded data also sets limits that no prompt lifts, so they are enforced by
+orient's availability flags, by the shape of the tools and by fixed caveats,
+not by asking the model to be careful:
+
+- **Per-floor energy is indistinguishable.** Only AHU and lighting are metered
+  per floor, and every floor measures about the same (`FLOORS_WITHIN_2PCT`);
+  chillers, pumps, cooling tower and EV charging are metered for the whole
+  building and are not split (`PLANT_NOT_ALLOCATED`).
+- **Per-zone and plug-load energy are not metered.** They exist only in
+  simulation results, labelled as model output.
+- **Main meter minus sub-meters is not plug load.** The two are generated
+  independently and do not reconcile; a difference is "unattributed"
+  (`MAIN_VS_SUBMETERS_UNRECONCILED`).
+- **The development database's main meter is contaminated** by smoke writes,
+  so `total_kwh` and `total_excluding_suspect_kwh` are always reported side by
+  side (`METER_SUSPECT_BUCKETS`), never one cleaned number — and the verifier
+  refuses one without the other (`unpaired_total`). The steps BETWEEN buckets
+  are judged like the buckets: a counter jump on a bucket boundary, or across
+  a gap, is in no bucket's delta, and was once counted whole as clean energy
+  (999,144 kWh "without suspect buckets" for 23 hours).
+- **No weather is stored over the telemetry window**, so behaviour is never
+  attributed to weather, nothing is called a forecast, and a what-if runs on a
+  synthetic design day the operator is told about (`SIM_SYNTHETIC_WEATHER`).
+- **Equipment status has no history** (`NO_STATUS_HISTORY`); only
+  `maintenance_logs` dates an event.
+- **The simulator shifts setpoints uniformly** for the whole period, so a
+  time-windowed pre-cool is simulated as a uniform shift and said to be one
+  (`SIM_UNIFORM_DELTA`).
+- **An override starts on approval** (§62). "Pre-cool tomorrow" is answered in
+  check mode: "ask me when the window opens" (`NO_SCHEDULED_START`).
+- **Comfort means sensor temperature against the designed band.** There is no
+  occupant feedback.
+
+### Decision: a planner, specialists that never write to the building in waves, a verified answer, and v1 behind one door
+
+This is the compiled graph, drawn by LangGraph. `npm run copilot:graph --
+--write` rewrites this block and README's; `docs.test.ts` fails whenever
+either differs from what the graph draws.
+
+<!-- copilot-graph:start -->
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	intake(intake)
+	orient(orient)
+	planner(planner)
+	diagnose(diagnose)
+	analyse(analyse)
+	simulate(simulate)
+	join(join)
+	compose(compose)
+	verify(verify)
+	control(control)
+	plan_check(plan_check)
+	confirm(confirm)
+	apply(apply)
+	declined(declined)
+	finish(finish)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> intake;
+	analyse --> join;
+	apply --> finish;
+	compose --> verify;
+	declined --> finish;
+	diagnose --> join;
+	finish --> __end__;
+	intake --> orient;
+	join --> planner;
+	simulate --> join;
+	orient -.-> planner;
+	orient -.-> finish;
+	planner -.-> diagnose;
+	planner -.-> analyse;
+	planner -.-> simulate;
+	planner -.-> compose;
+	planner -.-> control;
+	planner -.-> finish;
+	verify -.-> compose;
+	verify -.-> control;
+	verify -.-> finish;
+	control -.-> plan_check;
+	control -.-> compose;
+	plan_check -.-> confirm;
+	plan_check -.-> finish;
+	confirm -.-> apply;
+	confirm -.-> declined;
+	classDef default fill:#f2f0ff,line-height:1.2;
+	classDef first fill-opacity:0;
+	classDef last fill:#bfb6fc;
+```
+<!-- copilot-graph:end -->
+
+| Node | Does |
+|---|---|
+| `intake` | Starts every new message (never a resume): stamps the request, appends the operator's words to the dialogue, resets every per-request channel, and opens the request's budget in the run registry. A plan still pending is set aside (`plan_superseded`) and its grant revoked. |
+| `orient` | One READ ONLY read of the building, the zone directory and what data exists, plus the control envelope from ingest: evidence C.1–C.3. A database that cannot be read ends the request (`context_unavailable`); an envelope that cannot be read only removes control (`control_unavailable`). |
+| `planner` | The lead model, structured output. Interprets the question, fixes the request's authority on its first call, and dispatches up to four specialist tasks per wave, three waves at most. One repair call; then a fallback (below). |
+| `diagnose` · `analyse` · `simulate` | Specialist subgraphs, reached only by `Send`. Each is handed its goal and the operator's own question, reads through its own tools, stores every result as numbered evidence, and ends by calling `report_finding`. |
+| `join` | Deferred: runs once per wave and folds the findings in. Back to the planner. |
+| `compose` | The lead model writes the answer as segments that cite evidence. |
+| `verify` | Pure. Recomputes every figure from its cited evidence; a failing draft goes back to `compose` (three drafts), then evidence cards are shown instead. |
+| `control` | v1's agent, as a subgraph on a plain edge, entered from the planner (a control-only request) or from `verify` (an answer first, then a proposal). Handed its brief, the operator's question and the request's simulation, if one ran. |
+| `plan_check` | Re-dry-runs every proposed command now, matches the plan against any simulation it cites, and stamps an id, a hash and an expiry. |
+| `confirm` | `interrupt()`. The person. |
+| `apply` | The one write to the building. |
+| `declined` | Clears the plan; issues nothing. |
+| `finish` | The only way to `__end__`. Records the verified answer (or none), closes the request's budget. |
+
+Why this shape:
+
+- **Specialists are subgraphs with private transcripts.** A model's
+  transcript must alternate tool calls and their results; two tasks sharing
+  one would interleave. A subgraph's private channels start empty on every
+  invocation (checked on LangGraph 1.4.17, through `Send` and through a plain
+  edge), so each task has its own, and the parent sees only the finding and
+  the evidence. `getGraphAsync({xray: true})` draws their inside, so the
+  structure tests can assert it.
+- **The controller is v1, moved, not rewritten.** Its four tools keep their
+  names, schemas and strictness; `propose_plan` gains an optional `basis` (the
+  simulation the plan follows) and refuses a summary or reason that states any
+  figure with a unit, naming it, because the plan card shows the setpoints and
+  durations from the commands and nothing else beside it is verified.
+  It gains `report_finding`, so a controller that proposes nothing is answered
+  in words rather than silence.
+- **There is no LLM critic.** No evaluation shows a gap one would close, and
+  it would put a model on every plan's path to the person. The verifier is a
+  pure function instead, and its limits are stated below.
+- **Structured output uses `output_config.format`, not a forced tool.** The
+  API answers a forced `tool_choice` with a 400 on `claude-opus-5-5` and
+  `claude-fable-5-1`, and a model forced to call a tool cannot say it has
+  nothing to report. The JSON schema carries types and enums only; the bounds
+  live in the Zod schema the reply is parsed with.
+- **The operator's words go with every task.** The design handed a specialist
+  only the planner's goal. A goal is a paraphrase, and the first real runs
+  (below) showed what one loses: "by 1 K" became "one step", which the
+  controller read as the envelope's 2 K step, and "peaks at 46 °C" vanished, so
+  the what-if ran on a day of the specialist's own choosing. Every specialist
+  and the controller now also get `question`, the operator's text — the one
+  thing in a data message the prompts do not treat as data — and the planner
+  keeps stated figures in goals and briefs. And the controller is always handed
+  the request's simulation: in a compound request the planner writes the
+  `controlTask` on its first decision, before the simulation exists, so its ids
+  could never name it, and the plan could never be "simulated as" anything.
+- **When the planner cannot plan** — an API error, or a reply that fails its
+  schema twice — the request falls back to v1: the operator's words go to the
+  controller as a propose task, but only as the request's first step, only for
+  someone who may command, and never against a first decision that said this
+  request does not control (`copilot.planner_fallback`). Otherwise the
+  operator is told `planner_unavailable`.
+
+### One door, six locks
+
+The building is reached only through `control → plan_check → confirm → apply`.
+Six things hold that, each against a different way of being wrong:
+
+1. **The edge list.** `apply`'s only in-edge is `confirm`, `confirm`'s is
+   `plan_check`, `plan_check`'s is `control` (`control:finish` in xray),
+   `control`'s are `planner` and `verify`; a walk from `__start__` that may not
+   pass `confirm` never reaches `apply`; no specialist, `join`, `compose` or
+   `verify` has an edge into the gate. Asserted flat and xray on the compiled
+   graph.
+2. **The source scan.** The edge list is the whole truth only if nothing
+   routes around it, and on LangGraph 1.4.17 four constructs do, drawing no
+   edge: a node returning `Command({goto})`, a router returning a `Send`
+   outside its path list, a node `errorHandler` returning a goto, and
+   `Command.PARENT` out of a subgraph. `ends` and path maps are drawing hints,
+   not runtime guards. A fifth was found while verifying this:
+   `updateState(config, values, asNode)` makes the next run continue from
+   `asNode`'s edges — written as `confirm`, it reaches `apply` with no person
+   asked. The scan, over every non-test file in `lib/copilot` and
+   `app/api/copilot` with comments stripped by the compiler, forbids `goto`,
+   `Command.PARENT`, `errorHandler`, `setNodeDefaults`, `updateState`,
+   `bulkUpdateState` and `/weather/generate`; allows `new Send(` only in
+   `fanout.ts`, `interrupt(` only in `confirm.ts`, `.issue(` only in
+   `apply.ts`; and allows `new Command(` only in `session.ts`, as an object
+   literal whose only key is `resume`.
+3. **`confirm` calls `interrupt()` as its first statement.** A node that
+   interrupts first pauses however it is entered — by its edge, or by any
+   route the scan missed — so there is no path through it that does not stop
+   for a person. On resume it judges strictly: the resume must name this
+   plan's id and hash, the commands must still hash to that hash, the plan must
+   be in date. Anything else is `stale` or `expired`.
+4. **`apply` issues only a frozen grant held outside graph state.** Only
+   `confirm`, only for `approved`, puts a deep-frozen copy of the plan into an
+   approval ledger — a closure per compiled graph, keyed by thread, never
+   checkpointed. `apply`'s first statement takes that grant: consumed on read,
+   refused past 120 s, and it must name the pending plan's id. It then issues
+   the grant's commands, never `state.pendingPlan`'s. A forged route in finds
+   no grant (`copilot.apply_refused`); forged state changes nothing the grant
+   holds. Both are tested with the real `apply`, including `updateState(…,
+   'confirm')` on the real graph.
+5. **Capabilities are types, backed by fetch guards.** `buildCopilotGraph`
+   hands the `Issuer` to `makeApply` and to nothing else. Specialists get a
+   `TwinReader`, the controller and `plan_check` a `ControlProbe`, `simulate` a
+   `ScenarioRunner`; none of those types has `issue`. Behind the types, the
+   probe's one door to ingest throws before `fetch` unless the request is
+   `GET /control/settings` or a `POST /control/commands` whose SERIALISED body
+   says `dryRun: true` — judged as the bytes sent, because ingest treats a
+   missing flag as "issue it". The scenario runner's door throws unless it is
+   one of four worker routes, and reads or cancels only runs it started.
+6. **The envelope is asked four times, and the gateway asks a fifth.** The
+   controller's own dry runs (its choice), then, whatever it chose,
+   `propose_plan`'s re-dry-run of every command, `plan_check`'s fresh one (the
+   verdict the person sees, and the start of the plan's 600 s life), ingest's
+   `evaluate()` when `apply` sends the real command — and the gateway's
+   re-evaluation at dispatch (§62).
+
+**A double Approve issues once, and three layers see to it.** The route holds
+a per-thread lock, so a second decision while the first runs is a 409. The
+grant is taken once. And the ledger grants a plan id once, remembering it for
+the plan's TTL: without that, a second resume that re-runs `confirm` from the
+interrupted checkpoint after `apply` has taken the first grant would grant —
+and issue — the plan again. The test reproduced that before the ledger
+refused it.
+
+**The minutes on the card are the minutes issued.** A command may leave its
+duration to the tenant default. `plan_check` pins it to the default its dry
+run resolved before the plan is hashed, so the hash, the grant and the issued
+command all carry what the card showed; left open, the hash bound "no
+duration" and ingest resolved the default again at issue time, and an admin
+who lengthened it in between gave the building four hours where the operator
+approved one (review). The envelope still judges the pinned duration at issue.
+
+### Five classes of write, and the building is none of them
+
+§63's rule — no tool writes anything but a dry run — is amended by class
+rather than stretched. Every tool has one, asserted verbatim:
+
+| Class | Tools | Writes |
+|---|---|---|
+| `read` | the nine diagnose and analyse reads, `list_zones`, `control_envelope` | nothing: READ ONLY transactions, or ingest's settings |
+| `dry_run` | `dry_run_setpoint` | nothing: the envelope's verdict, queued nowhere |
+| `scratch` | `simulate_scenarios` | simulation runs and their results, which nothing in the building reads |
+| `propose` | `propose_plan` | a proposal in graph state, for `plan_check` |
+| `report` | `report_finding` | the task's finding |
+
+There is no `building` class. The one building write is the `apply` node,
+which no tool can reach.
+
+**Why a simulation is scratch.** Its rows are read by the scenario panel, the
+worker's summary and results routes, and this copilot; none of them is on the
+actuation path (gateway, envelope, `control_commands`), and a run changes no
+setpoint. Any signed-in session can already create the same rows by hand.
+That is why it is a tool and not an interrupt-gated node: gating it would put
+a person's approval in front of something that cannot move the building, and
+teach the person to approve without reading.
+
+**Why `/weather/generate` is building-class, and unreachable.** It writes
+`weather_observations`, which an `observed` run replays as measured weather —
+a scratch write that would come back as evidence. The runner's allow-list
+omits it, and the scan forbids the path in source.
+
+**The sim-only key.** The runner exists only when `COPILOT_SIM_API_KEY` is
+set: bootstrap's `copilot-sim`, scope `sim:run` and nothing else. It never
+falls back to `SIM_API_KEY`, which also carries `control:write`. Without it,
+orient reports simulation unavailable and the planner is never offered
+`simulate`. Runs are named `copilot: <scenario>` and described with the user
+and request, because `simulation_runs` has no `requested_by` column yet.
+
+### Authority is fixed before any data exists
+
+The planner's FIRST call of a request decides `allowControl` and
+`allowSimulation`, and `scope` is write-once: a later planner call, made after
+tool results (and whatever a zone name or a maintenance note says) are in its
+context, cannot widen it. A control task needs that scope and a person who may
+command — the route already refuses a viewer outright, and the graph refuses
+again (`control_not_permitted`) should a request without that authority ever
+reach it.
+`propose_plan` is offered only in `propose` mode — a controller asked to
+*check* ("can we pre-cool tomorrow?") cannot propose whatever it concludes.
+
+A check-mode finding always carries `NO_SCHEDULED_START`, attached by code, and
+`verify` refuses an answer that drops it. Its text ("ask again when the window
+opens") fits the "pre-cool tomorrow" case it was written for and is slightly
+off for "could we do this now?" — worth narrowing the check-mode prompt to
+future starts, or the caveat, when an evaluation says which.
+
+Tool results and database text are data. System prompts are byte-constant per
+role and name no building, zone, floor or meter: the building's own names
+reach the model as data (the directory and availability in C.1 and C.2, and
+tool results), and text people wrote — alert messages, command reasons,
+maintenance notes — only as `*_untrusted` values inside tool results.
+
+### Every figure is recomputed; the verifier checks provenance, not reasoning
+
+Every tool result is stored as an EVIDENCE record with a server-assigned id
+(`C.1`–`C.3`, `T1.E1`…, `K.E1`…), a kind — `measured`, `simulated` or
+`configured` — a source, a window, coverage, exclusions and its caveats. Its
+data is at most 8 KB and never truncated: a larger result is refused with a
+hint to narrow it.
+
+`compose` writes an answer as segments: text, a number, or a citation. A
+number names its value, its decimals, its unit, its basis, and either one
+evidence path (`metrics.temperature_c.mean_c`) or a declared derivation over
+two to six paths (difference, sum, percent change). The pure verifier:
+
+- resolves every path in THIS request's evidence and recomputes the value at
+  the stated decimals, with the renderer's own formatter;
+- takes the unit from the cited key's suffix — CLAUDE.md's units-in-names rule,
+  made mechanical — so a key with no suffix cannot be cited at all, and a
+  derivation's unit follows from its inputs (°C − °C is K; percent change of
+  °C is refused; simulated and measured never mix);
+- requires the basis to equal the evidence's kind (`derived` across kinds);
+- refuses a number followed by a unit in prose — every unit in the table but
+  bare counts, in the spellings a model uses (`degC` too), including the ids
+  themselves (`pct`, `zone_h`, `k_per_h`) that it reads in key names, and the
+  neighbours a building answer reaches for: tons, BTU, joules, litres per
+  second, cfm, a magnitude ("5k"), money either side of its number, and a Δ or
+  × in front — and the words "validated", and "forecast" without forecast
+  evidence;
+- reads prose as it is SHOWN: through citation chips and empty text segments,
+  and refuses an invisible format character (`invisible_character`: a
+  zero-width space hid "1 K" from the quantity test, a soft hyphen hid
+  "validated", a direction override shows "K 1" as "1 K");
+- refuses prose that runs into a figure — a digit, a sign, a second figure —
+  or on as more of its unit (`glued_figure`): a count is shown bare, so "3" +
+  "% above" reads 3%, and "12.3 kW" + "h" reads kWh; and a derivation that
+  cites one place twice (`derive`), a doubled sum or a difference of zero;
+- requires every caveat attached to cited evidence, and
+  `SIM_ANALYTICALLY_VERIFIED` beside any simulated figure — and refuses a
+  caveat no evidence of the request carries (`caveat_unsupported`), because
+  each states a fact found in this data ("floors within 2%" beside floors 40%
+  apart verified);
+- requires a meter's two totals together in one paragraph when it has suspect
+  periods (`unpaired_total`).
+
+Caveats are codes (seventeen, `caveats.ts`) rendered from fixed text. A draft
+that fails goes back with its violations as data; after the third, the
+operator gets the evidence as cards and a `verify_failed` notice — never
+unverified prose. The planner's interpretation, a clarifying question, task
+goals, scenario names and a plan's summary and reasons pass the same wording
+rules or are not shown.
+
+**What it does not check.** Reasoning: an answer can cite a true 23.97 °C and
+draw the wrong conclusion, and nothing here notices — the first real diagnostic
+run said a zone had "sat steadily just above band all day" after reading only
+the hours since 09:00, and it had not. Quantities written in words ("one kelvin
+below") pass; only numerals are caught. Basis is read off the RECORD, so a
+configured figure inside a measured record passes as measured; that happened
+in the first real run (a designed setpoint, a VAV rating and a design
+occupancy, all from `zone_conditions`), and so no measured or simulated record
+carries one of the register's configured figures under a CITABLE key any more
+— a test walks every tool's result for them. Two carry configured figures
+under keys no unit is read off, to be read and never cited: `list_zones` keeps
+v1's camelCase controller vocabulary (`designedSetpointC`, `areaM2`), and
+`zone_timeline`'s rules in scope give a rule's threshold, window and breach
+count as `ruleThreshold` (+ `ruleThresholdUnit`), `ruleWindowS` and
+`ruleConsecutiveBreaches` — as `threshold_c` and `window_s` a configured limit
+could only be cited as measured (review). An alert's own threshold snapshot,
+on an alert event or in `list_alerts`, is part of the recorded alert and keeps
+its unit.
+
+The tool shapes changed to fit the 8 KB bound with realistic rows, measured
+against the development database's own: `meter_consumption` is columnar on an
+implicit hourly axis (168 hourly rows went from about 25 KB to 4.9 KB);
+`*_truncated: false` is dropped; the meters arrive in C.2 rather than in a
+prompt. And they changed so that one record has one basis: `equipment_status`
+is configuration only — a measured last-hour draw in a `configured` record
+would be cited as configured, so it was removed, and the copilot can no longer
+quote an item's draw — and, the other way round, `zone_conditions` has no
+`design` block and `compare_zones` items no `area_m2`, so those are cited from
+C.1 and `equipment_status`. `report_finding` does not spend the per-task tool
+budget, or a task told to report at its twelfth call would be refused the
+report.
+
+### Streaming, and a route that refuses before it answers
+
+`POST /api/copilot` takes a message, a decision (`interruptId`, `planId`,
+`planHash`) or Stop. Every gate answers before any byte, in order: session
+401, demo session 403, a role that may not command 403 (for the whole
+copilot, reads included), no model credential 503, a body over 16 KB 413
+(read to the bound and no further — `request.json()` had buffered whatever
+arrived), body 400; Stop then answers 202 without the lock and without
+building a graph; then the person's graph (503 + `Retry-After: 30` when one
+would have to be evicted and every graph is busy); then the thread's lock
+(409, `Retry-After: 2`), then for a decision the pending-plan check (409
+"nothing awaiting approval" or `plan_expired`). A refused request is JSON
+whatever its `Accept` asked for.
+
+With `Accept: application/x-ndjson` the answer is a stream of protocol events
+— `accepted`, `step`, `task`, `activity`, `evidence`, `sim`, `plan`, a
+`ping` every 15 s, and a final `turn` or `error` — each built from
+whitelisted fields and parsed against the same Zod schema the panel parses
+with. No model message, tool body, thinking block, graph state or error
+message crosses. Otherwise the answer is the same `CopilotTurn` as JSON; one
+runner, `runTurn`, serves both, and it parses every turn against the protocol
+before sending it (`copilot.turn_invalid` if one fails).
+
+A client that disconnects does not abort the run: it finishes within its
+bounds, checkpoints, and `GET /api/copilot?threadId=` shows how it ended. The
+lock is released when the RUN settles, not when the response is handed back.
+A run that fails after the stream opened ends in the fixed-words `error`
+event; the failure is logged once, by name and HTTP status, never its message
+— `runTurn` logs its own, and the route logs only a failure `runTurn` did not
+(a plan that expires between the gate and the run). A failed request is
+abandoned in the registry and its grant revoked, so nothing reports it as
+running. `plan_check` honours Stop and the deadline both before and after its
+dry runs, so a stopped request never reaches `confirm`.
+
+Log events, one JSON line each and never a sentence (§61):
+`copilot.request_started`, `planner_fallback`, `specialist_failed`,
+`budget_exhausted`, `verify_failed`, `sim_refused`, `apply_refused`,
+`apply_issued` (with `stopped` when a Stop kept commands back), `turn_failed`,
+`lock_conflict`, and six more than the design listed — `turn_invalid`,
+`tool_failed`, `plan_check_unreachable`, `compose_failed`,
+`context_unavailable`, `graphs_busy`.
+
+### Bounds
+
+Every bound says what it does when reached (§53); `lib/copilot/limits.ts` is
+the one table.
+
+| What | Value | When reached |
+|---|---|---|
+| Waves per request | 3 | The planner makes no call: compose if there are findings, else finish; `wave_limit` |
+| Tasks per wave / per request | 4 / 8 | Validation error, one repair, then the fallback |
+| Simulate tasks per request | 1 | As above. The design said 2, but a request makes one `simulate_scenarios` call, so a second task could only be refused after spending its model calls |
+| Specialist tasks at once | 3 | Extra `Send`s wait |
+| Model calls per request | 40, atomic across parallel specialists | Specialists end `partial`/`budget`; compose falls back to cards; `budget` |
+| `max_tokens` | 16,000 on every call | A specialist or the controller ends `partial`; the planner's cut-off JSON gets its one repair, then the fallback; compose's cannot be parsed, so the evidence cards and `compose_unavailable` |
+| Deadline | 300 s (the design said 180; a real compound run reached 180 s with its plan ready, below) | Calls and tools refuse, a model call in flight is aborted, the in-flight simulation is cancelled, `plan_check` drops a plan; `deadline`. A node is never killed mid-way: it gets the aborted call's `BudgetError`, as for any refusal |
+| Stop | `{threadId, stop: true}` → 202 | As the deadline; `stopped`. During an approved plan's commands, those not yet sent are kept back and listed as not issued; a Stop pressed while a plan waited is answered by the decision |
+| Specialist turns | 6 | The last is nudged to report; then `partial`/`turn_limit` |
+| Tool calls | 6 per turn, 12 per task (`report_finding` exempt from the 12) | `is_error` naming the limit |
+| Drafts | 3 | Evidence cards; `verify_failed` |
+| Evidence | 8 KB per record, 60 per request, 64 KB into compose | Refused with a hint; ledger full; uncited data dropped first and the drop stated |
+| Answer | 6 paragraphs, 48 segments, 1,600 text characters (compose is asked for about 900 and 30; the design's 40 and 1,200 refused four of the first five real drafts, below) | Violation `too_long`, another draft |
+| Tool windows | `zone_conditions`, `zone_timeline` 7 d; `zone_history` 48 h; energy, `compare_zones`, alerts, commands 31 d (`minutes_above_band` 7 d); meter 7 d hourly, 92 d daily; simulation 72 h | `is_error` naming the limit; the database is not asked |
+| Capped lists | `zone_timeline` 25, `list_alerts` 15, `control_history` 12, `compare_zones` 24, `equipment_status` 40 | `{items, total_count, limit_count, truncated}`; a page still over 8 KB is refused with a limit that fits |
+| Simulation | 1 call per request; a baseline and ≤ 2 scenarios; 1 in flight; 1 copilot run per web process; 12 runs per person per hour; zones × (hours + 24) ≤ 10,000; 45 s per run | `is_error` naming the limit (`retry_after_s` for the hourly one); a worker 429 is surfaced, never retried; a run past 45 s is cancelled |
+| Plan | 12 commands, no zone twice | `propose_plan` `is_error` |
+| Plan / grant TTL | 600 s from `plan_check` / 120 s from `confirm` | 409 `plan_expired`, or `expired` in `confirm` / `apply_refused` |
+| Per thread | 1 run | 409, `Retry-After: 2` |
+| Recursion | 40 supersteps per level | Unreachable: the worst case (three waves, three drafts, the controller and the gate) runs in a test |
+| Orient | 500 zones, 50 meters | Throws — a directory missing zones is not an honest subset — so the request ends `context_unavailable` |
+| Transport | probe 10 s, issue 15 s, worker request 10 s; a model call the time left to the deadline, aborted by Stop; the process simulation slot's lease 60 s | A probe or worker call throws (the tool says the service is unreachable); an issue ANSWERS a `timeout` refusal saying the command may nonetheless have been queued; a model call is a `BudgetError` (`deadline` or `stopped`) — unbounded, a stalled API held the thread's lock for the SDK's retries of its ten-minute timeout, about 15 minutes, while Stop answered "stopping" (review); the lease frees a slot whose cancel never arrived |
+| Dialogue / request | 40 kept, 6 shown to the models / 2,000 characters in a body of at most 16 KB | Oldest dropped / 400, or 413 with the rest unread |
+| Graphs | 200 per process, one per person | The least recently USED graph with no thread locked and no request open is evicted, with its threads; every graph busy, a new person gets 503 + `Retry-After`. By creation order and blind to runs, the first operator lost an approval mid-`apply`, and the next request built a second graph with a second lock (review) |
+| Checkpoints | Per thread and namespace, the latest and its parent; 16 threads per graph; none for the specialist subgraphs | Earlier checkpoints and their writes are let go on every write; past 16, the least recently used thread with no request open is forgotten whole. MemorySaver kept every superstep of every thread — about a megabyte per compound question, three specialist transcripts included — for the life of the process (review) |
+
+The capped lists were 50 in the design. Fifty realistic alerts are about
+20 KB, so the largest limit the model was offered was the one certain to be
+refused; the caps are now the most rows that fit with room to spare
+(`sizes.test.ts` checks each at its cap against the development database's
+rows). `zone_timeline`'s rules-in-scope list is itself capped at 50, and a
+zone with roughly thirty applicable rules would be refused at any page size —
+not reachable with the seed.
+
+### Models and cost
+
+The planner, `compose` and the controller call the LEAD model,
+`COPILOT_MODEL` (default `claude-opus-5`); diagnose, analyse and simulate call
+the SPECIALIST model, `COPILOT_SPECIALIST_MODEL` (default: the lead). A blank
+value is unset. Nothing defaults a role to a cheaper model: measure usage
+before moving one. Every call sends `max_tokens` 16,000, no `thinking`
+parameter, no `fallbacks`, no forced `tool_choice` and automatic prompt
+caching, held at the one seam every call passes through. Planner, compose and
+specialists ask for effort `medium`; the controller's request keeps v1's shape
+but for caching. The SDK's `maxRetries` is the only retry layer. Refusal
+fallbacks stay off, as §63 decided: a refusal acts on nothing.
+
+**Prompt caching.** The first real runs (below) cached the system prompts and
+nothing else, and input dominated what they cost: every specialist turn
+re-sent its whole transcript and every compose redraft its whole evidence, so
+the compound question sent 216,648 uncached input tokens, $1.08 of its $1.63.
+A cache write costs 1.25× the input price and a read 0.1×, so a breakpoint
+pays where the bytes before it are sent again and is a surcharge where they
+are not. Every call now carries a top-level `cache_control` — automatic
+caching, which puts a breakpoint on the last block and moves it forward as a
+transcript grows — beside the system prompt's own. That is the whole change
+for a specialist or the controller: each turn re-sends the previous turn's
+request plus one reply and its results. Compose and the planner were arranged
+so that their repeats are prefixes too. A redraft's previous draft and
+violations now follow the evidence in a block of their own, so the redraft
+re-sends the first draft's request byte for byte; inside the one block they
+changed its bytes and nothing could be read. The planner's input is two
+blocks, the request's fixed CONTEXT (question, building, directory, what
+exists and may be run) with a breakpoint of its own, then PROGRESS (scope,
+what is left, tasks, findings, evidence), so each later wave's decision reads
+the context; a repair re-sends the refused request and appends. That is three
+breakpoints at most, of the API's four. All are the default five-minute
+ephemeral kind: the API refuses a longer TTL after a shorter one, and a
+request's whole life fits in five minutes. The breakpoint is a request
+parameter, so nothing in graph state is ever marked. `requestShapeError`
+allows caching within those rules and refuses a fifth breakpoint, or any
+marker but the default one, before a request is sent; `model.test.ts` 7 holds
+each role to re-sending its earlier request unchanged. The automatic
+breakpoint also writes, at 1.25×, the tail of a request that is never
+repeated — the last turn of a task, a first draft that passes, a decision
+that is not repaired. One real run since has measured the net (below, "What
+it cost"): it saved about a tenth of the energy question's cost, not the
+nine-tenths a read's price suggests, because in a question of that shape each
+prefix is sent again at most once.
+
+Each turn reports model calls by role, simulation runs, and input, output,
+cache-read and cache-write tokens — cache writes are billed separately and
+would otherwise understate cost. While a plan waits at `confirm`, `finish` has
+not run, so the turn shows the request's live count from the registry.
+
+### Degradation
+
+| Down | What the operator gets |
+|---|---|
+| Database | `context_unavailable`; nothing else runs |
+| Ingest | Every read works; no plan can pass its dry runs (`control_unavailable`) |
+| Simulation worker, or busy | That tool's `is_error` and a failed or partial finding; the rest of the answer is unaffected |
+| Model | The planner's fallback, or evidence cards (`compose_unavailable`) |
+| A refusal | `model_refused`; nothing in the reply is acted on |
+
+### Honest limits
+
+- **In memory.** The checkpointer, the ledger and the run registry live in the
+  web process: a restart forgets a pending plan (nothing is issued for it),
+  and a second replica would not share them. Bounded (above): a thread keeps
+  its latest checkpoint, a graph 16 threads, the process 200 graphs.
+- **The probe and the issuer share `SIM_API_KEY`**, which carries
+  `control:write`. The probe's boundary is code — the fetch guard, the types,
+  the scan — not the key's scope; a `control:dry_run` scope would move it into
+  the key.
+- **No scheduled commands, synthetic weather only**, and the simulator sizes
+  plant from each scenario's own setpoint, overstating a setpoint-raise
+  saving (`SIM_PLANT_RESIZED_PER_RUN`).
+- **Whole-hour checks use UTC hours**, wrong for a building in a half-hour
+  zone. **`list_zones` is refused whole beyond about 29 zones** (its result
+  exceeds 8 KB); the refusal tells the controller to work from the directory
+  and dry-run zone by zone.
+- **Stop while a plan waits at `confirm`** answers `{stopping: true}`: the
+  request stays open until the plan is decided or expires, and the decision
+  answers the Stop — an Approve after it is issued whole. The panel reads
+  `running` from the lock, which is free, so it is unaffected. Stop during
+  `apply` keeps back every command not yet sent.
+- **One building per answer.** Orient answers about a tenant's first building
+  by name and says so when there are more; every read not scoped by a
+  directory zone passes that building's id, because RLS scopes a transaction
+  to the tenant — unscoped, energy, rankings, meters, alerts, commands and the
+  register summed across buildings under a notice naming one (review).
+- **Plan quality is unproven.** Every property above is about what the copilot
+  may do, not whether its plans are good. That needs an evaluation set, which
+  costs real model calls and is the named next step.
+
+### One real run
+
+On 28 Sep 2026 the copilot answered eight questions from the real model
+(`claude-opus-5` for every role) on an isolated copy of the development
+database: a read-only dump restored into a throwaway TimescaleDB, 20.3 million
+readings from 18–28 Sep, with this branch's ingest (its device simulator still
+writing), simulation worker and web service in front of it, signed in as an
+operator. Every stream, final turn, and model request and reply was kept. It is
+a handful of runs judged by hand against the data, not an evaluation.
+
+**What held.** Each question took the route the planner prompt describes. The
+diagnostic ("why has OFF-305 been warm since 9?") fanned out two diagnose tasks
+and an analyse task in one wave and found a terminal near its rated flow in
+every office, not a local fault. The energy question found the four floors tied
+to within 0.31 kWh, did not split central plant by floor, and put the main
+meter's raw 2,048,617 kWh beside the 28,030 kWh left without its suspect days
+(the development database's own smoke writes) rather than one cleaned number.
+The compound question simulated, answered, and put a plan in front of the
+operator "simulated as minus-1", zones and setpoints matching; approving it
+queued four commands under the `copilot (operator-approved):` reason against
+the approving operator, and the gateway applied them eight seconds later. A
+decline issued nothing; a decision with a wrong hash and a replayed approval
+were 409s before the graph ran; Stop answered 202 and the run ended after the
+call in flight, its evidence shown as cards. The verifier rejected six drafts
+in five runs — thirteen violations where the reasons were captured: length
+six times, a basis label twice, "forecast" twice, a dropped sign, a malformed
+path, and once a false figure, a "band top" computed as setpoint plus the
+WHOLE deadband, refused because °C + K is no declared derivation. No figure
+that reached the operator failed to trace to its evidence; four were checked
+against the database independently, three exactly and one mean to 0.01 °C
+(averaged a little differently).
+
+**What did not, and what changed.** Five defects, each now with a test that
+fails without its fix. The operator's figures were lost between the planner
+and the specialists: "by 1 K" became "one step" and a 2 K plan, and a stated
+46 °C design day became a 42 °C one, with an invented excuse in the answer —
+the operator's question now travels with every task (above). A designed
+setpoint, a VAV rating and a design occupancy were cited as measured, from
+`zone_conditions` — no measured record carries them now. The controller was
+never handed the simulation it was meant to follow — now it always is. The
+compound run reached the 180 s deadline with its plan dry-run and ready, and
+`plan_check` dropped it — the deadline is 300 s. And `propose_plan` refused
+"44 °C" in a summary with a message about setpoints, so the controller guessed
+and retried — the refusal names the figure. The re-runs confirmed the first,
+third and fourth, and the controller's side of the figures (44 °C simulated,
+22 °C proposed); no later run reached the refusal wording. Compose's first draft
+overran 1,200 characters in four of five runs; asking for about 900 narrowed the
+overrun (1,551 to 1,335 characters on the same question) and did not end it.
+Since then the bounds are 1,600 characters and 48 segments, and the aim stays
+900 and 30: two of those four drafts (1,232 characters and 41 segments; 1,335
+characters) were refused for length and nothing else, a 20–40 s redraft each
+for no gain in honesty, and none of the four was over the new bounds.
+`compare_zones` labelled a window ending now up to the next whole hour —
+"09:00–19:00" at 18:51 — because its covered end was `to` rounded up; it now
+ends at now, and a window that ended earlier still keeps the whole hour its
+last bucket read.
+
+**What it cost.** An estimated $6.94 for the eight: $0.23–0.36 for a stopped
+run or a fast-path plan, $0.76–0.78 for an analytic or a what-if question,
+$1.41–1.63 for a diagnostic or a compound one, at list prices from the usage
+each turn reports, which matched the API's per-call figures exactly. Input
+dominates — the compound re-run sent 216,648 uncached input tokens, because only
+the system prompts were cached and every specialist turn and every redraft
+re-sent its transcript. Automatic caching has since been added to every call
+("Prompt caching", above), and the energy question was asked once more to
+measure it — one run, on the current code, so a single measurement and not a
+rate. Uncached input fell from 84,349 tokens to 16: everything else was read
+from the cache (44,113, up from 23,618) or written to it (61,335, up from
+7,116). The run cost $0.67 against $0.76, 13% less, with one model call fewer
+(8 against 9). Every read was a repeat the design predicts — each task's second
+turn, the planner's second decision, the whole of compose's redraft (21,601
+tokens, exactly the first draft's write) — and 17,222 written tokens were
+never read. Priced on the re-run's own tokens, caching the system prompts alone
+would have cost about $0.74 and nothing cached $0.79, so automatic caching
+saved about a tenth here. The reason is the shape, not the mechanism: a
+specialist finished in two turns and compose redrafted once, so a token
+written at 1.25× was read once at 0.1× — 1.35× for two sends instead of 2× —
+and the last send of every chain is a surcharge. Longer chains (the compound
+run's diagnose task took four turns, its controller six) should gain more;
+that is not measured. The re-run started cold, past the five-minute lifetime,
+so every role wrote its system prompt; the first run had read two of them.
+Latency showed no effect (94 s against 109 s, with the call fewer; the redraft
+took 21.7 s reading 21,601 tokens and 21.8 s sending 20,293 uncached). Nine
+questions cost $7.61. Latency: 3–15 s a planner call, 3–35 s a
+specialist turn, 18–45 s a compose, 3–16 s a controller turn; about a minute
+for a fast-path plan, 110–131 s for an answered question, 206 s for the compound
+one.
+
+**What it does not show.** How often an answer is right: one run per question
+cannot say. The diagnostic's "steady all day" was wrong — the zone was in band
+overnight and warmed from 07:00 — and nothing caught it; the prompt change made
+for it (read both sides of "since 9") has not been re-run. A fast-path plan at
+1 K was not seen after the fix: the re-run found the offices already held at
+22 °C by the approved compound plan, had every dry run refused `no_change`, and
+said so. Nothing here says what another building, or another model, would do.
+
+### What the review found
+
+A review of this change, each finding reproduced before it was fixed and each
+fix with a test that fails without it, beyond the bounds, the verifier rules
+and the limits described above:
+
+- **`zone_timeline`** missed alerts on the equipment serving a zone — an AHU
+  or a chiller has no zone, so its alerts resolved to none — while its
+  description and its own rules in scope promised them; they are in, each
+  naming its `equipment`. And a zone with no active temperature point was
+  given one gap the length of the window; with no feed there is no gap.
+- **Comfort minutes** read 0 — "measured, and fine" — for a zone that was
+  occupied while its probe was flagged or silent. They are null there, and
+  `occupied_with_temperature_min` says how much occupied time was judged; the
+  same in `compare_zones`' band.
+- **`compare_zones`** counted its minutes above the band over the window
+  asked, under a label of the hours it covered; both now read the covered
+  hours. Its coverage was hours with any good sample, so a feed that reported
+  ten minutes of every hour read as complete; it is 5-minute periods, as every
+  other tool's is.
+- **A scenario's name** is the operator's label for the shift, so it states
+  it: `plus-1` for +1 K, `minus-0-5` for −0.5 K, words after. `plus-1` on a
+  −1 K run had put "Simulated as plus-1" beside commands that lowered
+  setpoints.
+- **Evidence cards carry their caveats**, and the model-estimate one on
+  anything simulated: the cards shown when no answer verifies had carried
+  none, beside figures the verifier would not let prose state without them.
+- **Evidence ids are not kept in the dialogue.** They restart every request,
+  so an id from an earlier answer named a different record on the next turn.
+- **The panel** stops lighting a plan's zones when the plan expires, and its
+  status text takes theme tokens that hold 4.5:1 (the amber was 1.7:1).
+
+### Tests
+
+Re-counted on 28 Sep 2026 after the review's fixes, not copied: **806 vitest
+tests in 55 files**, all passing. The copilot's are 490 in 28 files under
+`lib/copilot`, 51 in 6 under `lib/copilot-panel`, and 20 for its SQL
+(`packages/db/src/queries/copilot.test.ts`); v1 had seventeen. The db smoke
+suite's **116** checks — among them each copilot query as the application
+role, a READ ONLY transaction refusing an `INSERT` with SQLSTATE 25006, the
+meter read over the real-time tail, and the review's cases each built and
+rolled back in one transaction (an alert on a serving AHU, a zone with no
+temperature point, a second building) — pass on an isolated database, as do
+pytest (84) and the sim smoke suite (56), which this change does not touch.
+None of them calls a model or the network. The web smoke suite's **32** checks,
+the copilot's decision check among them (signed in as an operator, a wrong plan
+hash is a JSON 409 before the graph runs), passed against this branch's web
+service on the isolated copy the real runs used.
+
+| Property | Where it is proved |
+|---|---|
+| `apply` has one way in; the gate chain; no walk reaches `apply` without passing `confirm`; no reader has an edge into the gate | `structure.test.ts` 1–4, flat and xray |
+| No construct routes around the drawn edges | `source-scan.test.ts` |
+| A forged route or forged state issues nothing; `confirm` pauses however it is entered | `safety.test.ts` 1, 1b, 2, 3 |
+| A double Approve issues once | `safety.test.ts` 4, `ledger.test.ts` |
+| A stale, expired or mis-named decision is refused before the graph runs; resume is keyed by interrupt | `safety.test.ts` 5–6, `route.test.ts` |
+| Only `apply` holds `Issuer`; the probe and the runner cannot be talked past their doors | `capability.test.ts` |
+| Every figure is recomputed; caveats and wording; cards after three drafts | `verify.test.ts`, `orchestration.test.ts` 9 and 10b |
+| Authority is fixed before data; check mode cannot propose | `injection.test.ts` 2, `orchestration.test.ts` 10, `tools.test.ts` |
+| Each node writes only its own channels | `capability.test.ts` 5 |
+| Scratch writes are bounded, never `/weather/generate`, a 429 never retried | `sim.test.ts`, `capability.test.ts` |
+| Reads cannot write | `capability.test.ts` "reader opens READ ONLY", db smoke |
+| A failing specialist neither aborts nor re-runs its siblings | `orchestration.test.ts` 5 |
+| Database text stays data; system prompts are constant | `injection.test.ts` 1, `model.test.ts` |
+| Every call caches; each repeat (a specialist's next turn, a redraft, a later wave's or a repair's decision) re-sends the earlier request byte for byte; nothing stored is marked; at most four five-minute breakpoints | `model.test.ts` 2 and 7, `registry.test.ts` |
+| Budgets are per request and hold across parallel specialists | `bounds.test.ts`, `registry.test.ts` |
+| No error text or state reaches the browser; the route's gates, lock, pings and disconnect | `stream.test.ts`, `route.test.ts` |
+| Every capped list fits the 8 KB bound at its cap | `sizes.test.ts` |
+| The diagram in README and here is the graph | `docs.test.ts` |
+| One record, one basis; the operator's words reach every task; the controller is handed the request's simulation; drafts a little over the old length bound pass; a window label never runs past now (the real runs' defects) | `tools.test.ts` "no measured or simulated record…" and "compare_zones: the window it read", `model.test.ts` 5–6, `orchestration.test.ts` 4c, `verify.test.ts` "passes the drafts…", `packages/db/src/queries/copilot.test.ts` |
+| The panel's reducers, wire format and layout | `lib/copilot-panel/*.test.ts`, `layout.test.ts` |
+| The review: the duration issued is the one approved; Stop keeps back unsent commands; Stop and the deadline end a model call in flight; checkpoints stay flat; graphs evicted least recently used and never busy; a body read to its bound | `safety.test.ts` 10, `bounds.test.ts` 9–10, `model-call.test.ts`, `checkpoints.test.ts`, `graph-cache.test.ts`, `route.test.ts` 5a |
+| The review: a meter's steps between buckets judged; rule configuration uncitable; coverage in 5-minute periods; every read on orient's building; scenario names state their shift; cards carry caveats; no evidence ids in the dialogue; the verifier's new rules | `tools.test.ts` (meter, rules in scope, compare_zones), `sim.test.ts` 7–7a, `render.test.ts`, `verify.test.ts` "(review)", `packages/db/src/queries/copilot.test.ts`, db smoke [9b] |
+| The review: a plan's zones unlit at expiry; status text contrast; the documents' claims | `countdown.test.ts`, `colors.test.ts`, `docs.test.ts` |

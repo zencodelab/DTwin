@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 /**
@@ -15,6 +16,13 @@ import { defineConfig } from 'vitest/config';
  * in CI before anything is started.
  */
 export default defineConfig({
+  resolve: {
+    // apps/web's tsconfig maps `@/*` to its own root, and its route handlers
+    // import through it. The same mapping here lets a test load a route file
+    // (apps/web/lib/copilot/route.test.ts) instead of only reviewing it. A
+    // regex, anchored on `@/`, so `@dtwin/…` and `@langchain/…` never match.
+    alias: [{ find: /^@\//, replacement: fileURLToPath(new URL('./apps/web/', import.meta.url)) }],
+  },
   test: {
     include: ['{apps,packages}/*/src/**/*.test.ts', 'apps/web/lib/**/*.test.ts'],
     // The smoke suites are executables, not test files; they exit the process

@@ -191,9 +191,10 @@ Sources: [Next.js routes](../apps/web/app/api).
 | `GET /api/ws-ticket` | — | `{ticket}` — a 60-second signed ticket for the ingest socket |
 | `GET /api/control` | — | `{settings, commands, total, limit, truncated}`, proxied to ingest. **403 with an explanation when the session has no user behind it** — the demo tenant can read the building and command nothing, because a command is recorded against a person |
 | `POST /api/control` | `SetpointCommandRequest` | Proxies to ingest and passes the refusal through verbatim, status and all |
-| `GET /api/copilot` | — | `{available, model, reason}`. 401 for an unattributable session |
-| `POST /api/copilot` | `{threadId, message}` or `{threadId, decision}` | One turn of the supervisory-control copilot ([§63](decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural)). Returns `{messages, pendingPlan, outcomes, notice}`; a non-null `pendingPlan` means the run is suspended on a LangGraph `interrupt()` awaiting `decision: "approved" \| "declined"`. **403** for the demo session (a plan is approved *by* someone) and for a `viewer`; **503** with an explanation when no model credential is configured; the model's own errors are logged server-side and returned as a bare 502 |
-| `GET /api/copilot/graph` | — | `{nodes, edges, mermaid}` read off the compiled LangGraph — the panel's diagram and `npm run copilot:graph` both come from this, so neither can describe a graph the code no longer has |
+| `GET /api/copilot` | — | `{available, models: {lead, specialist}, simulation: {available, reason}, reason}` — whether this person may use the copilot, and with what. **401** with no session; **403** for the demo session, which has nobody to record a command against |
+| `GET /api/copilot?threadId=` | Thread id: 1–64 of `A–Z a–z 0–9 _ -` | The thread as a `CopilotTurn` ([below](#the-copilot)), with `running: true` while a run holds its lock — for a reloaded panel, or one whose stream was lost. A thread with nothing on it is an empty turn. **400** for a bad id; **401**/**403** as above, and **403** for a role that may not command |
+| `POST /api/copilot` | A message, a decision, or Stop | One turn of the copilot ([§63](decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural), [§64](decisions.md#64-the-copilot-investigates-in-parallel-answers-from-evidence-and-reaches-the-building-through-one-door)): NDJSON events or one JSON `CopilotTurn`. Bodies, status codes and events are [below](#the-copilot) |
+| `GET /api/copilot/graph` | Optional `xray=1` | `{nodes, edges, mermaid, roles}` read off the compiled LangGraph. `roles` says what each node is (`llm`, `specialist`, `specialist-scratch`, `specialist-control`, `dry-run`, `interrupt`, `writes-building`, …); `?xray=1` expands the four specialist subgraphs. The panel's diagram and `npm run copilot:graph` both come from the compiled graph, so neither can describe a graph the code no longer has. **401** with no session |
 | `GET /api/heatmap` | Required `buildingId`; `metric=temperature_c`, `hours=1` defaults | `{zones}` with values, setpoints and deadbands; missing data is null |
 | `GET /api/zones/{id}` | Zone UUID | `{readings, equipment, maintenance, profile}` |
 | `GET /api/sensors/{id}/history` | `resolution=5m` and `hours=6` defaults | `{buckets}`; resolution allows `5m`, `1h`, `1d` |
@@ -215,6 +216,88 @@ every five minutes
 Any other client of the socket should reconcile the same way: there is no
 replay, so a snapshot after each reconnect is the only thing that can report an
 alert which resolved during the gap.
+
+### The copilot
+
+Source: [route](../apps/web/app/api/copilot/route.ts) and
+[protocol](../apps/web/lib/copilot/protocol.ts), whose Zod schemas are the
+contract — the server parses every event and turn through them before sending,
+and the panel parses every line through them before rendering.
+
+**Bodies** (strict: any other key is a 400):
+
+```json
+{"threadId": "t-1", "message": "Why has OFF-305 been warm since 9?"}
+{"threadId": "t-1", "decision": "approved", "interruptId": "…", "planId": "<uuid>", "planHash": "<64 hex>"}
+{"threadId": "t-1", "stop": true}
+```
+
+A message is 1–2,000 characters. A decision is `approved` or `declined` and
+must name the pending plan exactly as the `plan` event and the turn gave it.
+Threads are namespaced by the signed-in person, so nobody can resume — or
+approve — another person's plan by guessing a thread id.
+
+**Refusals come first, in this order, before any byte of an answer — and
+always as JSON, whatever `Accept` asked for:**
+
+| Status | When |
+|---|---|
+| 401 | No session |
+| 403 | The demo session: a plan is approved *by* someone, and it has nobody |
+| 403 | A role that may not command (`viewer`) — for the whole copilot, reads included |
+| 503 | No model credential on the web service |
+| 413 | A body over 16 KB. It is read to the bound and no further, whether or not it declares its length |
+| 400 | A body that is not one of the three shapes |
+| 202 `{stopping}` | Stop. It never waits for the thread's lock and never builds a graph; `stopping` is false when nothing was running. The run ends with notice `stopped`: a model call in flight is aborted, and during an approved plan's commands those not yet sent are kept back and listed as not issued. A Stop pressed while a plan waits is answered by the decision |
+| 503, `Retry-After: 30` | The web process holds as many people's copilots as it may (200) and every one is busy — a run or a plan open. Nobody's work is dropped to make room |
+| 409 `a request on this thread is still running`, `Retry-After: 2` | Another request on the thread holds its lock |
+| 409 `nothing awaiting approval` | A decision whose interrupt, plan id or hash is not the one pending — or a thread with nothing pending |
+| 409 `plan_expired` | The plan's 600 s, counted from its fresh dry runs, ran out. Ask again for a fresh plan |
+
+Nothing is issued by a refused decision. An approved one issues the plan's
+frozen commands, each recorded against the approving person with the reason
+prefix `copilot (operator-approved): `.
+
+**With `Accept: application/x-ndjson`** the answer is a 200 stream,
+`content-type: application/x-ndjson; charset=utf-8`, `cache-control: no-cache,
+no-transform`, `x-accel-buffering: no`, one JSON event per line:
+
+| `t` | Fields | Sent |
+|---|---|---|
+| `accepted` | `requestId` | First |
+| `step` | `node` | A top-level graph node finished |
+| `task` | `taskId` (`T1`–`T8`, or `K` for the controller), `specialist`, `goal`, `status` | A task was dispatched (`running`, with its goal if the goal passed the wording rules) or ended (its finding's status) |
+| `activity` | `taskId`, `tool`, `label` | A tool call, labelled by the server |
+| `evidence` | `id`, `taskId`, `tool`, `source`, `kind`, `label`, `window`, `coverage`, `flaggedExcluded_count`, `truncated` | An evidence record was stored; its data stays on the server |
+| `sim` | `taskId`, `runId`, `role`, `scenario`, `status`, `progressPct` | Simulation progress |
+| `plan` | `interruptId`, `planId`, `planHash`, `expiresAt` | A plan is waiting for a decision |
+| `ping` | — | Every 15 s |
+| `turn` | `turn` | Last, on success: the `CopilotTurn` |
+| `error` | `error: "the copilot could not complete this turn"`, `requestId` | Last, if the run failed after the stream opened. Fixed words; the cause is logged by name and status only |
+
+A client must skip a `t` it does not know. No model message, tool body,
+thinking block, graph state or error message is ever sent. **A client that
+disconnects does not stop the run**: it finishes within its bounds, the lock is
+released when it settles, and `GET /api/copilot?threadId=` shows how it ended.
+
+**Otherwise** the answer is the `CopilotTurn` as JSON — the same object the
+stream's `turn` carries — or **502** with the same fixed words if the run
+failed.
+
+**`CopilotTurn`:** `requestId`; `running`; `dialogue` (the operator's words and
+the copilot's verified replies, with notice codes — without evidence ids,
+which are numbered afresh every request); `answer` — null unless it
+verified, else paragraphs of rendered segments (text; a figure with its basis,
+the evidence it came from, and whether it is simulated; a citation) and the
+caveat lines; `interpretation` and `message` (a clarifying question), each
+only if it passed the wording rules; `cards` (the evidence: label, source,
+kind, window, coverage, exclusions, headline figures, and its caveat lines in
+the catalogue's fixed words); `tasks`; `pendingPlan`
+(`interruptId`, `planId`, `planHash`, `checkedAt`, `expiresAt`, `summary`,
+each command with its fresh dry-run verdict, and whether it matches a cited
+simulation); `outcomes` of an approval; `notices` (`{code, text}`, fixed
+templates); `usage` (model calls by role, simulation runs, input, output,
+cache-read and cache-write tokens); `models`.
 
 ## Worker HTTP
 

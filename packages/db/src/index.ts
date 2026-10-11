@@ -1,7 +1,7 @@
 export {
   getPool, getOwnerPool, closePool,
   withTenant, withoutTenant, withTransaction,
-  type Db, type TenantContext,
+  type Db, type TenantContext, type WithTenantOptions,
 } from './client.ts';
 export { splitStatements } from './sql-split.ts';
 export * from './queries/index.ts';

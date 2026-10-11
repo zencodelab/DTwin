@@ -15,6 +15,9 @@ import {
   magnitudeColor, temperatureColor, type OverlayMetric,
 } from '@/lib/colors';
 import { reconcileAlerts } from '@/lib/alerts';
+import {
+  browserSessionStorage, currentThreadId, newThreadId, saveThreadId,
+} from '@/lib/copilot-panel/thread';
 import { formatAge, reducePower, reduceZone, zoneSource } from '@/lib/live';
 import { useIsDark } from '@/lib/theme';
 import { useLiveData } from '@/lib/ws';
@@ -97,6 +100,18 @@ export function Dashboard({
   // Zones a copilot plan would change, while the operator is deciding.
   const [highlightedZoneIds, setHighlightedZoneIds] = useState<ReadonlySet<string>>(() => new Set());
   const highlight = useCallback((ids: string[]) => setHighlightedZoneIds(new Set(ids)), []);
+
+  // The copilot's conversation, kept per tab in sessionStorage so a reload
+  // comes back to it — and to a plan still awaiting a decision. Read after
+  // mount, not during render: there is no sessionStorage on the server, and
+  // the panel waits (null) rather than starting a thread it would then drop.
+  const [copilotThread, setCopilotThread] = useState<string | null>(null);
+  useEffect(() => { setCopilotThread(currentThreadId(browserSessionStorage)); }, []);
+  const newCopilotThread = useCallback(() => {
+    const id = newThreadId();
+    saveThreadId(browserSessionStorage, id);
+    setCopilotThread(id);
+  }, []);
   const isDark = useIsDark();
 
   // Subscribe to the floor in frame, not the whole building: the server fans
@@ -518,7 +533,7 @@ export function Dashboard({
       </main>
 
       <aside className="overflow-y-auto border-l" style={{ borderColor: 'var(--border)' }}>
-        {selected ? (
+        {selected && (
           <>
             <button
               type="button"
@@ -540,7 +555,9 @@ export function Dashboard({
               now={now}
             />
           </>
-        ) : (
+        )}
+
+        {!selected && (
           <>
             <h2 className="px-4 pb-1 pt-4 text-[11px] font-semibold uppercase tracking-wider"
                 style={{ color: 'var(--text-muted)' }}>
@@ -553,13 +570,34 @@ export function Dashboard({
               </p>
             )}
             <AlertList alerts={alerts} onSelectZone={selectZoneFromAlert} />
+          </>
+        )}
 
-            <h2 className="px-4 pb-1 pt-5 text-[11px] font-semibold uppercase tracking-wider"
-                style={{ color: 'var(--text-muted)' }}>
-              Copilot
-            </h2>
-            <CopilotPanel onHighlight={highlight} />
+        {/*
+          HIDDEN, never unmounted, while a zone is open. Unmounting dropped the
+          conversation (v1 began a new thread on every remount, losing a plan
+          awaiting a decision), cut a streaming answer off mid-run, and left
+          the plan's glow behind with nothing to clear it. Now that the
+          highlight effect cleans up after itself, unmounting would switch the
+          glow off instead — at exactly the moment the operator clicks one of
+          the plan's zones to inspect it. Hidden, the panel keeps its stream,
+          its state and its highlight; only its box is out of sight.
+        */}
+        <section hidden={selected !== null} aria-label="Copilot">
+          <h2 className="px-4 pb-1 pt-5 text-[11px] font-semibold uppercase tracking-wider"
+              style={{ color: 'var(--text-muted)' }}>
+            Copilot
+          </h2>
+          <CopilotPanel
+            threadId={copilotThread}
+            onNewThread={newCopilotThread}
+            onHighlight={highlight}
+            simRuns={simRuns}
+          />
+        </section>
 
+        {!selected && (
+          <>
             <h2 className="px-4 pb-1 pt-5 text-[11px] font-semibold uppercase tracking-wider"
                 style={{ color: 'var(--text-muted)' }}>
               Energy scenarios

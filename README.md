@@ -14,9 +14,13 @@ definitions and smoke suites. **All four packages are tenant-scoped** —
 tenant-scoped queries, row-level security, API-key and WebSocket-ticket
 authentication in `packages/db` and `apps/ingest`; session-resolved tenancy in
 `apps/web`; and a context-bound scope in the Python worker. The stack builds and
-runs end to end. The suites total **293 checks, all passing**, plus
-**338 unit tests**, and [CI](.github/workflows/ci.yml) runs all of it on
-every push.
+runs end to end. There are **890 unit tests** (806 vitest, 84 pytest) and
+four smoke suites holding **342 checks**, and [CI](.github/workflows/ci.yml)
+runs them on every pull request and push to `main` — every check but the web
+suite's copilot decision check, which needs a signed-in operator and a model
+credential CI does not have, and SKIPs there. On 28 Sep the unit tests and the
+database, simulation and web suites were re-run and pass; the ingest suite was
+not (CLAUDE.md says why).
 
 The one defect the suite had been carrying is closed. `sim:<runId>` topics could
 never be subscribed to — the topic-owner map is keyed by spatial ids and has
@@ -40,41 +44,103 @@ Start with the [documentation index](docs/README.md). It includes the
 and [API reference](docs/api.md), alongside the schema and design decisions.
 
 
-## The copilot's graph
+## The copilot
 
-Generated from the compiled LangGraph (`npm run copilot:graph`), not drawn.
-The safety property is visible in the edges: `apply` has exactly one incoming
-edge, from `confirm`, and `confirm` is an `interrupt()` that suspends the run
-until a person approves ([ADR 63](docs/decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural)).
+A panel beside the 3D view where an operator asks about the building in
+words. It answers four kinds of question, and proposes setpoint changes only
+for a person to approve:
 
+- **Why** — "why has this office been warm since nine?", from rollups, alerts,
+  overrides, the equipment serving the zone and its maintenance log.
+- **How much** — "which floor used most energy last week, and what drove
+  it?", from end-use and cumulative meters and zone rankings.
+- **What if** — "if we raise setpoints 1 K on a 46 °C day, what do we save and
+  who gets uncomfortable?", by running the thermal simulator against a
+  baseline on a synthetic design day it names (only when
+  `COPILOT_SIM_API_KEY` is set).
+- **What to change** — a setpoint plan, dry-run against the safety envelope,
+  that waits for a person's Approve.
+
+A planner dispatches specialists that never write to the building (diagnose
+and analyse read; simulate also writes scratch simulation runs) in parallel
+waves. Every tool result becomes a numbered evidence record, and every figure
+in the answer is recomputed from the record it cites before the operator sees
+it; an answer that fails that check three times is replaced by the evidence
+itself, each card with its caveats. Where the data cannot answer, the answer
+says so rather than guessing: no weather is stored and the floors measure
+within 2% of each other, and each of those comes with a fixed caveat; per-zone
+energy is not metered, which the tools' shape enforces (no tool offers energy
+by zone) and the prompts' honesty rules make the model say in its own words.
+
+The graph is generated from the compiled LangGraph (`npm run copilot:graph --
+--write` rewrites the block below, and a test fails if it goes stale), not
+drawn. The safety property is visible in the edges: `apply` — the one node
+that writes to the building — has exactly one incoming edge, from `confirm`,
+an `interrupt()` that suspends the run until a person approves, and `confirm`
+is reached only from `plan_check`, which re-checks the plan against the
+envelope first
+([ADR 63](docs/decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural),
+[ADR 64](docs/decisions.md#64-the-copilot-investigates-in-parallel-answers-from-evidence-and-reaches-the-building-through-one-door)).
+
+<!-- copilot-graph:start -->
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 graph TD;
 	__start__([<p>__start__</p>]):::first
-	agent(agent)
-	tools(tools)
+	intake(intake)
+	orient(orient)
+	planner(planner)
+	diagnose(diagnose)
+	analyse(analyse)
+	simulate(simulate)
+	join(join)
+	compose(compose)
+	verify(verify)
+	control(control)
+	plan_check(plan_check)
 	confirm(confirm)
 	apply(apply)
 	declined(declined)
+	finish(finish)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> agent;
-	apply --> agent;
-	declined --> agent;
-	agent -.-> tools;
-	agent -.-> __end__;
-	tools -.-> confirm;
-	tools -.-> agent;
+	__start__ --> intake;
+	analyse --> join;
+	apply --> finish;
+	compose --> verify;
+	declined --> finish;
+	diagnose --> join;
+	finish --> __end__;
+	intake --> orient;
+	join --> planner;
+	simulate --> join;
+	orient -.-> planner;
+	orient -.-> finish;
+	planner -.-> diagnose;
+	planner -.-> analyse;
+	planner -.-> simulate;
+	planner -.-> compose;
+	planner -.-> control;
+	planner -.-> finish;
+	verify -.-> compose;
+	verify -.-> control;
+	verify -.-> finish;
+	control -.-> plan_check;
+	control -.-> compose;
+	plan_check -.-> confirm;
+	plan_check -.-> finish;
 	confirm -.-> apply;
 	confirm -.-> declined;
 	classDef default fill:#f2f0ff,line-height:1.2;
 	classDef first fill-opacity:0;
 	classDef last fill:#bfb6fc;
 ```
+<!-- copilot-graph:end -->
 
-[`video/`](video/) holds a narrated walkthrough of this graph and one real run
-through it — request, dry runs, suspension, approval, the audit trail and the
-live map — rendered from the recording, not screen-captured. The rendered MP4
-is not committed; `video/README.md` says how to make it.
+[`video/`](video/) holds a walkthrough of the v1 graph, recorded 24 Sep 2026
+— the five-node agent that preceded this one — and one real run through it:
+request, dry runs, suspension, approval, the audit trail and the live map,
+rendered from the recording, not screen-captured. It is kept as it was; the
+rendered MP4 is not committed, and `video/README.md` says how it was made.
 
 ## Stack
 
@@ -101,7 +167,7 @@ source .env
 set +a
 npm run db:up        # TimescaleDB-HA (bundles PostGIS + Toolkit)
 npm run db:seed      # applies 001..009 *including* the demonstration building
-npm run bootstrap    # first user + the two API keys; prints them once
+npm run bootstrap    # first user + the API keys, the copilot's sim-only one included; prints them once
 npm run smoke -w @dtwin/db   # end-to-end check against the live database, incl. tenant isolation
 ```
 

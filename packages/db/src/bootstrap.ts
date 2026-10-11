@@ -33,12 +33,23 @@ import { closePool } from './client.ts';
 const DEFAULT_TENANT_SLUG = 'corniche';
 
 /**
- * The two keys the stack cannot run without.
+ * The keys a fresh stack needs.
  *
- * Only the worker's key is process configuration. The gateway key is a
- * credential you hand to a device — `.env.example` is explicit that it gets no
- * variable, because a key is tenant-scoped data rather than a setting of this
- * process. It is printed here so there is something to POST /ingest with.
+ * The service keys are process configuration, each printed as the variable
+ * that reads it. The gateway key is a credential you hand to a device —
+ * `.env.example` is explicit that it gets no variable, because a key is
+ * tenant-scoped data rather than a setting of this process. It is printed
+ * here so there is something to POST /ingest with.
+ *
+ * The copilot's simulation key is separate from `web-proxy` on purpose, and
+ * its scope list is the point of it: `sim:run` and nothing else. The copilot
+ * starts what-if runs on its own initiative, bounded but without asking, so
+ * the credential it holds for that must not also be one that ingest accepts
+ * on `/control` — `web-proxy` carries `control:write`, and a code path that
+ * reached for the wrong key would then be able to move a setpoint. With this
+ * key, the worst it can do is what any session can already do by hand in the
+ * scenario panel (docs/decisions.md §64). Unset, the copilot's simulate
+ * specialist is switched off rather than borrowing `SIM_API_KEY`.
  */
 const KEYS = [
   {
@@ -55,6 +66,13 @@ const KEYS = [
     // travels in a header and their ROLE is looked up in the database.
     env: 'SIM_API_KEY',
     note: "the web service's credential for the worker and for control",
+  },
+  {
+    kind: 'service', name: 'copilot-sim', scopes: ['sim:run'],
+    // apps/web's copilot reads COPILOT_SIM_API_KEY for its scratch what-if
+    // runs, and only for those. See the note above KEYS.
+    env: 'COPILOT_SIM_API_KEY',
+    note: "the copilot's sim-only credential; cannot reach /control",
   },
   {
     kind: 'device', name: 'dev-gateway', scopes: ['ingest:write', 'control:dispatch'],

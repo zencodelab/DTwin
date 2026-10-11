@@ -1,4 +1,13 @@
 /**
+ * V1 ONLY — FROZEN. This drives the 5-node v1 copilot (agent, tools, confirm,
+ * apply, declined) through v1's API — `resolveModel`, `realBackend`,
+ * `CopilotBackend`, a `messages` input and a scalar resume — none of which
+ * exists since the v2 graph (docs/decisions.md §64). It is kept as the record
+ * of how `run.json` was captured on 24 Sep 2026, not as a tool: run it only
+ * from a checkout of b2a79eb. It sits outside every workspace tsconfig, so
+ * `npm run typecheck` never compiles it against the current code; ESLint
+ * still reads it (it is not type-aware), and it lints clean as written.
+ *
  * Record one REAL copilot run, node by node, for the explainer video.
  *
  * Same graph, same model, same backend as the web route — bound to one real

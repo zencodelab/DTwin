@@ -134,6 +134,22 @@ export interface TenantContext {
   userId?: string;
 }
 
+export interface WithTenantOptions {
+  /**
+   * Open the transaction `READ ONLY`, so nothing inside it can write — an
+   * INSERT, UPDATE or DELETE fails with SQLSTATE 25006 whatever the role's
+   * grants say. For callers whose whole job is reading and whose input is
+   * shaped by something that is not trusted to be careful: the copilot's tools
+   * run every query this way, so "a read cannot write" is a property of the
+   * transaction rather than of each SQL string being reviewed
+   * (docs/decisions.md §64).
+   *
+   * `set_config(…, true)` and `SET LOCAL` are not writes and still work, so
+   * the tenant scope and a per-query planner setting are unaffected.
+   */
+  readOnly?: boolean;
+}
+
 /**
  * Run `fn` scoped to one tenant.
  *
@@ -151,10 +167,13 @@ export interface TenantContext {
  *
  * This is also why it is a transaction rather than a bare connection checkout:
  * the transaction boundary IS the scope boundary.
+ *
+ * `opts.readOnly` opens it `BEGIN READ ONLY`; see `WithTenantOptions`.
  */
 export async function withTenant<T>(
   ctx: TenantContext,
   fn: (db: Db) => Promise<T>,
+  opts: WithTenantOptions = {},
 ): Promise<T> {
   if (!ctx.tenantId) {
     // Not a defensive nicety. An empty GUC means current_tenant_id() is NULL,
@@ -165,7 +184,7 @@ export async function withTenant<T>(
 
   const client = await getPool().connect();
   try {
-    await client.query('BEGIN');
+    await client.query(opts.readOnly === true ? 'BEGIN READ ONLY' : 'BEGIN');
     await client.query(
       `SELECT set_config('app.tenant_id', $1, true),
               set_config('app.user_id',   $2, true)`,

@@ -89,6 +89,15 @@ services:
       # The worker refuses a caller that cannot present a key with the sim:run
       # scope. `npm run bootstrap` mints it.
       - SIM_API_KEY=${SIM_API_KEY:-}
+      # The copilot (docs/decisions.md §63, §64). Without a credential it says
+      # so and nothing else is affected; blank models mean the defaults.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - COPILOT_MODEL=${COPILOT_MODEL:-}
+      - COPILOT_SPECIALIST_MODEL=${COPILOT_SPECIALIST_MODEL:-}
+      # Its what-if runs use their own sim:run-only key, never SIM_API_KEY
+      # (which can also command); unset, the copilot simulates nothing. They
+      # go to SIM_BASE_URL above.
+      - COPILOT_SIM_API_KEY=${COPILOT_SIM_API_KEY:-}
       # Signs the WebSocket tickets ingest verifies — the two must match.
       - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET is required — see .env.example}
       # Inert unless DTWIN_ALLOW_DEMO_TENANT is also 'true', which is not set
