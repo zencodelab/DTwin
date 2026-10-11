@@ -40,16 +40,17 @@ export default async function Page() {
     );
     const buildingId = rows[0]?.id;
     if (!buildingId) return null;
-    const [tree, tenant] = await Promise.all([
-      getSpatialTree(db, buildingId).catch((err: unknown) => {
-        if (err instanceof SpatialTreeTooLargeError) {
-          tooLarge = err.message;
-          return null;
-        }
-        throw err;
-      }),
-      getTenant(db),
-    ]);
+    // In turn, not Promise.all: both run on this transaction's one client,
+    // which executes one statement at a time anyway. Promise.all only leaned
+    // on pg's internal query queue, which pg 9 removes.
+    const tree = await getSpatialTree(db, buildingId).catch((err: unknown) => {
+      if (err instanceof SpatialTreeTooLargeError) {
+        tooLarge = err.message;
+        return null;
+      }
+      throw err;
+    });
+    const tenant = await getTenant(db);
     // getSpatialTree can still answer null — the id came from a row this
     // transaction read, but RLS could have hidden its children.
     if (!tree) return null;

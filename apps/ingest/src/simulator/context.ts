@@ -55,29 +55,30 @@ export interface SimContext {
 
 export async function loadSimContext(tenantId: string): Promise<SimContext> {
   return withTenant({ tenantId }, async (pool) => {
-  const [building, zones, equipment, days] = await Promise.all([
-    pool.query<{ timezone: string }>(`SELECT timezone FROM buildings ORDER BY name LIMIT 1`),
-    pool.query<ZoneContext>(`
-      SELECT z.id, z.zone_type AS "zoneType",
-             COALESCE(z.design_occupancy, 0) AS "designOccupancy",
-             COALESCE(z.area_m2, 100) AS "areaM2",
-             COALESCE(tp.setpoint_temp_c, 23) AS "setpointC",
-             COALESCE(tp.lighting_power_density_w_m2, 8) AS "lightingDensityW_m2",
-             COALESCE(tp.equipment_power_density_w_m2, 10) AS "equipmentDensityW_m2",
-             z.occupancy_schedule_id AS "scheduleId"
-        FROM zones z
-        LEFT JOIN thermal_profiles tp ON tp.id = z.thermal_profile_id`),
-    pool.query<EquipmentContext>(`
-      SELECT id, equipment_type AS "equipmentType",
-             rated_power_kw AS "ratedPowerKw",
-             rated_airflow_cmh AS "ratedAirflowCmh",
-             status IN ('operational', 'degraded') AS "isRunning"
-        FROM equipment`),
-    pool.query<{ scheduleId: string; dayType: DayType; hourlyFractions: number[] }>(`
-      SELECT schedule_id AS "scheduleId", day_type AS "dayType",
-             hourly_fractions AS "hourlyFractions"
-        FROM occupancy_schedule_days`),
-  ]);
+  // Sequential: these share the transaction's one client, which runs one
+  // statement at a time anyway; Promise.all relied on pg's query queue,
+  // which pg 9 removes.
+  const building = await pool.query<{ timezone: string }>(`SELECT timezone FROM buildings ORDER BY name LIMIT 1`);
+  const zones = await pool.query<ZoneContext>(`
+    SELECT z.id, z.zone_type AS "zoneType",
+           COALESCE(z.design_occupancy, 0) AS "designOccupancy",
+           COALESCE(z.area_m2, 100) AS "areaM2",
+           COALESCE(tp.setpoint_temp_c, 23) AS "setpointC",
+           COALESCE(tp.lighting_power_density_w_m2, 8) AS "lightingDensityW_m2",
+           COALESCE(tp.equipment_power_density_w_m2, 10) AS "equipmentDensityW_m2",
+           z.occupancy_schedule_id AS "scheduleId"
+      FROM zones z
+      LEFT JOIN thermal_profiles tp ON tp.id = z.thermal_profile_id`);
+  const equipment = await pool.query<EquipmentContext>(`
+    SELECT id, equipment_type AS "equipmentType",
+           rated_power_kw AS "ratedPowerKw",
+           rated_airflow_cmh AS "ratedAirflowCmh",
+           status IN ('operational', 'degraded') AS "isRunning"
+      FROM equipment`);
+  const days = await pool.query<{ scheduleId: string; dayType: DayType; hourlyFractions: number[] }>(`
+    SELECT schedule_id AS "scheduleId", day_type AS "dayType",
+           hourly_fractions AS "hourlyFractions"
+      FROM occupancy_schedule_days`);
 
   const schedules = new Map<string, Map<DayType, number[]>>();
   for (const d of days.rows) {

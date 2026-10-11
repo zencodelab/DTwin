@@ -19,40 +19,41 @@ export async function GET(
   const id = zone.value;
 
   const payload = await withTenant(ctx, async (db) => {
-    const [readings, equipment, maintenance, profile] = await Promise.all([
-      getLatestReadingsForZone(db, id),
-      db.query(
-        `SELECT DISTINCT e.id, e.tag, e.equipment_type AS "equipmentType", e.status,
-                e.manufacturer, e.model, e.rated_power_kw AS "ratedPowerKw"
-           FROM equipment e
-           JOIN equipment_zone_service es ON es.equipment_id = e.id
-          WHERE es.zone_id = $1
-          ORDER BY e.tag`,
-        [id],
-      ),
-      // Maintenance for every asset serving this zone, newest first — an AHU's
-      // service history is part of diagnosing the zone it conditions.
-      db.query(
-        `SELECT m.id, m.performed_at AS "performedAt", m.log_type AS "logType",
-                m.technician, m.notes, m.downtime_minutes AS "downtimeMinutes",
-                m.next_due_at AS "nextDueAt", e.tag AS "equipmentTag"
-           FROM maintenance_logs m
-           JOIN equipment e ON e.id = m.equipment_id
-           JOIN equipment_zone_service es ON es.equipment_id = e.id
-          WHERE es.zone_id = $1
-          ORDER BY m.performed_at DESC
-          LIMIT 10`,
-        [id],
-      ),
-      db.query(
-        `SELECT tp.name, tp.setpoint_temp_c AS "setpointC", tp.deadband_k AS "deadbandK",
-                tp.hvac_cop AS "hvacCop", tp.ventilation_l_s_person AS "ventilationLSPerson",
-                tp.window_to_wall_ratio AS "windowToWallRatio"
-           FROM zones z JOIN thermal_profiles tp ON tp.id = z.thermal_profile_id
-          WHERE z.id = $1`,
-        [id],
-      ),
-    ]);
+    // In turn, not Promise.all: all four run on this transaction's one client,
+    // which executes one statement at a time anyway. Promise.all only leaned
+    // on pg's internal query queue, which pg 9 removes.
+    const readings = await getLatestReadingsForZone(db, id);
+    const equipment = await db.query(
+      `SELECT DISTINCT e.id, e.tag, e.equipment_type AS "equipmentType", e.status,
+              e.manufacturer, e.model, e.rated_power_kw AS "ratedPowerKw"
+         FROM equipment e
+         JOIN equipment_zone_service es ON es.equipment_id = e.id
+        WHERE es.zone_id = $1
+        ORDER BY e.tag`,
+      [id],
+    );
+    // Maintenance for every asset serving this zone, newest first — an AHU's
+    // service history is part of diagnosing the zone it conditions.
+    const maintenance = await db.query(
+      `SELECT m.id, m.performed_at AS "performedAt", m.log_type AS "logType",
+              m.technician, m.notes, m.downtime_minutes AS "downtimeMinutes",
+              m.next_due_at AS "nextDueAt", e.tag AS "equipmentTag"
+         FROM maintenance_logs m
+         JOIN equipment e ON e.id = m.equipment_id
+         JOIN equipment_zone_service es ON es.equipment_id = e.id
+        WHERE es.zone_id = $1
+        ORDER BY m.performed_at DESC
+        LIMIT 10`,
+      [id],
+    );
+    const profile = await db.query(
+      `SELECT tp.name, tp.setpoint_temp_c AS "setpointC", tp.deadband_k AS "deadbandK",
+              tp.hvac_cop AS "hvacCop", tp.ventilation_l_s_person AS "ventilationLSPerson",
+              tp.window_to_wall_ratio AS "windowToWallRatio"
+         FROM zones z JOIN thermal_profiles tp ON tp.id = z.thermal_profile_id
+        WHERE z.id = $1`,
+      [id],
+    );
 
     return {
       readings,
