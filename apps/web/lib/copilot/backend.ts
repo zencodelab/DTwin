@@ -1,169 +1,266 @@
-import { withTenant } from '@dtwin/db';
-import type { ControlRefusal, ControlSettings } from '@dtwin/types';
+import {
+  copilotCompareZones, copilotControlHistory, copilotEnergyByEndUse, copilotEquipmentStatus,
+  copilotListAlerts, copilotListZones, copilotMeterConsumption, copilotOrient, copilotZoneConditions,
+  copilotZoneHistory, copilotZoneTimeline, withTenant, type Db,
+} from '@dtwin/db';
+import { ControlSettings } from '@dtwin/types';
+import { z } from 'zod';
+import type {
+  CommandSpec, ControlProbe, DryRunResult, IssueResult, Issuer, TwinReader,
+} from './deps.ts';
+import { readJson } from './http.ts';
 
 /**
- * Everything the copilot is allowed to touch, as one narrow interface.
+ * The real implementations of the copilot's capabilities (deps.ts).
  *
  * The agent never sees a database handle, an API key, or the ingest URL. It
- * sees four verbs, and the real implementation of each goes through exactly
- * the path a human operator's click goes through — the same `/control`
- * routes on ingest, the same `x-acting-user`, the same envelope evaluated the
- * same number of times. There is no privileged agent path (docs/decisions.md
- * §63). What the model can do is bounded by what this interface offers, and
- * what this interface offers is bounded by what the signed-in user could do
- * by hand.
+ * sees tools, and the tools reach the building through exactly the path a
+ * human operator's click goes through — the same `/control` routes on ingest,
+ * the same `x-acting-user`, the same envelope evaluated the same number of
+ * times. There is no privileged agent path (docs/decisions.md §63). What the
+ * copilot can do is bounded by what these objects offer, and what they offer
+ * is bounded by what the signed-in user could do by hand.
  *
- * Narrow on purpose so that the graph's tests can supply a fake with no
- * network and no database, and so that the list of verbs is short enough to
- * read in one glance when asking "what could go wrong".
+ * Reads come from the database under `withTenant(…, { readOnly: true })`, so
+ * RLS scopes them and the transaction itself refuses a write (P17). Dry runs
+ * and issues go to ingest over HTTP, because the safety envelope lives there
+ * and is evaluated against state this service does not hold: a second
+ * implementation of the envelope here would be a second envelope, and the two
+ * would diverge on the day it mattered.
  */
 
-export interface ZoneSummary {
-  id: string;
-  name: string;
-  floorName: string;
-  zoneType: string;
-  areaM2: number | null;
-  /** Latest GOOD temperature in the last hour, or null. §55's rule. */
-  temperatureC: number | null;
-  designedSetpointC: number | null;
-  deadbandK: number | null;
-  activeOverrideC: number | null;
-  overrideUntil: string | null;
-  equipment: Array<{ tag: string; status: string }>;
-}
-
-export interface CommandSpec {
-  zoneId: string;
-  setpointTempC: number;
-  durationS?: number | undefined;
-  reason: string;
-}
-
-export type DryRunResult =
-  | { allowed: true; previousTempC: number; durationS: number; effectiveUntil: string }
-  | { allowed: false; refusal: ControlRefusal | 'unknown_zone' | string; message: string };
-
-export type IssueResult =
-  | { ok: true; commandId: string; state: string; effectiveUntil: string }
-  | { ok: false; refusal: string; message: string };
-
-export interface CopilotBackend {
-  listZones(): Promise<ZoneSummary[]>;
-  settings(): Promise<ControlSettings>;
-  dryRun(command: CommandSpec): Promise<DryRunResult>;
-  issue(command: CommandSpec): Promise<IssueResult>;
-}
-
-const INGEST_BASE = process.env.INGEST_BASE_URL ?? 'http://localhost:8787';
+const DEFAULT_INGEST_BASE = 'http://localhost:8787';
 
 /**
- * The real backend, bound to one tenant and one acting user.
- *
- * Reads come from the database under `withTenant`, so RLS scopes them. Writes
- * — the dry run and the issue — go to ingest over HTTP, because the safety
- * envelope lives there and is evaluated against state this service does not
- * hold. A second implementation of the envelope here would be a second
- * envelope, and the two would diverge on the day it mattered.
+ * How long one probe or issue request may take before it is abandoned. Not in
+ * `Limits`: they bound a transport, not a request. Reached, a probe THROWS
+ * (the tool reports "control service unreachable"); an issue ANSWERS a
+ * `timeout` refusal that says the command may nonetheless have been queued,
+ * because a request that was sent and not answered is not known to have
+ * failed. Without a bound, a hung ingest holds the thread's lock until
+ * undici's five-minute header timeout.
  */
-export function realBackend(tenantId: string, userId: string): CopilotBackend {
-  const headers = (): Record<string, string> => {
-    const key = process.env.SIM_API_KEY;
-    return {
-      'content-type': 'application/json',
-      'x-acting-user': userId,
-      ...(key ? { authorization: `Bearer ${key}` } : {}),
-    };
+export const PROBE_TIMEOUT_MS = 10_000;
+export const ISSUE_TIMEOUT_MS = 15_000;
+
+/** Read per call, not per module: `||` so a blank `INGEST_BASE_URL=` means unset. */
+function ingestBase(): string {
+  return process.env.INGEST_BASE_URL?.trim() || DEFAULT_INGEST_BASE;
+}
+
+/**
+ * The web service's key (bootstrap `web-proxy`: `sim:run`, `control:write`)
+ * and the person the request is for. Honest limit: this key could issue, so
+ * for the probe the boundary is the code below — the route guard, the types,
+ * the source scan — not the key's scope (§64).
+ */
+function controlHeaders(userId: string, withBody: boolean): Record<string, string> {
+  const key = process.env.SIM_API_KEY?.trim();
+  return {
+    ...(withBody ? { 'content-type': 'application/json' } : {}),
+    'x-acting-user': userId,
+    ...(key ? { authorization: `Bearer ${key}` } : {}),
   };
+}
+
+function field(json: unknown, key: string): string | null {
+  if (typeof json !== 'object' || json === null) return null;
+  const v = (json as Record<string, unknown>)[key];
+  return typeof v === 'string' && v !== '' ? v : null;
+}
+
+/**
+ * The command as ingest's `SetpointCommandRequest` takes it, field by field.
+ * Built rather than spread, so nothing the caller's object happens to carry
+ * — a `dryRun: false`, an extra key a later refactor adds — rides along.
+ */
+function commandBody(c: CommandSpec): Record<string, unknown> {
+  return {
+    zoneId: c.zoneId,
+    setpointTempC: c.setpointTempC,
+    reason: c.reason,
+    ...(c.durationS !== undefined ? { durationS: c.durationS } : {}),
+  };
+}
+
+// ==================================================================== reader
+
+/**
+ * Every read is one READ ONLY transaction scoped to the tenant and the acting
+ * user. `set_config` and `SET LOCAL` still work inside it, so RLS and the
+ * meter query's planner setting are unaffected; an INSERT fails with SQLSTATE
+ * 25006 whatever the role's grants say (P17, db smoke).
+ */
+export function realReader(tenantId: string, userId: string): TwinReader {
+  const read = <T>(fn: (db: Db) => Promise<T>): Promise<T> =>
+    withTenant({ tenantId, userId }, fn, { readOnly: true });
 
   return {
-    async listZones() {
-      return withTenant({ tenantId }, async (db) => {
-        const { rows } = await db.query<ZoneSummary & { equipment: ZoneSummary['equipment'] | null }>(
-          `SELECT z.id, z.name, f.name AS "floorName", z.zone_type AS "zoneType",
-                  z.area_m2 AS "areaM2",
-                  p.setpoint_temp_c AS "designedSetpointC", p.deadband_k AS "deadbandK",
-                  -- Latest GOOD reading only, and only if it is recent: the same
-                  -- rule the live map paints by. A value the map would grey out
-                  -- is not a value to plan a setpoint change from.
-                  (SELECT t.value FROM telemetry_t t
-                     JOIN sensors s ON s.id = t.sensor_id
-                    WHERE s.zone_id = z.id AND s.metric = 'temperature_c' AND t.quality = 0
-                      AND t.time > now() - INTERVAL '1 hour'
-                    ORDER BY t.time DESC LIMIT 1) AS "temperatureC",
-                  o.setpoint_temp_c AS "activeOverrideC",
-                  o.effective_until AS "overrideUntil",
-                  (SELECT json_agg(json_build_object('tag', e.tag, 'status', e.status) ORDER BY e.tag)
-                     FROM equipment_zone_service s JOIN equipment e ON e.id = s.equipment_id
-                    WHERE s.zone_id = z.id) AS equipment
-             FROM zones z
-             JOIN floors f ON f.id = z.floor_id
-             LEFT JOIN thermal_profiles p ON p.id = z.thermal_profile_id
-             LEFT JOIN LATERAL (
-               SELECT c.setpoint_temp_c, c.effective_until
-                 FROM control_commands c
-                WHERE c.zone_id = z.id AND c.state = 'applied' AND c.effective_until > now()
-                ORDER BY c.effective_until DESC LIMIT 1
-             ) o ON true
-            ORDER BY f.name, z.name`,
-        );
-        return rows.map((r) => ({
-          ...r,
-          equipment: r.equipment ?? [],
-          overrideUntil: r.overrideUntil ? new Date(r.overrideUntil).toISOString() : null,
-        }));
-      });
-    },
+    orient: () => read((db) => copilotOrient(db)),
+    listZones: () => read((db) => copilotListZones(db)),
+    zoneConditions: (q) => read((db) => copilotZoneConditions(db, q)),
+    zoneHistory: (q) => read((db) => copilotZoneHistory(db, q)),
+    zoneTimeline: (q) => read((db) => copilotZoneTimeline(db, q)),
+    equipmentStatus: (q) => read((db) => copilotEquipmentStatus(db, q)),
+    listAlerts: (q) => read((db) => copilotListAlerts(db, q)),
+    controlHistory: (q) => read((db) => copilotControlHistory(db, q)),
+    energyByEndUse: (q) => read((db) => copilotEnergyByEndUse(db, q)),
+    meterConsumption: (q) => read((db) => copilotMeterConsumption(db, q)),
+    compareZones: (q) => read((db) => copilotCompareZones(db, q)),
+  };
+}
 
+// ===================================================================== probe
+
+/** A request the probe refused to send. A bug in the caller, never a service failure. */
+export class ProbeRouteRefused extends Error {
+  constructor(method: string, path: string) {
+    super(`control probe refused ${method} ${path}: only GET /control/settings and a dry-run POST /control/commands are allowed`);
+    this.name = 'ProbeRouteRefused';
+  }
+}
+
+export interface ProbeReply {
+  status: number;
+  ok: boolean;
+  /** The parsed body, or null when it was empty or not JSON. */
+  json: unknown;
+}
+
+/**
+ * The probe's only door to ingest, and a closed one: it THROWS BEFORE `fetch`
+ * unless the request is `GET /control/settings` with no body, or
+ * `POST /control/commands` whose body says `dryRun: true`.
+ *
+ * The body is judged as the bytes that will be sent — serialised, parsed
+ * back, and checked — not as the object handed in. A getter that answers
+ * `true` once and `false` the next time, or a `toJSON` that drops the flag,
+ * would pass a check on the object and still send a real command; ingest
+ * treats a missing `dryRun` as "issue it". The path is compared exactly, so
+ * a query string or a trailing segment is a different route and refused.
+ */
+export async function probeFetch(
+  userId: string, method: string, path: string, body?: unknown,
+): Promise<ProbeReply> {
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  const sent: unknown = payload === undefined ? undefined : JSON.parse(payload);
+  const isSettings = method === 'GET' && path === '/control/settings' && payload === undefined;
+  const isDryRun = method === 'POST' && path === '/control/commands'
+    && typeof sent === 'object' && sent !== null && !Array.isArray(sent)
+    && (sent as Record<string, unknown>).dryRun === true;
+  if (!isSettings && !isDryRun) throw new ProbeRouteRefused(method, path);
+
+  const res = await fetch(`${ingestBase()}${path}`, {
+    method,
+    headers: controlHeaders(userId, payload !== undefined),
+    ...(payload !== undefined ? { body: payload } : {}),
+    cache: 'no-store',
+    signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+  });
+  return { status: res.status, ok: res.ok, json: await readJson(res) };
+}
+
+/** Ingest's dry-run answer when the envelope allows (apps/ingest/src/server.ts). */
+const DryRunAllowed = z.object({
+  allowed: z.literal(true),
+  previousTempC: z.number(),
+  durationS: z.number(),
+  effectiveUntil: z.string(),
+});
+
+/**
+ * The dry-run capability for one acting user. Parse at the boundary: the
+ * envelope is Zod-parsed as `ControlSettings`, an allowed verdict as
+ * `DryRunAllowed`; anything else is a refusal naming the status, never a
+ * cast that lets a malformed reply through as "allowed".
+ */
+export function realProbe(userId: string): ControlProbe {
+  return {
     async settings() {
-      const res = await fetch(`${INGEST_BASE}/control/settings`, { headers: headers(), cache: 'no-store' });
-      if (!res.ok) throw new Error(`control settings unavailable: ${res.status}`);
-      return (await res.json()) as ControlSettings;
+      const reply = await probeFetch(userId, 'GET', '/control/settings');
+      if (!reply.ok) throw new Error(`control settings unavailable: ${reply.status}`);
+      const parsed = ControlSettings.safeParse(reply.json);
+      if (!parsed.success) throw new Error('control settings unreadable: the reply is not a control envelope');
+      return parsed.data;
     },
 
     async dryRun(command) {
-      const res = await fetch(`${INGEST_BASE}/control/commands`, {
-        method: 'POST',
-        headers: headers(),
-        body: JSON.stringify({ ...command, dryRun: true }),
-      });
-      const body = (await res.json()) as Record<string, unknown>;
-      if (res.ok && body.allowed === true) {
-        return {
-          allowed: true,
-          previousTempC: body.previousTempC as number,
-          durationS: body.durationS as number,
-          effectiveUntil: String(body.effectiveUntil),
-        };
+      const reply = await probeFetch(userId, 'POST', '/control/commands', { ...commandBody(command), dryRun: true });
+      if (reply.ok) {
+        const allowed = DryRunAllowed.safeParse(reply.json);
+        if (allowed.success) {
+          const { previousTempC, durationS, effectiveUntil } = allowed.data;
+          return { allowed: true, previousTempC, durationS, effectiveUntil } satisfies DryRunResult;
+        }
       }
       return {
         allowed: false,
-        refusal: String(body.refusal ?? `http_${res.status}`),
-        message: String(body.error ?? 'refused'),
-      };
+        refusal: field(reply.json, 'refusal') ?? `http_${reply.status}`,
+        message: field(reply.json, 'error')
+          ?? (reply.json === null ? 'the control service returned a reply that is not JSON'
+            : reply.ok ? 'the control service answered without a verdict' : 'refused'),
+      } satisfies DryRunResult;
     },
+  };
+}
 
+// ==================================================================== issuer
+
+/** Ingest's 202 on a queued command. Only the three fields the outcome reports. */
+const Queued = z.object({
+  command: z.object({ id: z.string(), state: z.string(), effectiveUntil: z.string() }),
+});
+
+/**
+ * The ONLY non-dry POST to `/control/commands` in the copilot. `buildCopilotGraph`
+ * hands the object this returns to `makeApply` and to nothing else (§5.5).
+ *
+ * A transport failure before a reply THROWS (apply records "control service
+ * unreachable"). A timeout ANSWERS, because the request may have arrived: the
+ * refusal says to look at the control history before trying again, rather
+ * than inviting a second command on top of the first.
+ */
+export function realIssuer(userId: string): Issuer {
+  return {
     async issue(command) {
-      const res = await fetch(`${INGEST_BASE}/control/commands`, {
-        method: 'POST',
-        headers: headers(),
-        body: JSON.stringify(command),
-      });
-      const body = (await res.json()) as Record<string, unknown>;
-      const cmd = body.command as Record<string, unknown> | undefined;
-      if (res.ok && cmd) {
+      let res: Response;
+      try {
+        res = await fetch(`${ingestBase()}/control/commands`, {
+          method: 'POST',
+          headers: controlHeaders(userId, true),
+          body: JSON.stringify(commandBody(command)),
+          signal: AbortSignal.timeout(ISSUE_TIMEOUT_MS),
+        });
+      } catch (err) {
+        if ((err as { name?: unknown } | null)?.name === 'TimeoutError') {
+          return {
+            ok: false,
+            refusal: 'timeout',
+            message: `no reply from the control service within ${ISSUE_TIMEOUT_MS / 1000} s; the command may ` +
+              'have been queued — check the control history before issuing it again',
+          } satisfies IssueResult;
+        }
+        throw err;
+      }
+      const json = await readJson(res);
+      const queued = Queued.safeParse(json);
+      if (res.ok && queued.success) {
+        const { id, state, effectiveUntil } = queued.data.command;
+        return { ok: true, commandId: id, state, effectiveUntil } satisfies IssueResult;
+      }
+      if (res.ok) {
         return {
-          ok: true,
-          commandId: String(cmd.id),
-          state: String(cmd.state),
-          effectiveUntil: String(cmd.effectiveUntil),
-        };
+          ok: false,
+          refusal: 'unreadable_reply',
+          message: `the control service accepted the command (${res.status}) but its reply could not be read; ` +
+            'check the control history before issuing it again',
+        } satisfies IssueResult;
       }
       return {
         ok: false,
-        refusal: String(body.refusal ?? `http_${res.status}`),
-        message: String(body.error ?? 'refused'),
-      };
+        refusal: field(json, 'refusal') ?? `http_${res.status}`,
+        message: field(json, 'error') ?? 'refused',
+      } satisfies IssueResult;
     },
   };
 }

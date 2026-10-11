@@ -7,7 +7,14 @@
  * what this covers is everything the canvas is fed.
  *
  * Run:  npm run smoke -w @dtwin/web    (with the app, ingest and sim running)
+ *
+ * WEB_SMOKE_EMAIL / WEB_SMOKE_PASSWORD (optional): an operator of the tenant
+ * under test, for the copilot's decision check. Without them, or without a
+ * model credential in the web service, that one check is SKIPPED and says so.
+ * Point WEB_BASE_URL at a stack whose data may change; never at someone's dev
+ * stack you were not asked to touch.
  */
+import { randomUUID } from 'node:crypto';
 import { withTenant, closePool } from '@dtwin/db';
 
 const BASE = process.env.WEB_BASE_URL ?? 'http://localhost:3000';
@@ -18,12 +25,68 @@ const ok = (label: string, cond: boolean, detail = '') => {
   console.log(`  ${cond ? 'PASS' : 'FAIL'}  ${label}${detail ? ` — ${detail}` : ''}`);
 };
 
+/** A check that cannot run here, said so rather than silently passed. Not a failure. */
+const skip = (label: string, why: string) => {
+  console.log(`  SKIP  ${label} — ${why}`);
+};
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`);
   if (!res.ok) throw new Error(`${path} -> ${res.status}`);
   return (await res.json()) as T;
+}
+
+/**
+ * Sign in as `WEB_SMOKE_EMAIL` / `WEB_SMOKE_PASSWORD` (an operator, owner or
+ * admin of the tenant under test) and send a decision whose plan hash names
+ * no plan: 409 "nothing awaiting approval", as JSON, even to an NDJSON
+ * client. Signs out afterwards.
+ */
+async function copilotDecisionCheck(): Promise<void> {
+  const label = 'a decision with a wrong plan hash is a 409 before the graph runs';
+  const email = process.env.WEB_SMOKE_EMAIL?.trim();
+  const password = process.env.WEB_SMOKE_PASSWORD;
+  if (!email || !password) {
+    skip(label, 'set WEB_SMOKE_EMAIL and WEB_SMOKE_PASSWORD to an operator of this tenant to run it');
+    return;
+  }
+  const login = await fetch(`${BASE}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  const session = login.headers.getSetCookie().find((c) => c.startsWith('dtwin_session='))?.split(';', 1)[0];
+  if (login.status !== 200 || !session) {
+    ok(`${label} (sign-in)`, false, `sign-in answered HTTP ${login.status}`);
+    return;
+  }
+  try {
+    const who = await fetch(`${BASE}/api/copilot`, { headers: { cookie: session } });
+    const status = await who.json() as { available?: boolean; reason?: string | null };
+    if (who.status !== 200 || status.available !== true) {
+      skip(label, `the copilot is not available to this person: ${status.reason ?? `HTTP ${who.status}`}`);
+      return;
+    }
+    const res = await fetch(`${BASE}/api/copilot`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/x-ndjson', cookie: session },
+      body: JSON.stringify({
+        threadId: `smoke-${Date.now().toString(36)}`,
+        decision: 'approved',
+        interruptId: 'smoke-no-such-interrupt',
+        planId: randomUUID(),
+        planHash: '0'.repeat(64),
+      }),
+    });
+    const type = res.headers.get('content-type') ?? '';
+    const body = type.startsWith('application/json') ? await res.json() as { error?: string } : {};
+    ok(label, res.status === 409 && body.error === 'nothing awaiting approval',
+       `HTTP ${res.status}, ${type}, ${body.error ?? ''}`);
+  } finally {
+    await fetch(`${BASE}/api/auth/logout`, { method: 'POST', headers: { cookie: session } });
+  }
 }
 
 // Wrapped rather than top-level await: this package is CJS (a Next.js app), so
@@ -242,19 +305,43 @@ async function main(): Promise<void> {
     ok('and says why, before any model is called',
        copilotWrite.status === 403 && (copilotBody.error ?? '').includes('recorded against a person'),
        `HTTP ${copilotWrite.status}`);
+    // The gates run before any byte: a client asking for the event stream is
+    // refused exactly as a JSON client is, not handed a 200 stream that then
+    // says no (decisions.md §64).
+    const copilotStream = await fetch(`${BASE}/api/copilot`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' },
+      body: JSON.stringify({ threadId: 'smoke', message: 'pre-cool everything' }),
+    });
+    const streamType = copilotStream.headers.get('content-type') ?? '';
+    const streamBody = streamType.startsWith('application/json') ? await copilotStream.json() as { error?: string } : {};
+    ok('a demo session asking for NDJSON gets the same JSON 403, not a stream',
+       copilotStream.status === 403 && streamType.startsWith('application/json')
+         && (streamBody.error ?? '').includes('recorded against a person'),
+       `HTTP ${copilotStream.status}, ${streamType}`);
 
     // The diagram the panel draws and the one the README embeds both come
     // from this route, off the compiled graph. The one edge the safety
     // argument rests on must be in it.
     const graphRes = await fetch(`${BASE}/api/copilot/graph`);
     const graphBody = await graphRes.json() as {
-      nodes: string[]; edges: Array<{ source: string; target: string }>; mermaid: string;
+      nodes: string[]; edges: Array<{ source: string; target: string }>; mermaid: string; roles?: Record<string, string>;
     };
     const intoApply = (graphBody.edges ?? []).filter((e) => e.target === 'apply').map((e) => e.source);
     ok('the copilot graph is served from the compiled graph, and apply has one way in',
        graphRes.status === 200 && intoApply.length === 1 && intoApply[0] === 'confirm'
-         && graphBody.mermaid.includes('confirm -.-> apply'),
+         && graphBody.mermaid.includes('confirm -.-> apply') && graphBody.mermaid.includes('planner'),
        `into apply: ${intoApply.join(',') || 'none'}`);
+    ok('and says what each node is: apply writes the building, confirm is the interrupt',
+       graphBody.roles?.apply === 'writes-building' && graphBody.roles?.confirm === 'interrupt',
+       JSON.stringify(graphBody.roles ?? null));
+
+    // A decision is refused unless it names the plan actually pending — by
+    // interrupt, plan id and hash — before the graph runs. This needs a real
+    // person who may command, and a web service with a model credential (the
+    // credential gate answers first); the model itself is never called. Any
+    // of those missing, the check says so and is skipped, not passed.
+    await copilotDecisionCheck();
 
     console.log('\n[9] Sign-in limits');
     // Addresses nobody has, fresh each run: the limiter is keyed on what was

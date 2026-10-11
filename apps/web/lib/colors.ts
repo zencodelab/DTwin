@@ -52,6 +52,18 @@ export const STATUS = {
   critical: '#d03b3b',
 } as const;
 
+/**
+ * The status hues for TEXT: theme-aware tokens (app/globals.css) that hold
+ * 4.5:1 on the panel's surfaces in both themes. STATUS itself is for borders,
+ * fills and marks — as small text its amber was 1.7:1 on the light surface
+ * (review).
+ */
+export const STATUS_TEXT = {
+  good: 'var(--status-good-text)',
+  warning: 'var(--status-warning-text)',
+  critical: 'var(--status-critical-text)',
+} as const;
+
 export const NO_DATA_LIGHT = '#e1e0d9';
 export const NO_DATA_DARK = '#2c2c2a';
 

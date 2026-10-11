@@ -27,7 +27,7 @@ source .env
 set +a
 npm run db:up
 npm run db:seed     # migrate, including the demonstration building
-npm run bootstrap   # create the first user and the two API keys
+npm run bootstrap   # create the first user and the API keys
 npm run sim:install
 ```
 
@@ -39,8 +39,12 @@ so the seed only inserts cleanly in its own chain position. To change your mind,
 `docker compose down -v` and start again. `npm run db:migrate --status` says
 which of the two any database got.
 
-`bootstrap` prints the tenant id and the two API keys **once** — put them in
-`.env` as `DTWIN_DEMO_TENANT_ID`, `INGEST_API_KEY` and `SIM_SERVICE_KEY`. It is
+`bootstrap` prints the tenant id and the API keys **once**, as a `# .env` block
+— put them in `.env`: `DTWIN_DEMO_TENANT_ID`, `INGEST_API_KEY` (the worker's
+`sim-worker` key), `SIM_API_KEY` (the web service's `web-proxy` key) and
+`COPILOT_SIM_API_KEY` (the copilot's sim-only `copilot-sim` key; without it
+the copilot runs no simulations). The device gateway's `dev-gateway` key is
+printed apart, as it is not an environment variable of any service. It is
 idempotent: re-running reuses the existing tenant and user and leaves the
 password alone. `--rotate` replaces the keys (atomically, keeping the revoked
 rows as an audit trail); `--email`, `--name`, `--password` and `--tenant`
@@ -176,8 +180,13 @@ Authoritative definitions are in [ingest config](../apps/ingest/src/config.ts),
 | `ALERT_WEBHOOK_TIMEOUT_MS` / `ALERT_WEBHOOK_MAX_ATTEMPTS` | `5000` / `3` | Bound webhook calls and retries |
 | `ALERT_WEBHOOK_ALLOW_PRIVATE` | `false` | Local receiver testing only |
 | `SIM_ENABLED` / `SIM_TICK_MS` / `SIM_SPEEDUP` | `true` / `1000` / `10` | Ingest's synthetic device generator, not the Python engine |
-| `SIM_BASE_URL` | `http://localhost:8000` | Next.js-to-worker connection |
-| `INGEST_BASE_URL` | `http://localhost:8787` | Worker-to-ingest connection |
+| `SIM_BASE_URL` | `http://localhost:8000` | Next.js-to-worker connection: the scenario proxy and the copilot's what-if runs |
+| `INGEST_BASE_URL` | `http://localhost:8787` | Worker-to-ingest (run progress) and web-to-ingest (the control proxy, and the copilot's dry runs and approved commands) |
+| `SIM_API_KEY` | unset | Web's key for the worker and for ingest's `/control` routes (bootstrap `web-proxy`: `sim:run`, `control:write`) |
+| `ANTHROPIC_API_KEY` | unset | The copilot's model credential, on the web service. Without it the copilot answers 503 and says so; nothing else is affected. `ANTHROPIC_AUTH_TOKEN` also works for a web process started by hand (Compose passes only `ANTHROPIC_API_KEY`). An `ant auth login` profile does NOT: the route asks for one of the two variables before it builds a client |
+| `COPILOT_MODEL` | `claude-opus-5` | The copilot's lead model: planner, compose and the controller. Blank means unset |
+| `COPILOT_SPECIALIST_MODEL` | the lead model | The diagnose, analyse and simulate specialists. Blank means unset; nothing defaults to a cheaper model |
+| `COPILOT_SIM_API_KEY` | unset | The copilot's sim-only key (bootstrap `copilot-sim`, scope `sim:run` only). Unset, the copilot runs no simulations — it never borrows `SIM_API_KEY`, which can also command |
 | `INGEST_NOTIFY_TIMEOUT_S` | `3.0` | Timeout per worker event post |
 | `SIM_SUBSTEP_S` | `300` | Physics integration step |
 | `SIM_GROUND_REFLECTANCE` / `SIM_CAPACITY_FACTOR` | `0.2` / `1.25` | Solar reflection and auto-sizing margin |
@@ -216,15 +225,56 @@ claim and never cached, queued commands then lapse untouched, and applied
 overrides run out on their own clocks
 ([§62](decisions.md#62-the-twin-is-allowed-to-act-and-every-part-of-that-is-a-refusal)).
 
-The **copilot** needs `ANTHROPIC_API_KEY` on the web service (or an
-`ANTHROPIC_AUTH_TOKEN` / `ant auth login` profile; the SDK resolves them in
-that order). Without one, the panel says so and nothing else is affected. It
+The **copilot** needs `ANTHROPIC_API_KEY` on the web service (or
+`ANTHROPIC_AUTH_TOKEN`, for a web process started by hand — Compose passes
+only the key). An `ant auth login` profile is not enough, although the SDK
+would read one: the route checks for one of the two variables before it builds
+a client (`hasModelCredential`). Without one, the panel says so and nothing
+else is affected. It
 proposes and never applies: every command it issues went through the operator's
 Approve and is recorded against that person with a `copilot (operator-approved):`
-reason prefix, so `GET /control/commands` distinguishes them. Its suspended
-plans live in web-process memory — a restart forgets a plan awaiting approval,
-and nothing is issued for it
-([§63](decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural)).
+reason prefix, so `GET /control/commands` distinguishes them
+([§63](decisions.md#63-the-copilot-proposes-a-person-approves-the-graph-makes-that-structural),
+[§64](decisions.md#64-the-copilot-investigates-in-parallel-answers-from-evidence-and-reaches-the-building-through-one-door)).
+
+- **A restart drops pending plans.** Suspended runs, the approval ledger and
+  each request's budget live in web-process memory. A restart forgets a plan
+  awaiting approval and nothing is issued for it — the operator asks again —
+  and a second web replica would not share any of it. That memory is bounded:
+  each conversation keeps only its latest checkpoint, a person at most 16
+  conversations, and the process at most 200 people. Past 200, the least
+  recently used person with nothing running or pending is let go; if everyone
+  is busy, a new person gets 503 with `Retry-After` and `copilot.graphs_busy`
+  is logged, and nobody's plan is dropped.
+- **Simulation is off until `COPILOT_SIM_API_KEY` is set** (`npm run
+  bootstrap` mints `copilot-sim`). With it, the copilot starts what-if runs on
+  its own, bounded: one copilot run at a time per web process, a baseline and
+  at most two scenarios per request, twelve runs per person per hour, 45 s
+  each before it cancels one.
+- **It shares the worker's slots with people.** The worker admits
+  `SIM_MAX_CONCURRENT_RUNS` runs (default 2) across every tenant, without
+  regard to whose they are. A copilot run holds one of those two for its
+  duration, leaving every person's scenario panel one between them — a second
+  run meets a 429. The copilot itself surfaces a 429 as a refusal and never
+  retries. Its process
+  slot is leased for 60 s, so a run whose cancel never reached the worker
+  cannot hold it for the life of the process.
+- **Deleting its runs.** Copilot runs are named `copilot: <scenario>` and
+  described `copilot run; user <id>; request <id>`. Delete their
+  `simulation_runs` rows — the results go with them (`ON DELETE CASCADE`) —
+  and never with
+  `drop_chunks`: `simulation_results` is chunked by *simulated* time, so
+  dropping a chunk deletes every run's results for those dates, the scenario
+  panel's included.
+
+```sql
+-- As the owner, or scoped to the tenant (set app.tenant_id first).
+DELETE FROM simulation_runs
+ WHERE scenario_name LIKE 'copilot: %' AND requested_at < now() - INTERVAL '7 days';
+```
+
+Copilot log events are `copilot.*` (§64 lists them). A failed turn is logged
+by the error's name and HTTP status only, never its message.
 
 Logs are JSON, one object per line, with a stable `event` and named fields
 ([§61](decisions.md#61-one-request-id-three-services-and-an-event-name-that-is-not-prose)).
@@ -286,16 +336,11 @@ LIMIT 20;
 
 ## Change verification
 
-🚧 **`npm run typecheck` currently fails as a whole-repo command**, because
-`@dtwin/web` has not been converted to the tenant-scoped `@dtwin/db` query
-signatures yet and does not build. Check `@dtwin/types`, `@dtwin/db`, and
-`@dtwin/ingest` individually until that conversion lands:
-
-```bash
-npm run typecheck -w @dtwin/types
-npm run typecheck -w @dtwin/db
-npm run typecheck -w @dtwin/ingest
-```
+`npm run typecheck` covers all four TypeScript workspaces, web included, and
+`npx vitest run` the unit tests; both need no database (checked 28 Sep 2026,
+when `next build` also succeeded). After changing the copilot's graph, run
+`npm run copilot:graph -- --write`: the diagrams in README and ADR 64 are
+generated, and a unit test fails until they match.
 
 For repository changes touching the database or ingest, the baseline is:
 
@@ -326,12 +371,16 @@ and tenant isolation).
 npm run smoke -w @dtwin/ingest  # starts its test server on :8899
 ```
 
-`npm run smoke:sim` (`@dtwin/web`'s and the root chained `npm run smoke`) are
-not currently usable end to end: the web service does not build, and the
-Python worker has no tenant parameter to exercise against a tenancy-aware
-database. Re-establish the full chain once both are converted. Smoke success
-does not substitute for browser, overload, failure-recovery, or physical
-calibration tests.
+`npm run smoke:sim` spawns its own worker on :8912 against `DATABASE_URL` and
+needs `DTWIN_DEMO_TENANT_ID`; it passed on a migrated, seeded database on
+28 Sep 2026. `npm run smoke -w @dtwin/web` drives a running web service at
+`WEB_BASE_URL` (default `http://localhost:3000`, so point it elsewhere unless
+that stack's data may change), with ingest and the worker behind it. Its
+copilot decision check signs in as `WEB_SMOKE_EMAIL` / `WEB_SMOKE_PASSWORD` —
+an operator of the tenant under test — and needs a model credential on the web
+service; without either it prints SKIP and why, never a pass. The model itself
+is never called. Smoke success does not substitute for browser, overload,
+failure-recovery, or physical calibration tests.
 
 Migrations are append-only. Add the next unused numbered SQL file; never modify
 an applied file. Nontransactional migrations can partially apply. On failure,

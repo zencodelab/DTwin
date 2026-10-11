@@ -1,343 +1,245 @@
 import { describe, expect, it } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
-import type { CommandSpec, CopilotBackend, ZoneSummary } from './backend.ts';
+import { memoryLogger } from '../log.ts';
+import { buildCopilotGraph, DEFAULT_MODEL, resolveModels } from './graph.ts';
+import { decide, sendMessage, type CopilotTurn } from './session.ts';
 import {
-  DEFAULT_MODEL, MAX_TURNS, buildCopilotGraph, decide, resolveModel, sendMessage, type ModelCaller,
-} from './graph.ts';
-import { MAX_PLAN_COMMANDS, TOOL_NAMES, runTool } from './tools.ts';
+  Z, composeMsg, fakeDeps, message, plannerMsg, toolUse, type FakeDeps, type Script,
+} from './testing/fakes.ts';
+import { toolHarness } from './testing/tools.ts';
+import { MAX_PLAN_COMMANDS } from './tools/index.ts';
 
-// ---------------------------------------------------------------- fixtures
+/**
+ * v1's graph tests, ported to the v2 graph (design §10, graph.test.ts 1–11).
+ *
+ * The control fast path is v1's behaviour kept whole: the planner hands a
+ * setpoint request straight to the controller, the controller looks,
+ * dry-runs and proposes, and the run STOPS at `confirm` until a person
+ * decides. What changed underneath is what these now also prove: the plan is
+ * dry-run a third time by plan_check, a decision names the interrupt, the
+ * plan and its hash, apply issues the ledger's frozen grant, and no model is
+ * called after approval.
+ */
 
-const Z = {
-  off301: '00000000-0000-4000-8000-000000000301',
-  off303: '00000000-0000-4000-8000-000000000303',
-  off305: '00000000-0000-4000-8000-000000000305',
-  ser105: '00000000-0000-4000-8000-000000000105',
-};
+const FAST_PATH_PLANNER = () => plannerMsg({
+  intent: 'control', next: 'control', allowControl: true,
+  controlTask: { mode: 'propose', brief: 'pre-cool L3 offices' }, tasks: [],
+});
 
-const ZONES: ZoneSummary[] = [
-  { id: Z.off301, name: 'OFF-301', floorName: 'Level 3', zoneType: 'office', areaM2: 200,
-    temperatureC: 24.2, designedSetpointC: 23, deadbandK: 1, activeOverrideC: null,
-    overrideUntil: null, equipment: [{ tag: 'AHU-04', status: 'operational' }] },
-  { id: Z.off303, name: 'OFF-303', floorName: 'Level 3', zoneType: 'office', areaM2: 200,
-    temperatureC: 23.9, designedSetpointC: 23, deadbandK: 1, activeOverrideC: null,
-    overrideUntil: null, equipment: [{ tag: 'AHU-04', status: 'operational' }] },
-  // Serving AHU in fault: the envelope refuses this one.
-  { id: Z.off305, name: 'OFF-305', floorName: 'Level 3', zoneType: 'office', areaM2: 200,
-    temperatureC: 24.0, designedSetpointC: 23, deadbandK: 1, activeOverrideC: null,
-    overrideUntil: null, equipment: [{ tag: 'AHU-04', status: 'fault' }] },
-  // Stale sensor: temperatureC null.
-  { id: Z.ser105, name: 'SER-105', floorName: 'Level 1', zoneType: 'server_room', areaM2: 40,
-    temperatureC: null, designedSetpointC: 18, deadbandK: 0.5, activeOverrideC: null,
-    overrideUntil: null, equipment: [] },
-];
+const REPORT = (status: 'answered' | 'partial' | 'cannot_answer' = 'answered') =>
+  toolUse('report_finding', { status, summary: 'done', claims: [], openQuestions: [], caveats: [] });
 
-/** Refuses OFF-305 (equipment) and SER-105 (feedback), allows the rest. */
-function fakeBackend() {
-  const issued: CommandSpec[] = [];
-  const dryRuns: CommandSpec[] = [];
-  const backend: CopilotBackend = {
-    async listZones() { return ZONES; },
-    async settings() {
-      return { enabled: true, maxDeviationK: 3, maxStepK: 2, minIntervalS: 900,
-        defaultDurationS: 3600, maxDurationS: 43_200, commandTtlS: 300 };
-    },
-    async dryRun(c) {
-      dryRuns.push(c);
-      if (c.zoneId === Z.off305) {
-        return { allowed: false, refusal: 'equipment_unavailable', message: 'AHU-04 (fault)' };
-      }
-      if (c.zoneId === Z.ser105) {
-        return { allowed: false, refusal: 'feedback_unusable', message: 'no reading' };
-      }
-      return { allowed: true, previousTempC: 23, durationS: c.durationS ?? 3600,
-        effectiveUntil: '2026-09-24T15:00:00.000Z' };
-    },
-    async issue(c) {
-      issued.push(c);
-      return { ok: true, commandId: `cmd-${issued.length}`, state: 'pending',
-        effectiveUntil: '2026-09-24T15:00:00.000Z' };
-    },
-  };
-  return { backend, issued, dryRuns };
-}
-
-let ids = 0;
-// Test doubles for what a model returns. Cast through unknown because the
-// SDK's block types carry fields (caller, container) a fake need not fill.
-const toolUse = (name: string, input: unknown): Anthropic.ToolUseBlock =>
-  ({ type: 'tool_use', id: `tu_${++ids}`, name, input } as unknown as Anthropic.ToolUseBlock);
-const text = (t: string): Anthropic.TextBlock =>
-  ({ type: 'text', text: t, citations: null });
-
-function message(
-  content: Anthropic.ContentBlock[], stop: Anthropic.Message['stop_reason'] = 'end_turn',
-): Anthropic.Message {
-  return {
-    id: `msg_${++ids}`, type: 'message', role: 'assistant', model: 'fake', content,
-    stop_reason: stop, stop_sequence: null, stop_details: null,
-    usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0, server_tool_use: null, service_tier: null,
-      cache_creation: null, inference_geo: null, iterations: null, speed: null },
-  } as unknown as Anthropic.Message;
-}
-
-/** A model that returns a fixed script, one message per call. */
-function scriptedModel(script: Anthropic.Message[]): { call: ModelCaller; calls: number } {
-  const state = { calls: 0 };
-  const call: ModelCaller = async () => {
-    const next = script[state.calls];
-    state.calls += 1;
-    if (!next) throw new Error(`script exhausted after ${state.calls - 1} calls`);
-    return next;
-  };
-  return { call, get calls() { return state.calls; } };
-}
-
-const preCoolScript = () => [
-  message([toolUse('list_zones', {})], 'tool_use'),
+/** v1's pre-cool script, ending with the finding in the same turn as the plan. */
+const preCoolScript = (): Anthropic.Message[] => [
+  message([toolUse('list_zones', {})]),
   message([
     toolUse('dry_run_setpoint', { zoneId: Z.off301, setpointTempC: 24.5, durationS: 7200, reason: 'pre-cool' }),
     toolUse('dry_run_setpoint', { zoneId: Z.off303, setpointTempC: 24.5, durationS: 7200, reason: 'pre-cool' }),
-  ], 'tool_use'),
-  message([toolUse('propose_plan', {
-    summary: 'Raise OFF-301 and OFF-303 to 24.5 °C for two hours ahead of the afternoon peak.',
-    commands: [
-      { zoneId: Z.off301, setpointTempC: 24.5, durationS: 7200, reason: 'pre-cool for the afternoon peak' },
-      { zoneId: Z.off303, setpointTempC: 24.5, durationS: 7200, reason: 'pre-cool for the afternoon peak' },
-    ],
-  })], 'tool_use'),
+  ]),
+  message([
+    toolUse('propose_plan', {
+      summary: 'Raise OFF-301 and OFF-303 ahead of the afternoon peak.',
+      commands: [
+        { zoneId: Z.off301, setpointTempC: 24.5, durationS: 7200, reason: 'pre-cool for the afternoon peak' },
+        { zoneId: Z.off303, setpointTempC: 24.5, durationS: 7200, reason: 'pre-cool for the afternoon peak' },
+      ],
+    }),
+    REPORT(),
+  ]),
 ];
 
-// ------------------------------------------------------------------ tests
+const words = (text: string) => composeMsg({ paragraphs: [{ segments: [{ kind: 'text', text }] }], caveats: [] });
 
-describe('the copilot graph', () => {
+function setup(script: Script, extra: Parameters<typeof fakeDeps>[0] = {}) {
+  const fake: FakeDeps = fakeDeps({ script, ...extra });
+  const logger = memoryLogger();
+  const graph = buildCopilotGraph({ ...fake.deps, log: logger });
+  return {
+    fake, graph, logger,
+    send: (threadId: string, text: string) => sendMessage(graph, threadId, text, { mayCommand: true }),
+    decide: (threadId: string, turn: CopilotTurn, decision: 'approved' | 'declined') => decide(graph, threadId, {
+      decision,
+      interruptId: turn.pendingPlan!.interruptId,
+      planId: turn.pendingPlan!.planId,
+      planHash: turn.pendingPlan!.planHash,
+    }),
+  };
+}
+
+describe('the copilot graph: the control fast path', () => {
   it('proposes, then STOPS — nothing is issued until a person approves', async () => {
-    const { backend, issued, dryRuns } = fakeBackend();
-    const model = scriptedModel(preCoolScript());
-    const graph = buildCopilotGraph({ backend, callModel: model.call, model: 'fake' });
+    const { fake, send } = setup({ planner: [FAST_PATH_PLANNER()], control: preCoolScript() });
 
-    const turn = await sendMessage(graph, 't1', 'Pre-cool the Level 3 offices for the afternoon peak');
+    const turn = await send('t1', 'Pre-cool the Level 3 offices for the afternoon peak');
 
     expect(turn.pendingPlan).not.toBeNull();
     expect(turn.pendingPlan!.commands.map((c) => c.zoneName)).toEqual(['OFF-301', 'OFF-303']);
     expect(turn.pendingPlan!.commands.every((c) => c.verdict.allowed)).toBe(true);
-    // The graph re-ran the dry runs itself when the plan was proposed: two by
-    // the model, two more by propose_plan. The operator sees verdicts from now.
-    expect(dryRuns).toHaveLength(4);
-    expect(issued).toHaveLength(0);
-    expect(model.calls).toBe(3);
+    // Dry-run three times over: twice by the model, once more by propose_plan,
+    // and again by plan_check just before the card is shown.
+    expect(fake.probe.dryRuns).toHaveLength(6);
+    expect(fake.issuer.issued).toHaveLength(0);
+    expect(fake.model.count('planner')).toBe(1);
+    expect(fake.model.count('control')).toBe(3);
+    expect(fake.model.count()).toBe(4);
   });
 
-  it('issues every command once the operator approves, attributed as copilot-proposed', async () => {
-    const { backend, issued } = fakeBackend();
-    const model = scriptedModel([
-      ...preCoolScript(),
-      message([text('Queued both overrides; they lapse at 15:00.')]),
-    ]);
-    const graph = buildCopilotGraph({ backend, callModel: model.call, model: 'fake' });
+  it('issues every command once the operator approves, attributed as copilot-proposed, with no model call after', async () => {
+    const { fake, send, decide: d } = setup({ planner: [FAST_PATH_PLANNER()], control: preCoolScript() });
 
-    await sendMessage(graph, 't2', 'Pre-cool Level 3');
-    const turn = await decide(graph, 't2', 'approved');
+    const proposed = await send('t2', 'Pre-cool Level 3');
+    const calls = fake.model.count();
+    const turn = await d('t2', proposed, 'approved');
 
-    expect(issued).toHaveLength(2);
-    expect(issued.map((c) => c.zoneId)).toEqual([Z.off301, Z.off303]);
-    for (const c of issued) expect(c.reason).toMatch(/^copilot \(operator-approved\): /);
+    expect(fake.issuer.issued).toHaveLength(2);
+    expect(fake.issuer.issued.map((c) => c.zoneId)).toEqual([Z.off301, Z.off303]);
+    for (const c of fake.issuer.issued) expect(c.reason).toMatch(/^copilot \(operator-approved\): /);
     expect(turn.pendingPlan).toBeNull();
+    expect(turn.outcomes).toHaveLength(2);
     expect(turn.outcomes.every((o) => o.result.ok)).toBe(true);
-    const last = turn.messages[turn.messages.length - 1]!;
-    expect(JSON.stringify(last.content)).toContain('Queued both');
+    expect(fake.model.count()).toBe(calls);
   });
 
   it('issues nothing when the operator declines', async () => {
-    const { backend, issued } = fakeBackend();
-    const model = scriptedModel([
-      ...preCoolScript(),
-      message([text('Understood — what would you like instead?')]),
-    ]);
-    const graph = buildCopilotGraph({ backend, callModel: model.call, model: 'fake' });
+    const { fake, send, decide: d } = setup({ planner: [FAST_PATH_PLANNER()], control: preCoolScript() });
 
-    await sendMessage(graph, 't3', 'Pre-cool Level 3');
-    const turn = await decide(graph, 't3', 'declined');
+    const proposed = await send('t3', 'Pre-cool Level 3');
+    const turn = await d('t3', proposed, 'declined');
 
-    expect(issued).toHaveLength(0);
+    expect(fake.issuer.issued).toHaveLength(0);
     expect(turn.pendingPlan).toBeNull();
     expect(turn.outcomes).toEqual([]);
+    expect(turn.notices.map((n) => n.code)).toContain('plan_declined');
   });
 
   it('never shows the operator a plan containing a command the envelope refuses', async () => {
-    const { backend, issued } = fakeBackend();
-    const model = scriptedModel([
-      message([toolUse('propose_plan', {
-        summary: 'Pre-cool every Level 3 office',
-        commands: [
-          { zoneId: Z.off301, setpointTempC: 24.5, reason: 'pre-cool' },
-          { zoneId: Z.off305, setpointTempC: 24.5, reason: 'pre-cool' },   // AHU in fault
-        ],
-      })], 'tool_use'),
-      // The model receives the error and explains rather than retrying.
-      message([text('OFF-305 cannot be commanded: AHU-04 is in fault. I can proceed with OFF-301 alone.')]),
-    ]);
-    const graph = buildCopilotGraph({ backend, callModel: model.call, model: 'fake' });
+    const { fake, send } = setup({
+      planner: [FAST_PATH_PLANNER()],
+      control: [
+        message([toolUse('propose_plan', {
+          summary: 'Pre-cool every Level 3 office.',
+          commands: [
+            { zoneId: Z.off301, setpointTempC: 24.5, reason: 'pre-cool' },
+            { zoneId: Z.off305, setpointTempC: 24.5, reason: 'pre-cool' },   // VAV-305 in fault
+          ],
+        })]),
+        // The model reads the refusal and reports rather than retrying.
+        message([REPORT('cannot_answer')]),
+      ],
+      compose: [words('OFF-305 cannot be commanded while its VAV is in fault.')],
+    });
 
-    const turn = await sendMessage(graph, 't4', 'Pre-cool all of Level 3');
+    const turn = await send('t4', 'Pre-cool all of Level 3');
 
     expect(turn.pendingPlan).toBeNull();
-    expect(issued).toHaveLength(0);
-    const toolResult = turn.messages.find((m) =>
-      Array.isArray(m.content) && m.content.some((b) => b.type === 'tool_result'));
-    expect(JSON.stringify(toolResult!.content)).toContain('AHU-04 (fault)');
-    expect(JSON.stringify(toolResult!.content)).toContain('"is_error":true');
-  });
-
-  it('stops at the turn ceiling instead of looping for ever', async () => {
-    const { backend, issued } = fakeBackend();
-    // A model that only ever looks and never proposes.
-    const looping = Array.from({ length: MAX_TURNS + 5 }, () =>
-      message([toolUse('list_zones', {})], 'tool_use'));
-    const model = scriptedModel(looping);
-    const graph = buildCopilotGraph({ backend, callModel: model.call, model: 'fake' });
-
-    const turn = await sendMessage(graph, 't5', 'Look at everything');
-
-    expect(model.calls).toBe(MAX_TURNS);
-    expect(turn.notice).toMatch(/stopped after/);
-    expect(issued).toHaveLength(0);
+    expect(fake.issuer.issued).toHaveLength(0);
+    const second = fake.model.calls.control![1]!;
+    const results = JSON.stringify(second.messages[second.messages.length - 1]);
+    expect(results).toContain('VAV-305 (fault)');
+    expect(results).toContain('"is_error":true');
   });
 
   it('acts on nothing when the model refuses', async () => {
-    const { backend, issued } = fakeBackend();
     const refusal = message([toolUse('propose_plan', { summary: 'x', commands: [] })], 'refusal');
-    (refusal as { stop_details: unknown }).stop_details =
-      { type: 'refusal', category: 'cyber', explanation: 'declined' };
-    const model = scriptedModel([refusal]);
-    const graph = buildCopilotGraph({ backend, callModel: model.call, model: 'fake' });
+    const { fake, send } = setup({
+      planner: [FAST_PATH_PLANNER()],
+      control: [refusal],
+      compose: [words('The copilot could not act on that request.')],
+    });
 
-    const turn = await sendMessage(graph, 't6', 'Do something unwise');
+    const turn = await send('t5', 'Do something unwise');
 
-    expect(turn.notice).toMatch(/declined/);
     expect(turn.pendingPlan).toBeNull();
-    expect(issued).toHaveLength(0);
+    expect(fake.issuer.issued).toHaveLength(0);
+    expect(fake.probe.dryRuns).toHaveLength(0);
+    expect(turn.tasks.find((t) => t.taskId === 'K')!.status).toBe('refused');
+    expect(turn.notices.map((n) => n.code)).toContain('model_refused');
   });
 
   it('keeps threads apart', async () => {
-    const { backend } = fakeBackend();
-    const model = scriptedModel([
-      message([text('Hello from thread A')]),
-      message([text('Hello from thread B')]),
-    ]);
-    const graph = buildCopilotGraph({ backend, callModel: model.call, model: 'fake' });
-    const a = await sendMessage(graph, 'A', 'hi');
-    const b = await sendMessage(graph, 'B', 'hi');
-    expect(a.messages).toHaveLength(2);
-    expect(b.messages).toHaveLength(2);
-    expect(JSON.stringify(b.messages)).not.toContain('thread A');
+    const { send } = setup({
+      planner: [
+        plannerMsg({ next: 'finish', intent: 'clarify', message: 'Which floor do you mean, thread A?' }),
+        plannerMsg({ next: 'finish', intent: 'clarify', message: 'Which zone do you mean, thread B?' }),
+      ],
+    });
+    const a = await send('A', 'hi');
+    const b = await send('B', 'hi');
+    expect(a.message).toContain('thread A');
+    expect(b.message).toContain('thread B');
+    expect(a.dialogue).toHaveLength(2);
+    expect(b.dialogue).toHaveLength(2);
+    expect(JSON.stringify(b.dialogue)).not.toContain('thread A');
+  });
+
+  it('survives a backend throw: the next message on the same thread still works', async () => {
+    const { fake, send } = setup({
+      planner: [
+        FAST_PATH_PLANNER(),
+        plannerMsg({ next: 'finish', intent: 'clarify', message: 'Which zone should I look at?' }),
+      ],
+      control: [message([toolUse('control_envelope', {})]), message([REPORT('cannot_answer')])],
+      compose: [words('The control service could not be reached, so nothing was proposed.')],
+    }, { settingsThrows: true });
+
+    const first = await send('t11', 'Pre-cool Level 3');
+    expect(first.notices.map((n) => n.code)).toContain('control_unavailable');
+    const results = JSON.stringify(fake.model.calls.control![1]!.messages.at(-1));
+    expect(results).toContain('control service unreachable');
+    expect(results).toContain('"is_error":true');
+
+    const second = await send('t11', 'and now?');
+    expect(second.message).toBe('Which zone should I look at?');
+    expect(second.dialogue).toHaveLength(4);
   });
 });
 
-describe('resolveModel', () => {
-  it('treats a blank COPILOT_MODEL as unset — the first real request failed on model: ""', () => {
-    expect(resolveModel({ COPILOT_MODEL: '' })).toBe(DEFAULT_MODEL);
-    expect(resolveModel({ COPILOT_MODEL: '   ' })).toBe(DEFAULT_MODEL);
-    expect(resolveModel({})).toBe(DEFAULT_MODEL);
-    expect(resolveModel({ COPILOT_MODEL: 'claude-sonnet-5' })).toBe('claude-sonnet-5');
+describe('resolveModels', () => {
+  it('treats a blank COPILOT_MODEL or COPILOT_SPECIALIST_MODEL as unset, and defaults the specialist to the lead', () => {
+    expect(resolveModels({ COPILOT_MODEL: '' })).toEqual({ lead: DEFAULT_MODEL, specialist: DEFAULT_MODEL });
+    expect(resolveModels({ COPILOT_MODEL: '   ', COPILOT_SPECIALIST_MODEL: ' ' })).toEqual({ lead: DEFAULT_MODEL, specialist: DEFAULT_MODEL });
+    expect(resolveModels({})).toEqual({ lead: DEFAULT_MODEL, specialist: DEFAULT_MODEL });
+    expect(resolveModels({ COPILOT_MODEL: 'claude-opus-5-5' })).toEqual({ lead: 'claude-opus-5-5', specialist: 'claude-opus-5-5' });
+    expect(resolveModels({ COPILOT_MODEL: 'claude-opus-5-5', COPILOT_SPECIALIST_MODEL: 'claude-opus-5' }))
+      .toEqual({ lead: 'claude-opus-5-5', specialist: 'claude-opus-5' });
+    expect(DEFAULT_MODEL).toBe('claude-opus-5');
   });
 });
 
-describe("the copilot's vocabulary", () => {
-  it('cannot switch control on, change the envelope, cancel, or apply', () => {
-    // The whole safety argument rests on this list. If a tool that writes
-    // anything other than a dry run ever appears here, the interrupt is no
-    // longer the only path to equipment.
-    expect(TOOL_NAMES).toEqual(['list_zones', 'control_envelope', 'dry_run_setpoint', 'propose_plan']);
-  });
-
+describe("the controller's vocabulary (v1)", () => {
   it('bounds a plan', async () => {
-    const { backend } = fakeBackend();
+    const h = toolHarness({ taskId: 'K', mode: 'propose' });
     const tooMany = Array.from({ length: MAX_PLAN_COMMANDS + 1 }, (_, i) =>
-      ({ zoneId: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`, setpointTempC: 24, reason: 'x' }));
-    const out = await runTool('propose_plan', { summary: 'too many', commands: tooMany }, backend);
+      ({ zoneId: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`, setpointTempC: 24, reason: 'pre-cool' }));
+    const out = await h.call('control', 'propose_plan', { summary: 'too many', commands: tooMany });
     expect(out.isError).toBe(true);
-    expect(out.plan).toBeUndefined();
+    expect(out.proposal).toBeUndefined();
   });
 
   it('refuses a plan naming the same zone twice', async () => {
-    const { backend } = fakeBackend();
-    const out = await runTool('propose_plan', {
-      summary: 'dup',
+    const h = toolHarness({ taskId: 'K', mode: 'propose' });
+    const out = await h.call('control', 'propose_plan', {
+      summary: 'duplicate zones',
       commands: [
         { zoneId: Z.off301, setpointTempC: 24, reason: 'first attempt' },
         { zoneId: Z.off301, setpointTempC: 25, reason: 'second attempt' },
       ],
-    }, backend);
+    });
     expect(out.isError).toBe(true);
     expect(out.content).toContain('twice');
   });
 
   it('answers an unknown tool as an error rather than throwing', async () => {
-    const { backend } = fakeBackend();
-    const out = await runTool('enable_control', {}, backend);
+    const h = toolHarness({ taskId: 'K', mode: 'propose' });
+    const out = await h.call('control', 'enable_control', {});
     expect(out.isError).toBe(true);
   });
 
   it('hides a stale sensor as null rather than as a number', async () => {
-    const { backend } = fakeBackend();
-    const out = await runTool('list_zones', {}, backend);
-    const zones = JSON.parse(out.content) as Array<{ name: string; temperatureC: number | null }>;
+    const h = toolHarness({ taskId: 'K', mode: 'propose' });
+    const out = await h.call('control', 'list_zones', {});
+    const zones = (JSON.parse(out.content) as { data: Array<{ name: string; temperatureC: number | null }> }).data;
     expect(zones.find((z) => z.name === 'SER-105')!.temperatureC).toBeNull();
-  });
-});
-
-describe('the compiled graph, as LangGraph draws it', () => {
-  // These read the EDGE LIST of the compiled graph — the same object
-  // `npm run copilot:graph` renders. They are the safety argument, stated as
-  // a test rather than a sentence: if anyone adds a second way into `apply`,
-  // this fails before the diagram in the README gets a chance to lie.
-  const inert: CopilotBackend = {
-    listZones: async () => [],
-    settings: async () => ({ enabled: false, maxDeviationK: 0, maxStepK: 0, minIntervalS: 0,
-      defaultDurationS: 0, maxDurationS: 0, commandTtlS: 0 }),
-    dryRun: async () => ({ allowed: false, refusal: 'control_disabled', message: 'inert' }),
-    issue: async () => ({ ok: false, refusal: 'control_disabled', message: 'inert' }),
-  };
-  const compiled = buildCopilotGraph({
-    backend: inert, callModel: async () => { throw new Error('never'); }, model: 'none',
-  });
-
-  it('gives apply exactly one incoming edge, from confirm', async () => {
-    const g = await compiled.getGraphAsync();
-    const into = g.edges.filter((e) => e.target === 'apply').map((e) => e.source);
-    expect(into).toEqual(['confirm']);
-  });
-
-  it('gives confirm exactly one incoming edge, from tools', async () => {
-    const g = await compiled.getGraphAsync();
-    const into = g.edges.filter((e) => e.target === 'confirm').map((e) => e.source);
-    expect(into).toEqual(['tools']);
-  });
-
-  it('has no path from the start to apply that skips confirm', async () => {
-    const g = await compiled.getGraphAsync();
-    const next = new Map<string, string[]>();
-    for (const e of g.edges) next.set(e.source, [...(next.get(e.source) ?? []), e.target]);
-    // Depth-first from __start__, refusing to step through confirm: apply must
-    // be unreachable.
-    const seen = new Set<string>();
-    const stack = ['__start__'];
-    while (stack.length) {
-      const n = stack.pop()!;
-      if (seen.has(n) || n === 'confirm') continue;
-      seen.add(n);
-      for (const m of next.get(n) ?? []) stack.push(m);
-    }
-    expect(seen.has('apply')).toBe(false);
-    expect(seen.has('agent')).toBe(true);   // sanity: the walk did go somewhere
-  });
-
-  it('draws the same nodes the README embeds', async () => {
-    const g = await compiled.getGraphAsync();
-    const names = Object.keys(g.nodes).sort();
-    expect(names).toEqual(['__end__', '__start__', 'agent', 'apply', 'confirm', 'declined', 'tools']);
-    expect(g.drawMermaid()).toContain('confirm -.-> apply');
+    expect(zones.find((z) => z.name === 'OFF-301')!.temperatureC).toBe(24.2);
   });
 });

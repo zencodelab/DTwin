@@ -5,6 +5,17 @@ safety property it rests on, and **one real run** end to end, from the
 operator's request to the setpoints on the live map.
 1920×1080, 30 fps. Full version ~3:03; a 1:40 cut for the feed, below.
 
+> **Frozen: this records the v1 copilot.** It was recorded on 24 Sep 2026
+> against the 5-node v1 graph (`agent`, `tools`, `confirm`, `apply`,
+> `declined`) — the copilot as it stands at `b2a79eb`, before the planner and
+> specialists of [decision 64](../docs/decisions.md#64-the-copilot-investigates-in-parallel-answers-from-evidence-and-reaches-the-building-through-one-door)
+> replaced it. **Do not re-curl `graph.json` or re-run `capture.ts` on the
+> current graph:** `scene.html` positions only those seven nodes (with
+> `__start__` and `__end__`), `capture.ts` drives v1's API, which no longer
+> exists, and the narration describes v1's path. Everything below is kept as a
+> record of how this video was made; re-making it means checking out
+> `b2a79eb`. A video of the current graph would be a new one.
+
 | File | What it is |
 |---|---|
 | `dtwin-copilot-full-cc-music.mp4` | **Full video, intro sped up, captions burned in, background music — 2:50** (not committed) |

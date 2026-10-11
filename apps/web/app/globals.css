@@ -18,6 +18,15 @@
   --axis: #c3c2b7;
   --border: rgba(11, 11, 11, 0.1);
   --accent: #2a78d6;
+  /*
+   * Status hues as TEXT. The status colours themselves (lib/colors.ts STATUS)
+   * are for borders, fills and marks; as 10–12 px text the amber read 1.7:1
+   * and the green 3.2:1 on the light surfaces, and the red 3.6:1 on the dark
+   * ones, where AA asks 4.5:1 (review). colors.test.ts holds every pair.
+   */
+  --status-good-text: #0b7a0b;
+  --status-warning-text: #8a5a00;
+  --status-critical-text: #b42828;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -32,6 +41,9 @@
     --axis: #383835;
     --border: rgba(255, 255, 255, 0.1);
     --accent: #3987e5;
+    --status-good-text: #0ca30c;
+    --status-warning-text: #fab219;
+    --status-critical-text: #ef6b6b;
   }
 }
 
@@ -46,6 +58,9 @@
   --axis: #383835;
   --border: rgba(255, 255, 255, 0.1);
   --accent: #3987e5;
+  --status-good-text: #0ca30c;
+  --status-warning-text: #fab219;
+  --status-critical-text: #ef6b6b;
 }
 
 html, body { height: 100%; }

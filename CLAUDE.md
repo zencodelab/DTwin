@@ -9,7 +9,7 @@ A Digital Twin platform for one commercial building. npm-workspaces monorepo,
 not a monorepo build system — three apps, two shared packages, no Turborepo.
 
 Read [docs/decisions.md](docs/decisions.md) before changing the data model. It
-records 63 decisions where the obvious choice is wrong for building analytics,
+records 64 decisions where the obvious choice is wrong for building analytics,
 each with the reasoning and, where it was checked, the evidence. (It said "ten"
 for far longer than it was true — if you add an ADR, fix this number.)
 
@@ -34,10 +34,21 @@ four packages are tenant-scoped:
   which refuses to open when nothing is bound. The tenant arrives as the
   `X-Tenant-Id` header the web proxy sets from the session.
 
-Suites total **293 checks, all passing** (`db` 70, `ingest` 138, `sim` 56,
-`web` 29), plus **338 unit tests** (254 vitest, 84 pytest). CI runs types,
-lint and unit tests in one job and the four smoke suites against a real
-timescaledb-ha:pg17 in another, and is green.
+Re-counted 28 Sep 2026, after the copilot review's fixes (never copy these
+forward — re-count): **890 unit tests** (806 vitest, 84 pytest), all passing,
+and four smoke suites holding **342 checks** — `db` 116, `sim` 56 and `web` 32
+re-run and passing on isolated databases (`web` against this branch's web
+service on a copy of the dev database, signed in via
+`WEB_SMOKE_EMAIL`/`WEB_SMOKE_PASSWORD`, so its copilot decision check ran
+rather than SKIPped); `ingest` 138, NOT re-run, because its suite refuses to
+start while a dev ingest holds :8787. This change DOES edit `apps/ingest`:
+`loadSimContext` awaits its four queries in turn instead of through
+`Promise.all`. That is covered by a mocked unit test and by an isolated ingest
+starting its device simulator on it against a copy of the dev database (190
+sensors) — not by the ingest smoke suite. CI runs types, lint and unit tests
+in one job and the four smoke suites against a real timescaledb-ha:pg17 in
+another; CI has no signed-in operator or model credential, so the web suite's
+copilot decision check SKIPs there.
 
 **`sim:` topics are keyed by BUILDING, not by run** (`docs/decisions.md` §45).
 A run-keyed topic could never be authorised — the owner map is built from
@@ -151,20 +162,68 @@ Do not "optimise" it back to COPY.
   refuse to paint is a zone control must refuse to command (§55). `enabled`
   defaults to false and the kill switch is read on every claim, never cached.
   `control:dispatch` is deliberately separate from `ingest:write`.
-- **The copilot proposes; a person approves** (`docs/decisions.md` §63,
-  `apps/web/lib/copilot/`). It is a LangGraph.js graph whose `apply` node has
-  one incoming edge, from an `interrupt()` — that edge list IS the safety
-  property. Its four tools are `list_zones`, `control_envelope`,
-  `dry_run_setpoint`, `propose_plan`; a test asserts that list verbatim.
-  Never add a tool that writes anything other than a dry run, and never let
-  the agent call `/control/commands` without `dryRun` outside the `apply`
-  node. The model call is the Anthropic SDK directly, not a chat wrapper.
-  **The diagram is generated** (`npm run copilot:graph`; README and ADR 63
-  embed it; the panel draws it live from `/api/copilot/graph`) — never hand-
-  draw it, and never edit the embedded Mermaid by hand.
-  **`video/` holds a narrated explainer of one real run** — rendered from a
-  recording (`video/run.json`), not a screen capture; `video/README.md` says
-  what is recreated and how to re-make it. The MP4s are gitignored.
+- **The copilot investigates, simulates and proposes; a person approves**
+  (`docs/decisions.md` §63, §64; `apps/web/lib/copilot/`). A LangGraph.js
+  graph: a planner dispatches specialists that never write to the building
+  (`diagnose` and `analyse` read; `simulate` also writes scratch simulation
+  runs) in bounded waves, `compose` writes a cited answer, a pure
+  verifier checks it, and v1's agent is the `control` subgraph. `apply`'s
+  only in-edge is `confirm`, `confirm`'s is `plan_check`, `plan_check`'s is
+  `control` — asserted flat and xray. `confirm` calls `interrupt()` as its
+  first statement; `apply` issues ONLY the frozen plan `confirm` granted into
+  the consume-once ledger (a closure, outside graph state) after a person's
+  resume named that plan's id and hash, and the ledger grants a plan id once.
+  Only `apply` holds `Issuer`; specialists get `TwinReader`, `ControlProbe`
+  or `ScenarioRunner`, never `issue`. **Never add `goto`, `Command.PARENT`,
+  `errorHandler`, `setNodeDefaults`, `updateState`/`bulkUpdateState`, a
+  `Send` outside `fanout.ts`, an `interrupt(` outside `confirm.ts`, an
+  `.issue(` outside `apply.ts`, or a `new Command(` that does anything but
+  `resume` (in `session.ts`) under `lib/copilot` or `app/api/copilot` — a
+  test scans for them.** The controller's four tools are v1's —
+  `list_zones`, `control_envelope`, `dry_run_setpoint`, `propose_plan` (plus
+  an optional `basis`) — and every specialist also has `report_finding`; the
+  tool lists are asserted verbatim. Every unit-bearing number in the
+  copilot's prose is a `num` segment recomputed from cited evidence (unit
+  from the key's suffix, basis from the evidence's kind — so never put a
+  configured figure such as a designed setpoint, deadband, area, design
+  occupancy, rating or alert-rule threshold in a measured or simulated record
+  under a unit-suffixed (citable) key; `list_zones` keeps v1's uncitable
+  camelCase figures and `zone_timeline`'s rules in scope carry `rule*` keys
+  for that reason, and a test walks every tool for them); caveats are codes
+  rendered from fixed text, and an answer may list only codes some evidence
+  of the request carries. The verifier checks provenance, units and wording,
+  not reasoning. **Every read not scoped by a directory zone id passes
+  orient's `buildingId`** — RLS scopes a transaction to the tenant, not the
+  building. Every specialist and
+  the controller get the operator's own question beside the planner's goal
+  (a paraphrase lost "1 K" and "46 °C" in the first real runs), and the
+  controller is always handed the request's simulation. Copilot reads run in READ ONLY transactions. The
+  model call is the Anthropic SDK directly: lead `COPILOT_MODEL` (default
+  `claude-opus-5`), specialists `COPILOT_SPECIALIST_MODEL` (default: the
+  lead) — never a cheaper default — and every call sends `max_tokens` 16000,
+  no `thinking`, `fallbacks` or forced `tool_choice`, and a top-level
+  `cache_control` (automatic prompt caching; ADR 64, "Prompt caching"). A
+  cache read needs the earlier request's bytes unchanged in front of what is
+  new: keep compose's redraft payload in its own block after the evidence,
+  keep the planner's per-wave progress out of its marked context block, never
+  mark a stored transcript block, and stay within four five-minute
+  breakpoints (`requestShapeError` refuses more). **The diagram is
+  generated**: `npm run copilot:graph -- --write` rewrites the marked blocks
+  in README and ADR 64, `docs.test.ts` compares them, and the panel draws it
+  live from `/api/copilot/graph` — never hand-edit it. ADR 63's Mermaid is
+  the v1 graph, kept as history; never regenerate it. **`video/` records the
+  v1 graph** (a narrated walkthrough of one real run, 24 Sep; the MP4s are
+  gitignored) and must not be regenerated against this one — `capture.ts` is
+  v1-only.
+- **Writes are classed, and the building is not a class** (`docs/decisions.md`
+  §64; `TOOL_CLASS` in `lib/copilot/tools/index.ts`, asserted verbatim):
+  `read`, `dry_run`, `scratch`, `propose`, `report`. SCRATCH writes happen only
+  through `simulate_scenarios`, via the `ScenarioRunner` allow-list and the
+  sim-only `COPILOT_SIM_API_KEY` — never `SIM_API_KEY`, never
+  `/weather/generate`. BUILDING writes happen only in the `apply` node, never
+  in a tool. Never add a tool that writes anything a gateway reads,
+  `control_settings`, `thermal_profiles` or `weather_observations`, and never
+  let the copilot call `/control/commands` without `dryRun` outside `apply`.
 - **Alerts are never coalesced or shed.** Telemetry has a successor; an alert
   does not. That includes the SOCKET: `Fanout.send(…, { mustDeliver: true })`
   closes a client too backlogged to take the frame rather than skipping it, and

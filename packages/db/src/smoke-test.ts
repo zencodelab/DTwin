@@ -3,8 +3,8 @@
  *
  * Exercises the schema against a real database: spatial tree hydration, 3D
  * picking with elevation disambiguation, batched telemetry writes, reset-aware
- * counter aggregation, the heatmap rollup, the Zod parse boundary, and — since
- * 007/008 — tenant isolation.
+ * counter aggregation, the heatmap rollup, the Zod parse boundary, — since
+ * 007/008 — tenant isolation, and the copilot's READ ONLY queries (§64).
  *
  * TWO POOLS, ON PURPOSE. Assertions run through `withTenant` as the application
  * role, so they exercise the row-level security policies rather than going
@@ -16,12 +16,16 @@
  * not something to point at production. Run with:
  *   npm run smoke -w @dtwin/db
  */
-import { getOwnerPool, getPool, closePool, withTenant } from './client.ts';
+import { getOwnerPool, getPool, closePool, withTenant, type Db } from './client.ts';
 import {
   getSpatialTree, findZoneAtPoint, insertReadings, SPATIAL_LIMITS, SpatialTreeTooLargeError,
   getLatestReadingsForZone, getSensorHistory, getZoneHeatmap,
   createTenant, listBuildings, getTenant, createUser, addMember, login,
   listActiveTenants, TooManyTenantsError,
+  copilotOrient, copilotListZones, copilotZoneConditions, copilotZoneHistory,
+  copilotZoneTimeline, copilotEquipmentStatus, copilotListAlerts, copilotControlHistory,
+  copilotEnergyByEndUse, copilotMeterConsumption, copilotCompareZones, bucketStartsIn,
+  BUILDING_PLANT,
 } from './queries/index.ts';
 import {
   ClientMessage, TelemetryBatch, parseServerMessage,
@@ -471,7 +475,351 @@ ok('over its ceiling the tenant list throws rather than returning the first N',
    tenantCeiling instanceof TooManyTenantsError,
    tenantCeiling instanceof Error ? tenantCeiling.name : 'returned a truncated list');
 
-console.log('\n[9] Sign-in');
+// ------------------------------------------------------------ copilot reads
+console.log('\n[9] Copilot reads (READ ONLY, as dtwin_app)');
+/**
+ * Every copilot query, the way the copilot runs it: `withTenant(…, { readOnly:
+ * true })` as the application role. The fixtures above give them something
+ * to find — six hours of OFF-101 temperature with forty flagged samples in two
+ * runs, and a main meter that resets once and carries one flagged 9e9 spike —
+ * and tenant B, still alive here, gives isolation something to hide.
+ */
+const roA = <T>(fn: (db: Db) => Promise<T>) => withTenant(A, fn, { readOnly: true });
+const roB = <T>(fn: (db: Db) => Promise<T>) => withTenant(B, fn, { readOnly: true });
+const until = new Date();
+
+// A read-only transaction really is one: a write inside it is refused by
+// Postgres, whatever the role's grants say.
+const roWrite = await roA((db) => db.query(
+  `INSERT INTO maintenance_logs (tenant_id, equipment_id, performed_at, log_type)
+   VALUES ($1, $2, now(), 'inspection')`, [A.tenantId, ahu.id],
+)).then(() => null, (err: unknown) => err as { code?: string });
+ok('a READ ONLY transaction refuses an INSERT (SQLSTATE 25006)', roWrite?.code === '25006',
+   roWrite ? `code ${roWrite.code}` : 'the row was written');
+
+const orient = await roA((db) => copilotOrient(db));
+ok('orient: the seeded building, its timezone and 24 directory zones',
+   orient.building?.id === A.buildingId && orient.building.timezone.length > 0
+     && orient.directory.length === 24 && !orient.multipleBuildings,
+   `${orient.building?.name} ${orient.building?.timezone} ${orient.directory.length} zones`);
+const dirL1 = orient.directory.find((z) => z.id === hitL1!.id);
+ok('orient: a directory row carries its design band and serving equipment',
+   typeof dirL1?.designed_setpoint_c === 'number' && typeof dirL1.deadband_k === 'number'
+     && dirL1.serving.some((s) => /^AHU-\d+ \(\w+\)$/.test(s)),
+   JSON.stringify(dirL1?.serving));
+ok('orient: no floor or zone energy meter exists in the seed',
+   !orient.availability.perFloorEnergyMeter && !orient.availability.perZoneEnergyMeter);
+ok('orient: the telemetry span is known', orient.availability.telemetryFrom !== null
+   && orient.availability.telemetryTo !== null);
+// The prompts name no building's meters; this list is how a model learns
+// them. Every tag in it must be one meter_consumption accepts.
+ok('orient: lists the seed\'s readable meters by tag and unit',
+   JSON.stringify(orient.availability.meters) === JSON.stringify([
+     { tag: 'MTR-MAIN', type: 'electric_meter', unit: 'kwh' },
+     { tag: 'MTR-WATER', type: 'water_meter', unit: 'm3' },
+   ]),
+   JSON.stringify(orient.availability.meters));
+const orientB = await roB((db) => copilotOrient(db));
+ok('orient under another tenant sees only that tenant\'s building',
+   orientB.building?.id === bBuildingId && orientB.directory.length === 1,
+   `${orientB.building?.name}, ${orientB.directory.length} zone(s)`);
+
+const zonesV1 = await roA((db) => copilotListZones(db));
+ok('list_zones (v1) returns every zone', zonesV1.length === 24, `got ${zonesV1.length}`);
+
+const cond = await roA((db) => copilotZoneConditions(db, { zoneId: hitL1!.id, from: windowStart, to: until }));
+const t = cond?.metrics.temperature_c;
+ok('zone_conditions counts the flagged samples and keeps them out of the statistics',
+   t?.flagged_samples_count === 40 && t.min_c !== null && t.min_c > 20
+     && t.mean_c !== null && t.mean_c > 20 && t.mean_c < 26,
+   `flagged ${t?.flagged_samples_count}, min ${t?.min_c?.toFixed(2)}, mean ${t?.mean_c?.toFixed(2)}`);
+ok('zone_conditions reports coverage against the buckets the window should hold',
+   t !== undefined && t.good_buckets_count > 0 && t.good_buckets_count <= t.expected_buckets_count
+     && t.expected_buckets_count === bucketStartsIn(windowStart, until, 300),
+   `${t?.good_buckets_count} of ${t?.expected_buckets_count}`);
+ok('zone_conditions carries the design band and the serving AHU',
+   cond?.design.setpoint_c !== null && cond?.design.deadband_k !== null
+     && /^AHU-/.test(cond?.ahu?.tag ?? '') && cond?.comfort !== undefined,
+   JSON.stringify(cond?.design));
+const comfort = cond?.comfort;
+ok('zone_conditions judges comfort only where occupancy was reported',
+   comfort !== undefined && (comfort.occupied_min === null
+     ? Object.values(comfort).every((v) => v === null)
+     : [comfort.above_design_band_min, comfort.below_design_band_min]
+         .every((v) => v === null || v <= comfort.occupied_min!)),
+   JSON.stringify(comfort));
+ok('another tenant\'s zone has no conditions, not an error',
+   (await roB((db) => copilotZoneConditions(db, { zoneId: hitL1!.id, from: windowStart, to: until }))) === null);
+
+const hist = await roA((db) => copilotZoneHistory(db, {
+  zoneId: hitL1!.id, metrics: ['temperature_c'], resolution: '1h', from: windowStart, to: until,
+}));
+const series = hist.series.temperature_c ?? [];
+ok('zone_history: hourly series, flagged counted and excluded',
+   series.length > 0 && series.reduce((n, p) => n + p.flagged_count, 0) === 40
+     && series.every((p) => p.mean_c === null || (p.mean_c > 20 && p.mean_c < 26)),
+   `${series.length} points`);
+const histRefused = await roA((db) => copilotZoneHistory(db, {
+  zoneId: hitL1!.id, metrics: ['temperature_c'], resolution: '5m',
+  from: new Date(until.getTime() - 200 * 3600_000), to: until,
+})).then(() => null, (err: unknown) => err);
+ok('zone_history refuses a span its reader would truncate, naming the limit',
+   histRefused instanceof RangeError && /168 h/.test(histRefused.message),
+   histRefused instanceof Error ? histRefused.message : 'answered');
+
+const timeline = await roA((db) => copilotZoneTimeline(db, {
+  zoneId: hitL1!.id, from: windowStart, to: until, limit: 50,
+}));
+const episodes = timeline.items.filter((i) => i.kind === 'flag_episode');
+ok('zone_timeline finds both runs of flagged samples, forty samples in all',
+   episodes.length >= 2
+     && episodes.reduce((n, e) => n + Number(e.detail.flagged_samples_count), 0) === 40,
+   episodes.map((e) => `${e.detail.duration_min} min/${e.detail.flagged_samples_count}`).join(', '));
+ok('zone_timeline is chronological and counts every event',
+   timeline.items.every((e, i, all) => i === 0 || all[i - 1]!.at <= e.at)
+     && timeline.total === timeline.items.length && !timeline.truncated);
+const drift = timeline.rulesInScope.items.find((r) => r.condition === 'rate_of_change');
+ok('zone_timeline lists the rules in scope, thresholds keyed by their unit',
+   timeline.rulesInScope.total >= 1 && (drift === undefined || 'threshold_k_per_h' in drift),
+   `${timeline.rulesInScope.total} rules; drift keys ${drift ? Object.keys(drift).filter((k) => k.startsWith('threshold')) : 'n/a'}`);
+const tl1 = await roA((db) => copilotZoneTimeline(db, { zoneId: hitL1!.id, from: windowStart, to: until, limit: 1 }));
+ok('a timeline at its cap says so and keeps the most recent event',
+   tl1.truncated && tl1.items.length === 1 && tl1.total === timeline.total
+     && tl1.items[0]!.at === timeline.items.at(-1)!.at,
+   `total ${tl1.total}, kept ${tl1.items[0]?.kind}`);
+
+const equip = await roA((db) => copilotEquipmentStatus(db, { tag: null, zoneId: hitL1!.id, limit: 40, buildingId: A.buildingId }));
+const zoneVav = equip.items.find((e) => e.type === 'vav');
+const chiller = equip.items.find((e) => e.type === 'chiller');
+ok('equipment_status by zone is the serving chain, with each unit\'s chain upward',
+   equip.total === 4 && zoneVav?.chain_up.length === 3 && zoneVav.zones_served_count === 1,
+   equip.items.map((e) => `${e.tag}<${e.chain_up.join('<')}>`).join(' '));
+ok('equipment_status counts every zone below a unit and names the first eight',
+   chiller?.zones_served_count === 24 && chiller.zones_served.length === 8);
+const equip2 = await roA((db) => copilotEquipmentStatus(db, { tag: null, zoneId: hitL1!.id, limit: 2, buildingId: A.buildingId }));
+ok('equipment_status at its cap says so', equip2.truncated && equip2.total === 4 && equip2.items.length === 2);
+// Configured evidence: a measured draw inside it would be cited as configured.
+ok('equipment_status carries configuration only, no measured draw',
+   equip.items.every((e) => !Object.keys(e).some((k) => k.includes('_kw') || k.startsWith('last_hour'))),
+   Object.keys(equip.items[0] ?? {}).join(','));
+
+const monthAgo = new Date(until.getTime() - 31 * 24 * 3600_000);
+const alertsPage = await roA((db) => copilotListAlerts(db, { state: 'any', from: monthAgo, to: until, zoneId: null, limit: 50, buildingId: A.buildingId }));
+ok('list_alerts returns a capped page', Array.isArray(alertsPage.items)
+   && alertsPage.total >= alertsPage.items.length && alertsPage.limit === 50
+   && alertsPage.truncated === (alertsPage.total > alertsPage.items.length));
+const commands = await roA((db) => copilotControlHistory(db, { zoneId: null, from: monthAgo, to: until, limit: 50, buildingId: A.buildingId }));
+ok('control_history returns a capped page', Array.isArray(commands.items)
+   && commands.total >= commands.items.length
+   && commands.items.every((c) => 'reason_untrusted' in c && !('reason' in c)));
+
+const energy = await roA((db) => copilotEnergyByEndUse(db, { from: windowStart, to: until, groupBy: 'floor', timezone: tree!.building.timezone, buildingId: A.buildingId }));
+ok('energy_by_end_use: one row per floor plus the unallocated plant',
+   energy.rows.length === 5 && energy.rows.some((r) => 'floor' in r && r.floor === BUILDING_PLANT)
+     && energy.rows.every((r) => r.sensors_count > 0 && r.good_buckets_count <= r.expected_buckets_count),
+   energy.rows.map((r) => ('floor' in r ? r.floor : r.day)).join(', '));
+const energyDays = await roA((db) => copilotEnergyByEndUse(db, { from: windowStart, to: until, groupBy: 'local_day', timezone: tree!.building.timezone, buildingId: A.buildingId }));
+ok('energy_by_end_use by local day generates every day in the window',
+   energyDays.rows.length >= 1 && energyDays.rows.every((r) => 'day' in r && r.day_end > r.day_start));
+
+// The meter over the real-time tail. The hourly rollup was refreshed to ten
+// minutes ago, so the newest hour is aggregated live — where a parallel plan
+// has failed with "out of order points".
+const meterTag = tree!.equipment.find((e) => e.id === tree!.sensors.find((s) => s.id === meter.id)?.equipmentId)?.tag;
+const hourMs = 3600_000;
+const meterFrom = new Date(Math.ceil(windowStart.getTime() / hourMs) * hourMs);
+const meterTo = new Date(Math.ceil(until.getTime() / hourMs) * hourMs + hourMs);
+const byHour = await roA((db) => copilotMeterConsumption(db, {
+  meterTag: meterTag ?? '', from: meterFrom, to: meterTo, bucket: 'hour', timezone: tree!.building.timezone, buildingId: A.buildingId,
+})).then((v) => v, (err: unknown) => err as Error);
+const hourly = byHour instanceof Error || 'unknownMeter' in byHour || byHour.unit !== 'kwh' ? null : byHour;
+ok('meter_consumption runs over the real-time tail without "out of order points"',
+   hourly !== null, byHour instanceof Error ? byHour.message : JSON.stringify(byHour).slice(0, 80));
+// 361 readings at 3 kWh a minute across one reset: (1,000,720 − 1,000,003) +
+// 0 at the reset + 360 after it = 1,077 kWh. The flagged 9e9 spike would be
+// nine billion if the rollup counted it.
+ok('the window total is its own reset-aware rollup, spike excluded',
+   hourly !== null && hourly.total_kwh !== null && hourly.total_kwh > 1_000 && hourly.total_kwh < 1_100
+     && hourly.total_resets_count >= 1,
+   `total ${hourly?.total_kwh?.toFixed(1)} kWh, ${hourly?.total_resets_count} reset(s)`);
+const byDay = await roA((db) => copilotMeterConsumption(db, {
+  meterTag: meterTag ?? '', from: meterFrom, to: meterTo, bucket: 'local_day', timezone: tree!.building.timezone, buildingId: A.buildingId,
+})).then((v) => v, (err: unknown) => err as Error);
+ok('meter_consumption by local day agrees on the window total',
+   !(byDay instanceof Error) && !('unknownMeter' in byDay) && byDay.unit === 'kwh'
+     && byDay.total_kwh === hourly?.total_kwh && byDay.buckets.length >= 1,
+   byDay instanceof Error ? byDay.message : '');
+const listedAccepted = await Promise.all(orient.availability.meters.map((m) => roA((db) => copilotMeterConsumption(db, {
+  meterTag: m.tag, from: meterFrom, to: meterTo, bucket: 'hour', timezone: tree!.building.timezone, buildingId: A.buildingId,
+})).then((v) => !('unknownMeter' in v) && v.unit === m.unit, () => false)));
+ok('every meter orient lists is one meter_consumption reads, in the unit listed',
+   listedAccepted.length === 2 && listedAccepted.every(Boolean), JSON.stringify(listedAccepted));
+ok('a tag that is not a meter is unknown, not an error',
+   'unknownMeter' in await roA((db) => copilotMeterConsumption(db, {
+     meterTag: ahu.tag, from: meterFrom, to: meterTo, bucket: 'hour', timezone: tree!.building.timezone, buildingId: A.buildingId,
+   })));
+
+const ranked = await roA((db) => copilotCompareZones(db, {
+  metric: 'temperature_c', from: windowStart, to: until, floorLevel: 1, orderBy: 'mean', limit: 2, buildingId: A.buildingId,
+}));
+const l1Row = ranked.items.find((r) => r.zone_id === hitL1!.id);
+ok('compare_zones ranks one floor, capped, with the page flagged as truncated',
+   ranked.total === 6 && ranked.items.length === 2 && ranked.truncated);
+ok('compare_zones: the fixture zone ranks with its flagged samples counted',
+   l1Row !== undefined && l1Row.flagged_samples_count === 40
+     && Number(l1Row.mean_c) > 20 && Number(l1Row.mean_c) < 26,
+   JSON.stringify(l1Row));
+ok('compare_zones floor mean covers the whole floor, not the page',
+   ranked.floor_means.length === 1 && ranked.floor_means[0]!.zones_count === 6);
+const band = await roA((db) => copilotCompareZones(db, {
+  metric: 'temperature_c', from: windowStart, to: until, floorLevel: null, orderBy: 'minutes_above_band', limit: 24, buildingId: A.buildingId,
+}));
+ok('compare_zones can rank by occupied minutes above the designed band',
+   band.total === 24 && band.items.every((r) => 'minutes_above_band_min' in r));
+// Coverage is counted in 5-minute periods, not hours: the fixture zone has six
+// hours of minute data, so it has far more good periods than hours.
+const { rows: [l1Periods] } = await roA((db) => db.query<{ n: number }>(
+  `SELECT count(DISTINCT a.bucket)::int AS n
+     FROM sensors s JOIN telemetry_5m_t a ON a.sensor_id = s.id
+    WHERE s.zone_id = $1 AND s.metric = 'temperature_c' AND s.is_active AND a.avg_value IS NOT NULL
+      AND a.bucket >= $2 AND a.bucket < $3`,
+  [hitL1!.id, ranked.covered.from, new Date(Math.ceil(until.getTime() / 3600_000) * 3600_000)]));
+const l1All = (await roA((db) => copilotCompareZones(db, {
+  metric: 'temperature_c', from: windowStart, to: until, floorLevel: 1, orderBy: 'mean', limit: 24, buildingId: A.buildingId,
+}))).items.find((r) => r.zone_id === hitL1!.id);
+ok('compare_zones counts coverage in the 5-minute periods of the window it covered',
+   l1All !== undefined && l1All.good_buckets_count === l1Periods!.n && l1All.good_buckets_count > 12,
+   `${l1All?.good_buckets_count} counted, ${l1Periods?.n} good periods`);
+
+console.log('\n[9b] Copilot reads: what the review found (each in a transaction that is rolled back)');
+/**
+ * Each case needs a state the fixtures above do not hold — an alert on plant,
+ * a zone with no temperature point, a second building — so each is built,
+ * read and ROLLED BACK in one transaction, the reads running on that
+ * transaction's own connection. Nothing here outlives its check.
+ */
+const ROLLBACK = new Error('smoke: roll back');
+async function rolledBack<T>(fn: (db: Db) => Promise<T>): Promise<T> {
+  let out: { value: T } | null = null;
+  try {
+    await withTenant(A, async (db) => {
+      out = { value: await fn(db) };
+      throw ROLLBACK;
+    });
+  } catch (err) {
+    if (err !== ROLLBACK) throw err;
+  }
+  return out!.value;
+}
+
+// An AHU has no zone, so an alert on its supply-air point resolves to none.
+// The zone's timeline promises the equipment serving it.
+const plantAlert = await rolledBack(async (db) => {
+  const { rows: [point] } = await db.query<{ id: string; tag: string }>(
+    `SELECT s.id, e.tag
+       FROM equipment_zone_service es
+       JOIN equipment e ON e.id = es.equipment_id
+       JOIN sensors s ON s.equipment_id = e.id
+      WHERE es.zone_id = $1 AND e.equipment_type = 'ahu' AND e.zone_id IS NULL AND s.zone_id IS NULL
+      ORDER BY e.tag, s.id LIMIT 1`, [hitL1!.id]);
+  const { rows: [rule] } = await db.query<{ id: string }>(`SELECT id FROM alert_rules ORDER BY name, id LIMIT 1`);
+  await db.query(
+    `INSERT INTO alerts (tenant_id, rule_id, sensor_id, severity, state, message, opened_at)
+     VALUES ($1, $2, $3, 'warning', 'open', 'smoke: serving AHU', $4)`,
+    [A.tenantId, rule!.id, point!.id, new Date(until.getTime() - 60_000)]);
+  const tl = await copilotZoneTimeline(db, { zoneId: hitL1!.id, from: windowStart, to: until, limit: 50 });
+  return { tag: point!.tag, opened: tl.items.filter((i) => i.kind === 'alert_opened' && i.detail.equipment === point!.tag) };
+});
+ok('zone_timeline includes an alert on the AHU serving the zone, and names the AHU',
+   plantAlert.opened.length === 1, `${plantAlert.tag}: ${plantAlert.opened.length} alert(s)`);
+
+// A zone with no active temperature point: no feed, so no gap in it — and,
+// occupied, no "zero minutes out of band" either, because nothing was judged.
+const noTemperature = await rolledBack(async (db) => {
+  await db.query(`UPDATE sensors SET is_active = false WHERE zone_id = $1 AND metric = 'temperature_c'`, [hitL1!.id]);
+  const { rows: [occ] } = await db.query<{ id: string }>(
+    `SELECT id FROM sensors WHERE zone_id = $1 AND metric = 'occupancy_count' AND is_active ORDER BY id LIMIT 1`,
+    [hitL1!.id]);
+  // Occupied for the last nine minutes: after the rollup's watermark (ten
+  // minutes back), so real-time aggregation reads it. Never future-dated.
+  const t0 = Date.now();
+  await insertReadings(db, Array.from({ length: 9 }, (_, i) => ({
+    sensorId: occ!.id as Reading['sensorId'], ts: t0 - (9 - i) * 60_000, value: 12, quality: 0,
+  })));
+  const tl = await copilotZoneTimeline(db, { zoneId: hitL1!.id, from: windowStart, to: new Date(t0), limit: 50 });
+  const cz = await copilotZoneConditions(db, { zoneId: hitL1!.id, from: new Date(t0 - 10 * 60_000), to: new Date(t0) });
+  return { gaps: tl.items.filter((i) => i.kind === 'data_gap'), comfort: cz?.comfort };
+});
+ok('zone_timeline reports no temperature gap for a zone with no temperature point',
+   noTemperature.gaps.length === 0, JSON.stringify(noTemperature.gaps));
+ok('zone_conditions leaves the band minutes null when the zone was occupied and no temperature was judged',
+   (noTemperature.comfort?.occupied_min ?? 0) > 0 && noTemperature.comfort?.occupied_with_temperature_min === 0
+     && noTemperature.comfort.above_design_band_min === null && noTemperature.comfort.below_design_band_min === null
+     && noTemperature.comfort.above_effective_band_min === null,
+   JSON.stringify(noTemperature.comfort));
+
+// A second building on the same tenant, sorting after the first: orient
+// answers about the first and says so, and every read below must keep to it.
+// Its level-1 floor shares the level, its meter shares the tag (and sorts
+// first by id), and its AHU carries a power point and an open alert.
+const secondBuilding = await rolledBack(async (db) => {
+  const { rows: [b] } = await db.query<{ id: string }>(
+    `INSERT INTO buildings (tenant_id, name, timezone) VALUES ($1, 'Zzz Smoke Annex', 'UTC') RETURNING id`, [A.tenantId]);
+  const { rows: [f] } = await db.query<{ id: string }>(
+    `INSERT INTO floors (tenant_id, building_id, level, name, elevation_m) VALUES ($1, $2, 1, $3, 0) RETURNING id`,
+    [A.tenantId, b!.id, l1.name]);
+  await db.query(`INSERT INTO zones (tenant_id, floor_id, name, zone_type, area_m2) VALUES ($1, $2, 'ZZ-101', 'office', 50)`,
+    [A.tenantId, f!.id]);
+  const { rows: [ahuB] } = await db.query<{ id: string }>(
+    `INSERT INTO equipment (tenant_id, building_id, floor_id, tag, equipment_type) VALUES ($1, $2, $3, 'AHU-ZZ', 'ahu') RETURNING id`,
+    [A.tenantId, b!.id, f!.id]);
+  const { rows: [kw] } = await db.query<{ id: string }>(
+    `INSERT INTO sensors (tenant_id, external_id, name, metric, unit, equipment_id)
+     VALUES ($1, 'smoke-zz-kw-' || gen_random_uuid(), 'AHU-ZZ kW', 'power_kw', 'kW', $2) RETURNING id`, [A.tenantId, ahuB!.id]);
+  const { rows: [mtr] } = await db.query<{ id: string }>(
+    `INSERT INTO equipment (id, tenant_id, building_id, tag, equipment_type)
+     VALUES ('00000000-0000-0000-0000-000000000001', $1, $2, $3, 'electric_meter') RETURNING id`,
+    [A.tenantId, b!.id, meterTag]);
+  await db.query(
+    `INSERT INTO sensors (tenant_id, external_id, name, metric, unit, equipment_id, is_cumulative)
+     VALUES ($1, 'smoke-zz-mtr-' || gen_random_uuid(), 'ZZ main kWh', 'energy_kwh', 'kWh', $2, true)`, [A.tenantId, mtr!.id]);
+  const { rows: [rule] } = await db.query<{ id: string }>(`SELECT id FROM alert_rules ORDER BY name, id LIMIT 1`);
+  await db.query(
+    `INSERT INTO alerts (tenant_id, rule_id, sensor_id, equipment_id, severity, state, message, opened_at)
+     VALUES ($1, $2, $3, $4, 'critical', 'open', 'smoke: the other building', $5)`,
+    [A.tenantId, rule!.id, kw!.id, ahuB!.id, new Date(until.getTime() - 60_000)]);
+
+  const scope = { buildingId: A.buildingId };
+  return {
+    orient: await copilotOrient(db),
+    compare: await copilotCompareZones(db, {
+      metric: 'temperature_c', from: windowStart, to: until, floorLevel: 1, orderBy: 'mean', limit: 24, ...scope,
+    }),
+    energy: await copilotEnergyByEndUse(db, { from: windowStart, to: until, groupBy: 'floor', timezone: tree!.building.timezone, ...scope }),
+    meter: await copilotMeterConsumption(db, {
+      meterTag: meterTag ?? '', from: meterFrom, to: meterTo, bucket: 'hour', timezone: tree!.building.timezone, ...scope,
+    }),
+    equipment: await copilotEquipmentStatus(db, { tag: meterTag ?? '', zoneId: null, limit: 40, ...scope }),
+    alerts: await copilotListAlerts(db, { state: 'any', from: monthAgo, to: until, zoneId: null, limit: 500, ...scope }),
+  };
+});
+ok('with a second building, orient still answers about the first and says there is another',
+   secondBuilding.orient.building?.id === A.buildingId && secondBuilding.orient.multipleBuildings);
+ok('compare_zones keeps to orient\'s building: the other building\'s level-1 zone is not ranked',
+   secondBuilding.compare.total === ranked.total && secondBuilding.compare.floor_means[0]?.zones_count === 6,
+   `${secondBuilding.compare.total} zones`);
+ok('energy_by_end_use keeps to orient\'s building: the other building\'s AHU is not summed',
+   JSON.stringify(secondBuilding.energy.rows.map((r) => r.sensors_count)) === JSON.stringify(energy.rows.map((r) => r.sensors_count)),
+   secondBuilding.energy.rows.map((r) => `${'floor' in r ? r.floor : ''}:${r.sensors_count}`).join(', '));
+ok('meter_consumption reads orient\'s building\'s meter, not the other one with the same tag',
+   !('unknownMeter' in secondBuilding.meter) && secondBuilding.meter.unit === 'kwh'
+     && secondBuilding.meter.total_kwh === hourly?.total_kwh,
+   'unknownMeter' in secondBuilding.meter ? 'unknown' : JSON.stringify(secondBuilding.meter).slice(0, 120));
+ok('equipment_status by tag finds one unit, in orient\'s building', secondBuilding.equipment.total === 1,
+   `${secondBuilding.equipment.total} unit(s)`);
+ok('list_alerts keeps to orient\'s building', !secondBuilding.alerts.items.some((a) => a.equipment === 'AHU-ZZ'));
+
+console.log('\n[10] Sign-in');
 // `login()` had no coverage in any suite: the web smoke runs on the demo tenant
 // and never signs in. It is exercised here, against the real hash and the real
 // tables, while the fixture tenant still exists to be a member of.
